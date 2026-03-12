@@ -28,8 +28,7 @@ impl ChainActivations {
         *self
             .tx_engine
             .range(0..=block_height)
-            .rev()
-            .next()
+            .next_back()
             .unwrap()
             .1
     }

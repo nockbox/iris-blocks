@@ -2,26 +2,23 @@ pub mod schema;
 
 use super::{layer::*, shared_schema::*};
 use crate::chain_activations::ChainActivations;
-use crate::db::{AsyncDbConnection, DbPool};
+use crate::db::AsyncDbConnection;
+use crate::scry::{NounError, ScryError, ScryFailed, Scryable};
 use crate::StringDigest;
 use clap::Parser;
 use diesel::prelude::*;
-use diesel_async::{AsyncConnection, RunQueryDsl};
-use iris_grpc_proto::pb::private::v1::{
-    nock_app_service_client::NockAppServiceClient, nock_app_service_server::NockAppService,
-    peek_response::Result as PeekResult, *,
-};
-use iris_nockchain_types::{BlockHeight, Page, Tx};
-use iris_ztd::{cue, jam, Digest, NounDecode, NounEncode, ZMap};
+use diesel_async::RunQueryDsl;
+use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;
+use iris_nockchain_types::BlockHeight;
+use iris_ztd::{jam, Digest, NounEncode};
 use log::*;
 use schema::*;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use thiserror::Error;
 use tonic::transport::Channel;
 
 mod block_range_manager;
-use block_range_manager::{BlockRangeManager, ScryBlocksResult};
+use block_range_manager::BlockRangeManager;
 
 #[derive(Debug, Clone, Parser)]
 pub struct L0Config {
@@ -31,10 +28,10 @@ pub struct L0Config {
     pub store_pow: bool,
 }
 
-pub struct L0Client {
-    pool: DbPool,
-    client: Option<NockAppServiceClient<Channel>>,
-    manager: Option<BlockRangeManager>,
+pub struct L0Client<S = NockAppServiceClient<Channel>> {
+    conn: AsyncDbConnection,
+    client: Option<S>,
+    manager: Option<BlockRangeManager<S>>,
     dependencies: Vec<Arc<dyn LayerDependency>>,
     activations: ChainActivations,
     config: L0Config,
@@ -50,18 +47,16 @@ pub enum L0Error {
     NoNewBlocksNoGenesis,
     #[error("No new blocks")]
     NoNewBlocks(FixedLayerMetadata, Digest, BlockHeight),
-    #[error("Invalid blocks range response")]
-    InvalidBlocksRangeResponse,
     #[error("Unable to parse blocks range response")]
     UnableToParseBlocksRangeResponse,
     #[error("Block missing pow")]
     BlockMissingPow(Digest),
     #[error("TX {0} invalid on block {1} ({2})")]
     TransactionInvalid(Digest, BlockHeight, Digest),
-    #[error("Noun cue error")]
-    NounCueError,
-    #[error("Noun decode error")]
-    NounDecodeError,
+    #[error(transparent)]
+    Noun(#[from] NounError),
+    #[error(transparent)]
+    ScryFailed(#[from] ScryFailed),
     #[error("Chain reoverted")]
     Reverted,
     #[error("Unable to pull elders at block {1} on height {0}")]
@@ -72,35 +67,27 @@ pub enum L0Error {
     GrpcNeeded,
 }
 
-async fn remote_scry<T: NounDecode>(
-    client: &mut NockAppServiceClient<Channel>,
-    path: impl NounEncode,
-) -> Result<T, L0Error> {
-    let peek_req = PeekRequest {
-        pid: 0,
-        path: jam(path.to_noun()),
-    };
-
-    let peek_res = client.peek(peek_req).await?.into_inner();
-    let Some(PeekResult::Data(peek_blob)) = peek_res.result else {
-        return Err(L0Error::InvalidBlocksRangeResponse);
-    };
-    let peek_noun = cue(&peek_blob).ok_or(L0Error::NounCueError)?;
-    NounDecode::from_noun(&peek_noun).ok_or(L0Error::NounDecodeError)
+impl From<ScryError> for L0Error {
+    fn from(value: ScryError) -> Self {
+        match value {
+            ScryError::Noun(n) => L0Error::Noun(n),
+            ScryError::ScryFailed(s) => L0Error::ScryFailed(s),
+            ScryError::Tonic(t) => L0Error::TonicError(t),
+        }
+    }
 }
 
-impl L0Client {
+impl<S: Scryable> L0Client<S> {
     pub fn new(
-        pool: DbPool,
-        channel: Option<Channel>,
+        conn: AsyncDbConnection,
+        client: Option<S>,
         config: L0Config,
         activations: ChainActivations,
         dependencies: Vec<Arc<dyn LayerDependency>>,
     ) -> Self {
-        let client = channel.map(NockAppServiceClient::new);
         Self::verify_dependencies(&dependencies).unwrap();
         Self {
-            pool,
+            conn,
             client: client.clone(),
             manager: client.map(|client| BlockRangeManager::new(client, config.block_range_config)),
             activations,
@@ -112,7 +99,6 @@ impl L0Client {
     async fn revert_to(
         &mut self,
         new_next_block_height: u32,
-        conn: &mut AsyncDbConnection,
     ) -> Result<FixedLayerMetadata, L0Error> {
         debug!("Reverting l0 to next_block={new_next_block_height}");
 
@@ -122,26 +108,28 @@ impl L0Client {
         };
 
         for dep in self.dependencies.iter() {
-            dep.expire_blocks(conn, metadata).await;
+            dep.expire_blocks(&mut self.conn, metadata).await?;
         }
 
         trace!("Dropping transactions");
 
         diesel::delete(transactions::table)
             .filter(transactions::height.ge(new_next_block_height as i32))
-            .execute(conn)
+            .execute(&mut self.conn)
             .await?;
 
         trace!("Dropping blocks");
 
         diesel::delete(blocks::table)
             .filter(blocks::height.ge(new_next_block_height as i32))
-            .execute(conn)
+            .execute(&mut self.conn)
             .await?;
 
         trace!("Setting metadata");
 
-        Self::update_layer_metadata(&metadata).execute(conn).await?;
+        Self::update_layer_metadata(&metadata)
+            .execute(&mut self.conn)
+            .await?;
 
         Err(L0Error::Reverted)
     }
@@ -149,8 +137,7 @@ impl L0Client {
     async fn chain_reorged(
         &mut self,
         mut mismatch_block_height: BlockHeight,
-        mut mismatch_block: Digest,
-        conn: &mut AsyncDbConnection,
+        mismatch_block: Digest,
     ) -> Result<FixedLayerMetadata, L0Error> {
         // Recovery - walk up the elders until we find a common ancestor
         debug!("Chain reorg detected at height {mismatch_block_height}. Finding common ancestor");
@@ -158,8 +145,9 @@ impl L0Client {
         let client = self.client.as_mut().ok_or(L0Error::GrpcNeeded)?;
 
         while mismatch_block_height > 0 {
-            let Some(Some((last_bid, blocks))): Option<Option<(BlockHeight, Vec<Digest>)>> =
-                remote_scry(client, ("elders", StringDigest(mismatch_block))).await?
+            let Some(Some((last_bid, blocks))): Option<Option<(BlockHeight, Vec<Digest>)>> = client
+                .remote_scry(("elders", StringDigest(mismatch_block)))
+                .await?
             else {
                 return Err(L0Error::UnableToPullElders(
                     mismatch_block_height,
@@ -172,7 +160,7 @@ impl L0Client {
                 .filter(blocks::height.le(last_bid as i32))
                 .order_by(blocks::height.desc())
                 .limit(blocks.len() as i64)
-                .load::<JamlessBlock>(conn)
+                .load::<JamlessBlock>(&mut self.conn)
                 .await?;
 
             for (remote, local) in blocks.into_iter().zip(cur_blocks) {
@@ -187,25 +175,23 @@ impl L0Client {
             }
         }
 
-        self.revert_to(mismatch_block_height, conn).await
+        self.revert_to(mismatch_block_height).await
     }
 
     #[tracing::instrument(skip_all)]
     async fn update_blocks_impl(&mut self) -> Result<FixedLayerMetadata, L0Error> {
-        let mut conn = self.pool.get_owned().await.unwrap();
-
         trace!("Updating blocks");
 
-        let Some(mdata) = Self::layer_metadata(&mut conn).await? else {
+        let Some(mdata) = Self::layer_metadata(&mut self.conn).await? else {
             debug!("Metadata not set. Triggering reset");
-            return self.revert_to(0, &mut conn).await;
+            return self.revert_to(0).await;
         };
 
         let cur_tail: Option<JamlessBlock> = blocks::table
             .select(JamlessBlock::as_select())
             .order_by(blocks::height.desc())
             .limit(1)
-            .load::<JamlessBlock>(&mut conn)
+            .load::<JamlessBlock>(&mut self.conn)
             .await?
             .pop();
 
@@ -216,10 +202,7 @@ impl L0Client {
                     last.height, mdata.next_block_height
                 );
                 return self
-                    .revert_to(
-                        core::cmp::min(last.height + 1, mdata.next_block_height) as _,
-                        &mut conn,
-                    )
+                    .revert_to(core::cmp::min(last.height + 1, mdata.next_block_height) as _)
                     .await;
             }
             trace!("Current tail at height {}", last.height);
@@ -247,7 +230,7 @@ impl L0Client {
             }
         };
 
-        let Some(Some(mut new_blocks)) = manager.scry_blocks(next_height_start).await? else {
+        let Some(Some(new_blocks)) = manager.scry_blocks(next_height_start).await? else {
             return Err(L0Error::UnableToParseBlocksRangeResponse);
         };
 
@@ -261,9 +244,7 @@ impl L0Client {
             }
             (Some((tail_block, _)), false) => {
                 if new_blocks[0].0 != 0 && new_blocks[0].2.parent() != *tail_block.id {
-                    return self
-                        .chain_reorged(new_blocks[0].0, new_blocks[0].1, &mut conn)
-                        .await;
+                    return self.chain_reorged(new_blocks[0].0, new_blocks[0].1).await;
                 }
             }
             (None, true) => return Err(L0Error::NoNewBlocksNoGenesis),
@@ -326,23 +307,24 @@ impl L0Client {
 
         let metadata = FixedLayerMetadata {
             layer: self.layer(),
-            next_block_height: create_blocks.last().unwrap().height as i32 + 1,
+            next_block_height: create_blocks.last().unwrap().height + 1,
         };
 
-        conn.spawn_blocking(move |conn| {
-            use diesel::query_dsl::methods::ExecuteDsl;
-            conn.transaction(move |conn| {
-                let q1 = diesel::insert_into(blocks::table).values(create_blocks);
-                let q2 = diesel::insert_into(transactions::table).values(create_txs);
-                let q3 = Self::update_layer_metadata(&metadata);
+        self.conn
+            .spawn_blocking(move |conn| {
+                use diesel::query_dsl::methods::ExecuteDsl;
+                conn.transaction(move |conn| {
+                    let q1 = diesel::insert_into(blocks::table).values(create_blocks);
+                    let q2 = diesel::insert_into(transactions::table).values(create_txs);
+                    let q3 = Self::update_layer_metadata(&metadata);
 
-                ExecuteDsl::execute(q1, conn)?;
-                ExecuteDsl::execute(q2, conn)?;
-                ExecuteDsl::execute(q3, conn)?;
-                Ok(())
+                    ExecuteDsl::execute(q1, conn)?;
+                    ExecuteDsl::execute(q2, conn)?;
+                    ExecuteDsl::execute(q3, conn)?;
+                    Ok(())
+                })
             })
-        })
-        .await?;
+            .await?;
 
         Ok(metadata)
     }
@@ -362,7 +344,7 @@ impl L0Client {
 
         for dep in self.dependencies.iter() {
             trace!("Updating {}", dep.layer());
-            dep.update_blocks(self.pool.clone(), metadata).await?;
+            dep.update_blocks(&mut self.conn, metadata).await?;
         }
 
         res
@@ -385,10 +367,9 @@ impl L0Client {
                 Err(e)
                     if matches!(
                         e,
-                        L0Error::InvalidBlocksRangeResponse
+                        L0Error::ScryFailed(_)
                             | L0Error::UnableToParseBlocksRangeResponse
-                            | L0Error::NounCueError
-                            | L0Error::NounDecodeError
+                            | L0Error::Noun(_)
                     ) =>
                 {
                     debug!("Failed to get new blocks: {e}. Sleeping for 30 seconds.");
@@ -404,7 +385,7 @@ impl L0Client {
     }
 }
 
-impl LayerBase for L0Client {
+impl<S: Scryable> LayerBase for L0Client<S> {
     const ACCEPT_LAYERS: &'static [&'static str] = &[];
     const LAYER: &'static str = "l0";
 }

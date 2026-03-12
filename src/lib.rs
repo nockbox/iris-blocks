@@ -1,12 +1,9 @@
-use iris_grpc_proto::pb::private::v1::{
-    nock_app_service_client::NockAppServiceClient, nock_app_service_server::NockAppService, *,
-};
-use iris_ztd::{cue, Digest, Noun, NounDecode, NounEncode};
-use tonic::transport::Channel;
+use iris_ztd::{Digest, Noun, NounDecode, NounEncode};
 
 pub mod chain_activations;
 pub mod db;
 pub mod layers;
+pub mod scry;
 
 #[derive(Clone, Copy)]
 pub struct StringDigest(Digest);

@@ -7,10 +7,9 @@ use iris_blocks::layers::{
     l1::L1Client,
     layer::LayerDependency,
 };
-use iris_grpc_proto::pb::private::v1::nock_app_service_server::NockAppServiceServer;
+use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;
 use std::sync::Arc;
-use tonic::transport::{Channel, Server, Uri};
-use tonic_web::GrpcWebLayer;
+use tonic::transport::{Channel, Uri};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -40,7 +39,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_level(true),
     );
 
-    #[cfg(all(feature = "tracy"))]
+    #[cfg(feature = "tracy")]
     if std::env::var("TRACY_DISABLE").is_err() {
         let tracy = tracing_tracy::TracyLayer::default();
         sub.with(filter).with(tracy).init();
@@ -51,23 +50,27 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sub.with(filter).init();
 
     let args = Args::parse();
-    let addr = args.bind;
+    let _addr = args.bind;
 
-    let chan = if let Some(connect) = args.connect {
-        Some(Channel::builder(connect).connect().await?)
+    let scry = if let Some(connect) = args.connect {
+        Some(NockAppServiceClient::new(
+            Channel::builder(connect).connect().await?,
+        ))
     } else {
         None
     };
+
+    let mut conn = iris_blocks::db::new_conn(&args.db, 1).await?;
+
     if args.run_migrations {
-        iris_blocks::db::run_migrations(&args.db);
+        iris_blocks::db::run_migrations(&mut conn).await;
     }
-    let pool = iris_blocks::db::new_pool(&args.db, 1).await?;
 
     let activations = ChainActivations::mainnet();
     let l1_client = Arc::new(L1Client::new(activations.clone(), vec![]));
     let l0_deps: Vec<Arc<dyn LayerDependency>> = vec![l1_client.clone()];
 
-    let client = L0Client::new(pool, chan, args.l0, activations.clone(), l0_deps);
+    let client = L0Client::new(conn, scry, args.l0, activations.clone(), l0_deps);
     client.run().await;
 
     /*let proxy = IrisPeekProxy::new(chan);

@@ -948,6 +948,7 @@ dependencies = [
  "diesel-async",
  "diesel_migrations",
  "futures",
+ "http-body-util",
  "iris-grpc-proto",
  "iris-nockchain-types 0.2.0-alpha.6 (git+https://github.com/nockbox/iris-rs)",
  "iris-ztd 0.2.0-alpha.6 (git+https://github.com/nockbox/iris-rs)",

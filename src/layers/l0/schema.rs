@@ -1,15 +1,6 @@
 //! L0 layer: blocks and transactions.
 
-use diesel::{
-    backend::Backend,
-    deserialize::{self, FromSql},
-    prelude::*,
-    query_builder::BindCollector,
-    serialize::{self, IsNull, Output, ToSql},
-    sql_types::Text,
-};
-use iris_ztd::Digest;
-use std::io::Write;
+use diesel::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Schema

@@ -16,12 +16,16 @@ pub enum LayerErrorSource {
     OtherError(String),
     #[error(transparent)]
     Layer(Box<LayerError>),
-    #[error(transparent)]
-    PoolRun(#[from] crate::db::PoolRunError),
     #[error("Noun decode error block {0} digest {1}")]
     NounDecode(u32, Digest),
     #[error("Noun cue error on block {0} digest {1}")]
     NounCue(u32, Digest),
+}
+
+impl From<LayerError> for LayerErrorSource {
+    fn from(e: LayerError) -> Self {
+        Self::Layer(Box::new(e))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -132,11 +136,11 @@ pub trait LayerImpl: Layer {
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
     ) -> impl Future<Output = Result<(), LayerErrorSource>> + Send + 'a;
-    fn update_blocks_impl(
-        &self,
-        pool: crate::db::DbPool,
+    fn update_blocks_impl<'a>(
+        &'a self,
+        conn: &'a mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
-    ) -> impl Future<Output = Result<(), LayerErrorSource>> + Send + '_;
+    ) -> impl Future<Output = Result<(), LayerErrorSource>> + Send + 'a;
 }
 
 #[async_trait::async_trait]
@@ -148,7 +152,7 @@ pub trait LayerDependency: Layer + Send + Sync {
     ) -> Result<(), LayerError>;
     async fn update_blocks(
         &self,
-        pool: crate::db::DbPool,
+        conn: &mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
     ) -> Result<(), LayerError>;
 }
@@ -171,10 +175,10 @@ impl<T: ?Sized + LayerImpl + Send + Sync> LayerDependency for T {
     #[tracing::instrument(skip_all)]
     async fn update_blocks(
         &self,
-        pool: crate::db::DbPool,
+        conn: &mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
     ) -> Result<(), LayerError> {
-        self.update_blocks_impl(pool, metadata)
+        self.update_blocks_impl(conn, metadata)
             .await
             .map_err(|e| LayerError {
                 layer: self.layer(),

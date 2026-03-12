@@ -1,15 +1,12 @@
-use super::{remote_scry, L0Error};
+use crate::scry::{ScryError, Scryable};
 use clap::Parser;
 use futures::future::{BoxFuture, FutureExt};
-use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;
 use iris_nockchain_types::{BlockHeight, Page, Tx};
 use iris_ztd::{Digest, ZMap};
 use log::*;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Poll, Waker};
-use tonic::transport::Channel;
 
 #[derive(Debug, Copy, Clone, Parser)]
 pub struct BlockRangeConfig {
@@ -22,7 +19,7 @@ pub struct BlockRangeConfig {
 }
 
 pub type ScryBlocksResult =
-    Result<Option<Option<Vec<(BlockHeight, Digest, Page, ZMap<Digest, Tx>)>>>, L0Error>;
+    Result<Option<Option<Vec<(BlockHeight, Digest, Page, ZMap<Digest, Tx>)>>>, ScryError>;
 
 enum Prefetch {
     Pending(BoxFuture<'static, ScryBlocksResult>),
@@ -35,14 +32,14 @@ struct SharedState {
 }
 
 #[derive(Clone)]
-pub struct BlockRangeManager {
+pub struct BlockRangeManager<S> {
     config: BlockRangeConfig,
     shared: Arc<Mutex<SharedState>>,
-    client: NockAppServiceClient<Channel>,
+    client: S,
 }
 
-impl BlockRangeManager {
-    pub fn new(client: NockAppServiceClient<Channel>, config: BlockRangeConfig) -> Self {
+impl<S: Scryable> BlockRangeManager<S> {
+    pub fn new(client: S, config: BlockRangeConfig) -> Self {
         let shared = Arc::new(Mutex::new(SharedState {
             tasks: std::collections::BTreeMap::new(),
             driver_waker: None,
@@ -110,12 +107,12 @@ impl BlockRangeManager {
             });
 
             for &start in &valid_starts {
-                if !state.tasks.contains_key(&start) {
+                if let std::collections::btree_map::Entry::Vacant(e) = state.tasks.entry(start) {
                     let mut c = self.client.clone();
                     let end = start + self.config.block_range_step - 1;
-                    let fut = async move { remote_scry(&mut c, (scry_root, start, end, ())).await }
-                        .boxed();
-                    state.tasks.insert(start, Prefetch::Pending(fut));
+                    let fut =
+                        async move { c.remote_scry((scry_root, start, end, ())).await }.boxed();
+                    e.insert(Prefetch::Pending(fut));
                     dirty = true;
                 }
             }
@@ -133,9 +130,10 @@ impl BlockRangeManager {
             Some(Prefetch::Ready(res)) => res,
             Some(Prefetch::Pending(fut)) => fut.await,
             None => {
-                let mut c = self.client.clone();
                 let end = next_height_start + self.config.block_range_step - 1;
-                remote_scry(&mut c, (scry_root, next_height_start, end, ())).await
+                self.client
+                    .remote_scry((scry_root, next_height_start, end, ()))
+                    .await
             }
         }
     }

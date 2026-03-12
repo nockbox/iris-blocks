@@ -2,7 +2,6 @@ pub mod schema;
 
 use super::{l0::schema::*, layer::*, shared_schema::*};
 use crate::chain_activations::ChainActivations;
-use core::future::Future;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use iris_nockchain_types::{Nicks, Page, RawTx};
@@ -31,94 +30,96 @@ impl LayerBase for L1Client {
 }
 
 impl LayerImpl for L1Client {
-    fn expire_blocks_impl<'a>(
+    #[tracing::instrument(skip_all)]
+    async fn expire_blocks_impl<'a>(
         &'a self,
         conn: &'a mut crate::db::AsyncDbConnection,
         mut metadata: FixedLayerMetadata,
-    ) -> impl Future<Output = Result<(), LayerErrorSource>> + Send + 'a {
-        async move {
-            let cur_metadata = Self::layer_metadata(conn)
-                .await?
-                .unwrap_or(FixedLayerMetadata {
-                    layer: Self::LAYER,
-                    next_block_height: 0,
-                });
+    ) -> Result<(), LayerErrorSource> {
+        let cur_metadata = Self::layer_metadata(conn)
+            .await?
+            .unwrap_or(FixedLayerMetadata {
+                layer: Self::LAYER,
+                next_block_height: 0,
+            });
 
-            if cur_metadata.next_block_height < metadata.next_block_height {
-                metadata = cur_metadata;
-            }
-
-            for dep in &self.deps {
-                dep.expire_blocks(conn, metadata).await;
-            }
-
-            metadata.layer = Self::LAYER;
-
-            trace!("Dropping notes");
-
-            diesel::delete(notes::table)
-                .filter(notes::created_height.ge(metadata.next_block_height))
-                .execute(conn)
-                .await?;
-
-            Self::update_layer_metadata(&metadata).execute(conn).await?;
-
-            Ok(())
+        if cur_metadata.next_block_height < metadata.next_block_height {
+            metadata = cur_metadata;
         }
+
+        for dep in &self.deps {
+            dep.expire_blocks(conn, metadata).await?;
+        }
+
+        metadata.layer = Self::LAYER;
+
+        trace!("Dropping notes");
+
+        diesel::delete(notes::table)
+            .filter(notes::created_height.ge(metadata.next_block_height))
+            .execute(conn)
+            .await?;
+
+        Self::update_layer_metadata(&metadata).execute(conn).await?;
+
+        Ok(())
     }
 
-    fn update_blocks_impl(
-        &self,
-        pool: crate::db::DbPool,
+    #[tracing::instrument(skip_all)]
+    async fn update_blocks_impl<'a>(
+        &'a self,
+        conn: &'a mut crate::db::AsyncDbConnection,
         metadata: FixedLayerMetadata,
-    ) -> impl Future<Output = Result<(), LayerErrorSource>> + Send + '_ {
-        let update_span = tracing::info_span!("l1_update_blocks");
+    ) -> Result<(), LayerErrorSource> {
+        if metadata.next_block_height == 0 {
+            return Ok(());
+        }
 
-        async move {
-            if metadata.next_block_height == 0 {
-                return Ok(());
-            }
+        let cur_metadata = Self::layer_metadata(conn).await?;
+        let start_block_height = cur_metadata
+            .as_ref()
+            .map(|m| m.next_block_height)
+            .unwrap_or_default() as u32;
+        let end_block_height = metadata.next_block_height as u32 - 1;
 
-            let mut conn = pool.get().await?;
-            let cur_metadata = Self::layer_metadata(&mut conn).await?;
-            let start_block_height = cur_metadata
-                .as_ref()
-                .map(|m| m.next_block_height)
-                .unwrap_or_default() as u32;
-            let end_block_height = metadata.next_block_height as u32 - 1;
+        if start_block_height > end_block_height {
+            return Ok(());
+        }
 
-            if start_block_height > end_block_height {
-                return Ok(());
-            }
-
-            self.expire_blocks_impl(&mut conn, FixedLayerMetadata {
+        self.expire_blocks_impl(
+            conn,
+            FixedLayerMetadata {
                 layer: Self::LAYER,
                 next_block_height: start_block_height as _,
-            }).await?;
+            },
+        )
+        .await?;
 
-            trace!("Syncing note balances from {start_block_height} to {end_block_height}");
-            let constants = self.activations.constants();
+        trace!("Syncing note balances from {start_block_height} to {end_block_height}");
+        let constants = self.activations.constants();
 
-            let step = 100u32;
+        let step = 100u32;
 
-            for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
-                let block_range_span = tracing::info_span!("l1_update_block_range", block_height, end_block_height);
-                trace!("Syncing block {block_height}");
-                let last_block_height = core::cmp::min(block_height + step - 1, end_block_height);
+        for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
+            let block_range_span =
+                tracing::info_span!("l1_update_block_range", block_height, end_block_height);
+            trace!("Syncing block {block_height}");
+            let last_block_height = core::cmp::min(block_height + step - 1, end_block_height);
 
-                let block_span = tracing::info_span!("l1_db_get_block_range", block_height, end_block_height);
-                let blocks = blocks::table
-                    .filter(
-                        blocks::height
-                            .ge(block_height as i32)
-                            .and(blocks::height.le(last_block_height as i32)),
-                    )
-                    .order_by(blocks::height)
-                    .load::<Block>(&mut conn)
-                    .instrument(block_span)
-                    .await?;
+            let block_span =
+                tracing::info_span!("l1_db_get_block_range", block_height, end_block_height);
+            let blocks = blocks::table
+                .filter(
+                    blocks::height
+                        .ge(block_height as i32)
+                        .and(blocks::height.le(last_block_height as i32)),
+                )
+                .order_by(blocks::height)
+                .load::<Block>(conn)
+                .instrument(block_span)
+                .await?;
 
-                async {
+            async {
                     for block in blocks {
                         let block_height = block.height as u32;
                         let get_txs_span = tracing::info_span!("l1_db_get_txs", block.height);
@@ -135,7 +136,7 @@ impl LayerImpl for L1Client {
 
                         let txs: Vec<Transaction> = transactions::table
                             .filter(transactions::height.eq(block_height as i32))
-                            .load::<Transaction>(&mut conn)
+                            .load::<Transaction>(conn)
                             .instrument(get_txs_span)
                             .await?;
 
@@ -148,7 +149,7 @@ impl LayerImpl for L1Client {
 
                             let names = raw.input_names();
 
-                            let mut names_cond = names
+                            let names_cond = names
                                 .iter()
                                 .map(|n| {
                                     notes::first
@@ -162,7 +163,7 @@ impl LayerImpl for L1Client {
                                 query = query.or_filter(cond);
                             }
 
-                            let input_notes = query.load::<Note>(&mut conn).await?;
+                            let input_notes = query.load::<Note>(conn).await?;
 
                             if input_notes.len() != names.len() {
                                 let got_names = input_notes.iter().map(|n| (*n.first, *n.last)).collect::<BTreeSet<_>>();
@@ -248,10 +249,8 @@ impl LayerImpl for L1Client {
                 }
                 .instrument(block_range_span)
                 .await?;
-            }
-
-            Ok(())
         }
-        .instrument(update_span)
+
+        Ok(())
     }
 }

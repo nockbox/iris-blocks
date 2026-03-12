@@ -1,10 +1,6 @@
 use diesel::{
-    backend::Backend,
-    deserialize::{self, FromSql},
-    query_builder::BindCollector,
-    serialize::{self, IsNull, Output, ToSql},
-    sql_types::Text,
-    AsChangeset, Insertable, Queryable, Selectable,
+    backend::Backend, query_builder::BindCollector, serialize::ToSql, AsChangeset, Insertable,
+    Queryable, Selectable,
 };
 use iris_ztd::Digest;
 
@@ -29,7 +25,7 @@ pub mod sql_types {
 #[macro_export]
 macro_rules! impl_digest_sql {
     ($T:ty) => {
-        impl<DB: diesel::backend::Backend> diesel::serialize::ToSql<crate::layers::shared_schema::sql_types::DigestSql, DB> for $T where for<'a> String: Into<<<DB as diesel::backend::Backend>::BindCollector<'a> as diesel::query_builder::BindCollector<'a, DB>>::Buffer> {
+        impl<DB: diesel::backend::Backend> diesel::serialize::ToSql<$crate::layers::shared_schema::sql_types::DigestSql, DB> for $T where for<'a> String: Into<<<DB as diesel::backend::Backend>::BindCollector<'a> as diesel::query_builder::BindCollector<'a, DB>>::Buffer> {
             fn to_sql<'b>(
                 &'b self,
                 out: &mut diesel::serialize::Output<'b, '_, DB>,
@@ -39,7 +35,7 @@ macro_rules! impl_digest_sql {
             }
         }
 
-        impl<DB: diesel::backend::Backend> diesel::deserialize::FromSql<crate::layers::shared_schema::sql_types::DigestSql, DB> for $T where *const str: diesel::deserialize::FromSql<diesel::sql_types::Text, DB> {
+        impl<DB: diesel::backend::Backend> diesel::deserialize::FromSql<$crate::layers::shared_schema::sql_types::DigestSql, DB> for $T where *const str: diesel::deserialize::FromSql<diesel::sql_types::Text, DB> {
             fn from_sql(
                 bytes: <DB as diesel::backend::Backend>::RawValue<'_>,
             ) -> diesel::deserialize::Result<Self> {
