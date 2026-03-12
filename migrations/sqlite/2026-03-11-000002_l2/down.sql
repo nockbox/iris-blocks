@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS tx_signers;
+DROP TABLE IF EXISTS tx_outputs;
+DROP TABLE IF EXISTS tx_seeds;
+DROP TABLE IF EXISTS tx_spends;
