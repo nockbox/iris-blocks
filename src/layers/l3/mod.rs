@@ -199,6 +199,15 @@ impl LayerImpl for L3Client {
         metadata: FixedLayerMetadata,
     ) -> Result<(), LayerErrorSource> {
         if metadata.next_block_height == 0 {
+            let dep_metadata = Self::layer_metadata(conn)
+                .await?
+                .unwrap_or(FixedLayerMetadata {
+                    layer: Self::LAYER,
+                    next_block_height: 0,
+                });
+            for dep in &self.deps {
+                dep.update_blocks(conn, dep_metadata).await?;
+            }
             return Ok(());
         }
 
@@ -210,6 +219,15 @@ impl LayerImpl for L3Client {
         let end_block_height = metadata.next_block_height as u32 - 1;
 
         if start_block_height > end_block_height {
+            let dep_metadata = Self::layer_metadata(conn)
+                .await?
+                .unwrap_or(FixedLayerMetadata {
+                    layer: Self::LAYER,
+                    next_block_height: 0,
+                });
+            for dep in &self.deps {
+                dep.update_blocks(conn, dep_metadata).await?;
+            }
             return Ok(());
         }
 
@@ -499,6 +517,16 @@ impl LayerImpl for L3Client {
             }
             .instrument(block_range_span)
             .await?;
+        }
+
+        let dep_metadata = Self::layer_metadata(conn)
+            .await?
+            .unwrap_or(FixedLayerMetadata {
+                layer: Self::LAYER,
+                next_block_height: 0,
+            });
+        for dep in &self.deps {
+            dep.update_blocks(conn, dep_metadata).await?;
         }
 
         Ok(())
