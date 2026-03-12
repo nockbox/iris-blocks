@@ -2,13 +2,14 @@
 use clap::Parser;
 use core::net::SocketAddr;
 use iris_blocks::chain_activations::ChainActivations;
+use iris_blocks::layers::shared_schema::FixedLayerMetadata;
 use iris_blocks::layers::{
     l0::{L0Client, L0Config},
     l1::L1Client,
     l2::L2Client,
     l3::L3Client,
     l4::L4Client,
-    layer::LayerDependency,
+    layer::{LayerDependency, LayerExt},
 };
 use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;
 use std::sync::Arc;
@@ -27,6 +28,8 @@ pub struct Args {
     pub db: String,
     #[arg(short, long, default_value = "false")]
     pub run_migrations: bool,
+    #[arg(long)]
+    pub rederive_l4: bool,
     #[command(flatten)]
     pub l0: L0Config,
 }
@@ -78,6 +81,21 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let l1_deps: Vec<Arc<dyn LayerDependency>> = vec![l2_client.clone()];
     let l1_client = Arc::new(L1Client::new(activations.clone(), l1_deps));
     let l0_deps: Vec<Arc<dyn LayerDependency>> = vec![l1_client.clone()];
+
+    if args.rederive_l4 {
+        let dep_metadata = L3Client::layer_metadata(&mut conn)
+            .await?
+            .unwrap_or(FixedLayerMetadata {
+                layer: "l3",
+                next_block_height: 0,
+            });
+        l4_client
+            .update_blocks(&mut conn, dep_metadata)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        eprintln!("L4 re-derived successfully.");
+        return Ok(());
+    }
 
     let (client, _query_tx) = L0Client::new(conn, scry, args.l0, activations.clone(), l0_deps);
     client.run().await;

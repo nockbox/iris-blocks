@@ -150,7 +150,7 @@ debits:
 txid (base58 not null), pk (base58 pk not null), sole_owner (bool not null), amount (u64 not null), fee (u64 not null)
 
 credits:
-txid (base58 not null), recipient_type (pk | pkh | lock | bridge lock), recipient (base58 not null), amount (u64 not null)
+txid (base58 not null), recipient_type (pk | v0pk | pkh | lock), recipient (base58 not null), amount (u64 not null)
 ```
 
 ## Mappings
