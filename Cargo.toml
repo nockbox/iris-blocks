@@ -13,11 +13,19 @@ documentation = "https://docs.rs/iris-blocks"
 homepage = "https://nockbox.org"
 authors = ["NockBox inc. <tech@nockbox.org>"]
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "iris-blocks"
+path = "src/main.rs"
+required-features = ["binary"]
+
 [dependencies]
 iris-ztd = { git = "https://github.com/nockbox/iris-rs/", features = ["alloc"] }
 iris-nockchain-types = { git = "https://github.com/nockbox/iris-rs" }
-iris-grpc-proto = { path = "../iris-rs/crates/iris-grpc-proto", features = ["private-api", "server"] }
-tonic = { version = "0.12" }
+iris-grpc-proto = { path = "../iris-rs/crates/iris-grpc-proto", features = ["private-api"] }
+tonic = { version = "0.12", default-features = false }
 bs58 = { version = "0.5", default-features = false }
 bitvec = { version = "1.0", default-features = false }
 arrayref = "0.3"
@@ -33,18 +41,30 @@ tracing = "0.1"
 tracing-tracy = { version = "0.11.4", optional = true, features = ["fibers"] }
 tracy-client = { version = "=0.18.2", optional = true }
 http-body-util = "0.1"
+clap = { version = "4.0", features = ["derive"] }
 
-diesel = { version = "2.2", default-features = false, features = ["sqlite", "returning_clauses_for_sqlite_3_35"] }
-diesel_migrations = { version = "2.2", default-features = false }
-diesel-async = { version = "0.5", default-features = false, features = ["bb8", "sync-connection-wrapper"] }
-libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+diesel = { version = "2.3", default-features = false, features = ["sqlite", "returning_clauses_for_sqlite_3_35"] }
+diesel_migrations = { version = "2.3", default-features = false }
+diesel-async = { version = "0.7", default-features = false, features = ["sync-connection-wrapper"] }
+libsqlite3-sys = { version = "0.30", features = ["bundled"], optional = true }
 
 tonic-web = { version = "0.12", optional = true }
-tokio = { version = "1.42", features = ["full"], optional = true }
-clap = { version = "4.0", features = ["derive"], optional = true }
+tokio = { version = "1.42" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
+wasm-bindgen = { version = "0.2", optional = true }
+tonic-web-wasm-client = { version = "0.6", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+tracing-subscriber-wasm = { version = "0.1", optional = true }
+tsify = { version = "0.5", default-features = false, features = ["json"], optional = true }
+
 [features]
-default = ["binary", "tracy"]
-binary = ["tonic-web", "tokio", "clap", "tracing-subscriber"]
+default = []
+tokio = ["tokio/full"]
+binary = ["tonic-web", "tokio", "tracing-subscriber", "libsqlite3-sys"]
 tracy = ["tracing-tracy", "tracy-client"]
+wasm = ["wasm-bindgen", "tonic-web-wasm-client", "wasm-bindgen-futures", "tracing-subscriber", "tracing-subscriber-wasm", "tsify"]
+
+[profile.profiling]
+inherits = "release"
+debug = true

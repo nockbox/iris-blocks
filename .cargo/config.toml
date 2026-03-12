@@ -1,0 +1,6 @@
+[profile.release]
+debug = true
+rustflags = ["-C", "force-frame-pointers=yes", "-C", "force-unwind-tables=yes"]
+
+[target.wasm32-unknown-unknown]
+linker = "rust-lld"

@@ -24,3 +24,6 @@ CREATE INDEX idx_notes_created_height ON notes(created_height);
 CREATE INDEX idx_notes_spent_height ON notes(spent_height);
 CREATE INDEX idx_notes_created_txid ON notes(created_txid);
 CREATE INDEX idx_notes_spent_txid ON notes(spent_txid);
+CREATE INDEX idx_notes_coinbase ON notes(coinbase);
+CREATE INDEX idx_notes_spent ON notes(spent_txid) WHERE spent_txid IS NOT NULL;
+CREATE INDEX idx_notes_unspent ON notes(spent_txid) WHERE spent_txid IS NULL;

@@ -48,6 +48,24 @@ Deleting l1 metadata will force all downstream layers to resync. Deleting l0 wil
 
 You may also overwrite the next_block_height to force rollback to a particular block.
 
+## Wasm
+
+You may build this as a wasm module with:
+
+```
+wasm-pack build --features=wasm --target web --out-dir pkg --scope nockbox
+```
+
+And then use it with:
+
+```
+import { BlockExporter, setLogging } from "@nockbox/iris-blocks";
+setLogging();
+const e = await new BlockExporter(["l0", "l1"], ":memory:", true, "http://localhost:8080");
+```
+
+Data is not persisted.
+
 ## Layers
 
 ### L0

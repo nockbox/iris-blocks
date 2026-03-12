@@ -5,6 +5,7 @@ use diesel_async::RunQueryDsl;
 use iris_ztd::Digest;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::watch;
 
 #[derive(Debug, Error)]
 pub enum LayerErrorSource {
@@ -44,6 +45,8 @@ impl core::fmt::Display for LayerError {
 pub trait LayerBase {
     const ACCEPT_LAYERS: &'static [&'static str];
     const LAYER: &'static str;
+    type Stats;
+    fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>>;
 }
 
 pub trait Layer {
@@ -84,14 +87,20 @@ impl std::error::Error for VerifyDependenciesError {}
 pub trait LayerExt: LayerBase {
     fn verify_dependencies(
         deps: &[Arc<dyn LayerDependency>],
-    ) -> Result<(), VerifyDependenciesError> {
+    ) -> Result<
+        (
+            watch::Sender<Option<Self::Stats>>,
+            watch::Receiver<Option<Self::Stats>>,
+        ),
+        VerifyDependenciesError,
+    > {
         let mismatch = deps
             .iter()
             .filter(|dep| !dep.accepts_layers().contains(&Self::LAYER))
             .map(|dep| dep.layer())
             .collect::<Vec<_>>();
         if mismatch.is_empty() {
-            Ok(())
+            Ok(watch::channel(None))
         } else {
             Err(VerifyDependenciesError(Self::LAYER, mismatch))
         }

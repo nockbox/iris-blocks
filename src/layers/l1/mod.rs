@@ -8,25 +8,38 @@ use iris_nockchain_types::{Nicks, Page, RawTx};
 use iris_ztd::{cue, NounDecode};
 use log::*;
 use schema::*;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tracing::Instrument;
 
 pub struct L1Client {
     activations: ChainActivations,
     deps: Vec<Arc<dyn LayerDependency>>,
+    stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
+    stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
 impl L1Client {
     pub fn new(activations: ChainActivations, deps: Vec<Arc<dyn LayerDependency>>) -> Self {
-        Self::verify_dependencies(&deps).unwrap();
-        Self { activations, deps }
+        let (stats_tx, stats_rx) = Self::verify_dependencies(&deps).unwrap();
+        Self {
+            activations,
+            deps,
+            stats_tx,
+            stats_rx,
+        }
     }
 }
 
 impl LayerBase for L1Client {
     const ACCEPT_LAYERS: &'static [&'static str] = &["l0"];
     const LAYER: &'static str = "l1";
+    type Stats = L1Stats;
+    fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>> {
+        self.stats_rx.clone()
+    }
 }
 
 impl LayerImpl for L1Client {
@@ -245,6 +258,20 @@ impl LayerImpl for L1Client {
                         .await?;
                     }
 
+                    let cur_note_count = notes::table.count().get_result::<i64>(conn).await?;
+                    let cur_spent_note_count = notes::table
+                        .filter(notes::spent_txid.is_not_null())
+                        .count()
+                        .get_result::<i64>(conn)
+                        .await?;
+
+                    let new_stats = L1Stats {
+                        total_notes: cur_note_count as u64,
+                        spent_notes: cur_spent_note_count as u64,
+                    };
+
+                    self.stats_tx.send(Some(new_stats)).unwrap();
+
                     Ok(())
                 }
                 .instrument(block_range_span)
@@ -253,4 +280,12 @@ impl LayerImpl for L1Client {
 
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(from_wasm_abi, into_wasm_abi))]
+pub struct L1Stats {
+    pub total_notes: u64,
+    pub spent_notes: u64,
 }

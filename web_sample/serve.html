@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Iris Blocks WASM Test</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            padding: 2rem;
+            background: #1e1e1e;
+            color: #fff;
+        }
+
+        .status {
+            padding: 1rem;
+            background: #2d2d2d;
+            border-radius: 4px;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Iris Blocks WASM Test</h1>
+    <div class="status" id="status">Loading WASM...</div>
+    <div class="status" id="l0">Blocks: 0; TXs: 0</div>
+    <div class="status" id="l1">Notes: 0; Spent: 0; Unspent: 0</div>
+
+    <script type="module">
+        import init, { BlockExporter, setLogging } from '../pkg/iris_blocks.js';
+
+        async function main() {
+            const statusEl = document.getElementById('status');
+            const l0El = document.getElementById('l0');
+            const l1El = document.getElementById('l1');
+            try {
+                // Initialize the WASM module
+                await init();
+                statusEl.textContent = "WASM Initialized.\n";
+
+                // Setup logging
+                //setLogging();
+                statusEl.textContent += "Logging set.\n";
+
+                // Instantiate exporter as per README
+                statusEl.textContent += "Creating BlockExporter...\n";
+                const exporter = await new BlockExporter(["l0", "l1"], ":memory:", true, "http://localhost:8080", true);
+
+                statusEl.textContent += "BlockExporter instance created successfully!\n";
+                console.log("BlockExporter instance:", exporter);
+
+                async function l1update() {
+                    while (true) {
+                        const l1_stats = await exporter.nextL1Stats();
+                        if (l1_stats) {
+                            l1El.textContent = `Notes: ${l1_stats.total_notes}; Spent: ${l1_stats.spent_notes}; Unspent: ${l1_stats.total_notes - l1_stats.spent_notes}`;
+                        }
+                        await new Promise(resolve => setTimeout(resolve, 100));
+                    }
+                }
+
+                async function l0update() {
+                    while (true) {
+                        const l0_stats = await exporter.nextL0Stats();
+                        if (l0_stats) {
+                            l0El.textContent = `Blocks: ${l0_stats.next_block_height - 1}; TXs: ${l0_stats.total_txs}`;
+                        }
+                        await new Promise(resolve => setTimeout(resolve, 100));
+                    }
+                }
+
+                l1update();
+                l0update();
+
+                // Assuming there's a way to cleanly stop or it runs until stopped
+                // exporter.stop(); // If needed later
+            } catch (err) {
+                console.error("Error during WASM execution:", err);
+                statusEl.textContent = `Error: ${err.message || err}`;
+            }
+        }
+
+        main();
+    </script>
+</body>
+
+</html>

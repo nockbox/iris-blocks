@@ -3,7 +3,11 @@ use iris_ztd::{Digest, Noun, NounDecode, NounEncode};
 pub mod chain_activations;
 pub mod db;
 pub mod layers;
+mod rt;
 pub mod scry;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 #[derive(Clone, Copy)]
 pub struct StringDigest(Digest);

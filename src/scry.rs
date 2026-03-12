@@ -1,3 +1,4 @@
+use crate::rt::RtBound;
 use iris_grpc_proto::pb::private::v1::{
     nock_app_service_client::NockAppServiceClient, peek_response::Result as PeekResult, *,
 };
@@ -27,14 +28,14 @@ pub enum ScryError {
     ScryFailed(ScryFailed),
 }
 
-pub trait Scryable: Clone + Send + 'static {
-    fn remote_scry<'a, T: NounDecode + Send + 'a>(
+pub trait Scryable: Clone + RtBound + 'static {
+    fn remote_scry<'a, T: NounDecode + RtBound + 'a>(
         &'a mut self,
-        path: impl NounEncode + Send + 'a,
-    ) -> impl core::future::Future<Output = Result<T, ScryError>> + Send + 'a;
+        path: impl NounEncode + RtBound + 'a,
+    ) -> impl core::future::Future<Output = Result<T, ScryError>> + RtBound + 'a;
 }
 
-impl<C: tonic::client::GrpcService<tonic::body::BoxBody> + Send + Clone + 'static> Scryable
+impl<C: tonic::client::GrpcService<tonic::body::BoxBody> + RtBound + Clone + 'static> Scryable
     for NockAppServiceClient<C>
 where
     C::Error: Into<StdError>,
@@ -42,11 +43,11 @@ where
     <C::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
     <C as tonic::client::GrpcService<
         http_body_util::combinators::UnsyncBoxBody<tonic::codegen::Bytes, tonic::Status>,
-    >>::Future: Send,
+    >>::Future: RtBound,
 {
-    async fn remote_scry<'a, T: NounDecode + 'a>(
+    async fn remote_scry<'a, T: NounDecode + RtBound + 'a>(
         &'a mut self,
-        path: impl NounEncode + Send + 'a,
+        path: impl NounEncode + RtBound + 'a,
     ) -> Result<T, ScryError>
     where
         C::Error: Into<StdError>,

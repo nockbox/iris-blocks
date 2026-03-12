@@ -1,9 +1,11 @@
+use crate::rt::RtFuture;
 use crate::scry::{ScryError, Scryable};
 use clap::Parser;
-use futures::future::{BoxFuture, FutureExt};
+use futures::future::BoxFuture;
 use iris_nockchain_types::{BlockHeight, Page, Tx};
 use iris_ztd::{Digest, ZMap};
 use log::*;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Poll, Waker};
@@ -18,11 +20,21 @@ pub struct BlockRangeConfig {
     pub block_range_scry_no_pow: bool,
 }
 
+impl Default for BlockRangeConfig {
+    fn default() -> Self {
+        Self {
+            block_range_step: 10,
+            block_range_peek_ahead: 3,
+            block_range_scry_no_pow: false,
+        }
+    }
+}
+
 pub type ScryBlocksResult =
     Result<Option<Option<Vec<(BlockHeight, Digest, Page, ZMap<Digest, Tx>)>>>, ScryError>;
 
 enum Prefetch {
-    Pending(BoxFuture<'static, ScryBlocksResult>),
+    Pending(Pin<Box<RtFuture<'static, ScryBlocksResult>>>),
     Ready(ScryBlocksResult),
 }
 
@@ -46,7 +58,7 @@ impl<S: Scryable> BlockRangeManager<S> {
         }));
 
         let shared_clone = shared.clone();
-        tokio::spawn(futures::future::poll_fn(move |cx| {
+        crate::rt::spawn(futures::future::poll_fn(move |cx| {
             let mut state = shared_clone.lock().unwrap();
             state.driver_waker = Some(cx.waker().clone());
 
@@ -111,7 +123,7 @@ impl<S: Scryable> BlockRangeManager<S> {
                     let mut c = self.client.clone();
                     let end = start + self.config.block_range_step - 1;
                     let fut =
-                        async move { c.remote_scry((scry_root, start, end, ())).await }.boxed();
+                        Box::pin(async move { c.remote_scry((scry_root, start, end, ())).await });
                     e.insert(Prefetch::Pending(fut));
                     dirty = true;
                 }

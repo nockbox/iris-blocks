@@ -60,7 +60,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let mut conn = iris_blocks::db::new_conn(&args.db, 1).await?;
+    let mut conn = iris_blocks::db::new_conn(&args.db).await?;
 
     if args.run_migrations {
         iris_blocks::db::run_migrations(&mut conn).await;

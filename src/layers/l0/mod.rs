@@ -3,6 +3,7 @@ pub mod schema;
 use super::{layer::*, shared_schema::*};
 use crate::chain_activations::ChainActivations;
 use crate::db::AsyncDbConnection;
+use crate::rt;
 use crate::scry::{NounError, ScryError, ScryFailed, Scryable};
 use crate::StringDigest;
 use clap::Parser;
@@ -13,8 +14,11 @@ use iris_nockchain_types::BlockHeight;
 use iris_ztd::{jam, Digest, NounEncode};
 use log::*;
 use schema::*;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::watch;
+#[cfg(feature = "tokio")]
 use tonic::transport::Channel;
 
 mod block_range_manager;
@@ -28,13 +32,24 @@ pub struct L0Config {
     pub store_pow: bool,
 }
 
-pub struct L0Client<S = NockAppServiceClient<Channel>> {
+impl Default for L0Config {
+    fn default() -> Self {
+        Self {
+            block_range_config: Default::default(),
+            store_pow: false,
+        }
+    }
+}
+
+pub struct L0Client<S: Scryable> {
     conn: AsyncDbConnection,
     client: Option<S>,
     manager: Option<BlockRangeManager<S>>,
     dependencies: Vec<Arc<dyn LayerDependency>>,
     activations: ChainActivations,
     config: L0Config,
+    stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
+    stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
 #[derive(Debug, Error)]
@@ -85,7 +100,7 @@ impl<S: Scryable> L0Client<S> {
         activations: ChainActivations,
         dependencies: Vec<Arc<dyn LayerDependency>>,
     ) -> Self {
-        Self::verify_dependencies(&dependencies).unwrap();
+        let (stats_tx, stats_rx) = Self::verify_dependencies(&dependencies).unwrap();
         Self {
             conn,
             client: client.clone(),
@@ -93,6 +108,8 @@ impl<S: Scryable> L0Client<S> {
             activations,
             dependencies,
             config,
+            stats_tx,
+            stats_rx,
         }
     }
 
@@ -310,6 +327,16 @@ impl<S: Scryable> L0Client<S> {
             next_block_height: create_blocks.last().unwrap().height + 1,
         };
 
+        let cur_txs: i64 = transactions::table
+            .count()
+            .get_result(&mut self.conn)
+            .await?;
+
+        let new_stats = L0Stats {
+            next_block_height: metadata.next_block_height as _,
+            total_txs: cur_txs as u64 + create_txs.len() as u64,
+        };
+
         self.conn
             .spawn_blocking(move |conn| {
                 use diesel::query_dsl::methods::ExecuteDsl;
@@ -325,6 +352,8 @@ impl<S: Scryable> L0Client<S> {
                 })
             })
             .await?;
+
+        self.stats_tx.send(Some(new_stats)).ok();
 
         Ok(metadata)
     }
@@ -355,14 +384,13 @@ impl<S: Scryable> L0Client<S> {
         loop {
             match self.update_blocks().await {
                 // We updated successfully, continue without sleeping
-                Ok(_) => (),
+                Ok(_) => {}
                 Err(L0Error::Reverted) => {
                     debug!("Chain reverted. Restarting...");
-                    continue;
                 }
-                Err(L0Error::NoNewBlocks(_, block, height)) => {
+                Err(L0Error::NoNewBlocks(_metadata, block, height)) => {
                     debug!("Chain up-to-date at block {block}, height {height}");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    rt::sleep(std::time::Duration::from_secs(30)).await;
                 }
                 Err(e)
                     if matches!(
@@ -374,18 +402,30 @@ impl<S: Scryable> L0Client<S> {
                 {
                     debug!("Failed to get new blocks: {e}. Sleeping for 30 seconds.");
                     // We'll try again in a bit
-                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    rt::sleep(std::time::Duration::from_secs(30)).await;
                 }
                 Err(e) => {
                     error!("Error updating blocks: {e}");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    rt::sleep(std::time::Duration::from_secs(30)).await;
                 }
             }
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(from_wasm_abi, into_wasm_abi))]
+pub struct L0Stats {
+    pub next_block_height: u32,
+    pub total_txs: u64,
+}
+
 impl<S: Scryable> LayerBase for L0Client<S> {
     const ACCEPT_LAYERS: &'static [&'static str] = &[];
     const LAYER: &'static str = "l0";
+    type Stats = L0Stats;
+    fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>> {
+        self.stats_rx.clone()
+    }
 }
