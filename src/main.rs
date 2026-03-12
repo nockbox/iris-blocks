@@ -20,7 +20,7 @@ pub struct Args {
     #[arg(short, long, default_value = "[::1]:50051")]
     pub bind: SocketAddr,
     #[arg(short, long)]
-    pub connect: Uri,
+    pub connect: Option<Uri>,
     #[arg(short, long, default_value = "nockchain.sqlite")]
     pub db: String,
     #[arg(short, long, default_value = "false")]
@@ -53,7 +53,11 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let addr = args.bind;
 
-    let chan = Channel::builder(args.connect).connect().await?;
+    let chan = if let Some(connect) = args.connect {
+        Some(Channel::builder(connect).connect().await?)
+    } else {
+        None
+    };
     if args.run_migrations {
         iris_blocks::db::run_migrations(&args.db);
     }

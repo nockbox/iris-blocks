@@ -949,8 +949,8 @@ dependencies = [
  "diesel_migrations",
  "futures",
  "iris-grpc-proto",
- "iris-nockchain-types",
- "iris-ztd",
+ "iris-nockchain-types 0.2.0-alpha.6 (git+https://github.com/nockbox/iris-rs)",
+ "iris-ztd 0.2.0-alpha.6 (git+https://github.com/nockbox/iris-rs)",
  "libsqlite3-sys",
  "log",
  "lru",
@@ -977,8 +977,27 @@ dependencies = [
  "crypto-bigint",
  "hmac",
  "ibig",
- "iris-ztd",
- "iris-ztd-derive",
+ "iris-ztd 0.2.0-alpha.6",
+ "iris-ztd-derive 0.2.0-alpha.6",
+ "serde",
+ "serdect",
+ "sha2",
+]
+
+[[package]]
+name = "iris-crypto"
+version = "0.2.0-alpha.6"
+source = "git+https://github.com/nockbox/iris-rs#5b1a8731ceddcdf349b2f6c11155a50c05155892"
+dependencies = [
+ "argon2",
+ "arrayvec",
+ "bip39",
+ "bs58",
+ "crypto-bigint",
+ "hmac",
+ "ibig",
+ "iris-ztd 0.2.0-alpha.6 (git+https://github.com/nockbox/iris-rs)",
+ "iris-ztd-derive 0.2.0-alpha.6 (git+https://github.com/nockbox/iris-rs)",
  "serde",
  "serdect",
  "sha2",
@@ -991,9 +1010,9 @@ dependencies = [
  "bip39",
  "glob",
  "ibig",
- "iris-crypto",
- "iris-nockchain-types",
- "iris-ztd",
+ "iris-crypto 0.2.0-alpha.6",
+ "iris-nockchain-types 0.2.0-alpha.6",
+ "iris-ztd 0.2.0-alpha.6",
  "prost",
  "prost-build",
  "prost-types",
@@ -1012,9 +1031,25 @@ dependencies = [
  "bs58",
  "hex",
  "ibig",
- "iris-crypto",
- "iris-ztd",
- "iris-ztd-derive",
+ "iris-crypto 0.2.0-alpha.6",
+ "iris-ztd 0.2.0-alpha.6",
+ "iris-ztd-derive 0.2.0-alpha.6",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "iris-nockchain-types"
+version = "0.2.0-alpha.6"
+source = "git+https://github.com/nockbox/iris-rs#5b1a8731ceddcdf349b2f6c11155a50c05155892"
+dependencies = [
+ "bip39",
+ "bs58",
+ "hex",
+ "ibig",
+ "iris-crypto 0.2.0-alpha.6 (git+https://github.com/nockbox/iris-rs)",
+ "iris-ztd 0.2.0-alpha.6 (git+https://github.com/nockbox/iris-rs)",
+ "iris-ztd-derive 0.2.0-alpha.6 (git+https://github.com/nockbox/iris-rs)",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -1030,7 +1065,24 @@ dependencies = [
  "crypto-bigint",
  "either",
  "ibig",
- "iris-ztd-derive",
+ "iris-ztd-derive 0.2.0-alpha.6",
+ "num-traits",
+ "serde",
+]
+
+[[package]]
+name = "iris-ztd"
+version = "0.2.0-alpha.6"
+source = "git+https://github.com/nockbox/iris-rs#5b1a8731ceddcdf349b2f6c11155a50c05155892"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "bitvec",
+ "bs58",
+ "crypto-bigint",
+ "either",
+ "ibig",
+ "iris-ztd-derive 0.2.0-alpha.6 (git+https://github.com/nockbox/iris-rs)",
  "num-traits",
  "serde",
 ]
@@ -1038,6 +1090,17 @@ dependencies = [
 [[package]]
 name = "iris-ztd-derive"
 version = "0.2.0-alpha.6"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "iris-ztd-derive"
+version = "0.2.0-alpha.6"
+source = "git+https://github.com/nockbox/iris-rs#5b1a8731ceddcdf349b2f6c11155a50c05155892"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",

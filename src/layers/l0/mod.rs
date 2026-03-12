@@ -33,8 +33,8 @@ pub struct L0Config {
 
 pub struct L0Client {
     pool: DbPool,
-    client: NockAppServiceClient<Channel>,
-    manager: BlockRangeManager,
+    client: Option<NockAppServiceClient<Channel>>,
+    manager: Option<BlockRangeManager>,
     dependencies: Vec<Arc<dyn LayerDependency>>,
     activations: ChainActivations,
     config: L0Config,
@@ -68,6 +68,8 @@ pub enum L0Error {
     UnableToPullElders(BlockHeight, Digest),
     #[error(transparent)]
     LayerError(#[from] LayerError),
+    #[error("gRPC connection needed, but not provided")]
+    GrpcNeeded,
 }
 
 async fn remote_scry<T: NounDecode>(
@@ -90,17 +92,17 @@ async fn remote_scry<T: NounDecode>(
 impl L0Client {
     pub fn new(
         pool: DbPool,
-        channel: Channel,
+        channel: Option<Channel>,
         config: L0Config,
         activations: ChainActivations,
         dependencies: Vec<Arc<dyn LayerDependency>>,
     ) -> Self {
-        let client = NockAppServiceClient::new(channel);
+        let client = channel.map(NockAppServiceClient::new);
         Self::verify_dependencies(&dependencies).unwrap();
         Self {
             pool,
             client: client.clone(),
-            manager: BlockRangeManager::new(client, config.block_range_config),
+            manager: client.map(|client| BlockRangeManager::new(client, config.block_range_config)),
             activations,
             dependencies,
             config,
@@ -153,9 +155,11 @@ impl L0Client {
         // Recovery - walk up the elders until we find a common ancestor
         debug!("Chain reorg detected at height {mismatch_block_height}. Finding common ancestor");
 
+        let client = self.client.as_mut().ok_or(L0Error::GrpcNeeded)?;
+
         while mismatch_block_height > 0 {
             let Some(Some((last_bid, blocks))): Option<Option<(BlockHeight, Vec<Digest>)>> =
-                remote_scry(&mut self.client, ("elders", StringDigest(mismatch_block))).await?
+                remote_scry(client, ("elders", StringDigest(mismatch_block))).await?
             else {
                 return Err(L0Error::UnableToPullElders(
                     mismatch_block_height,
@@ -230,7 +234,20 @@ impl L0Client {
             .map(|(b, _)| b.height as u64 + 1)
             .unwrap_or_default();
 
-        let Some(Some(mut new_blocks)) = self.manager.scry_blocks(next_height_start).await? else {
+        let Some(manager) = self.manager.as_mut() else {
+            warn!("No gRPC connection available. Will not pull blocks");
+            if let Some((tail_block, mdata)) = cur_tail {
+                return Err(L0Error::NoNewBlocks(
+                    mdata,
+                    tail_block.id.into(),
+                    tail_block.height as BlockHeight,
+                ));
+            } else {
+                return Err(L0Error::GrpcNeeded);
+            }
+        };
+
+        let Some(Some(mut new_blocks)) = manager.scry_blocks(next_height_start).await? else {
             return Err(L0Error::UnableToParseBlocksRangeResponse);
         };
 

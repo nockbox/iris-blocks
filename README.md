@@ -19,6 +19,12 @@ RUST_LOG=info,iris_blocks=debug cargo run --release -- --connect http://localhos
 > [!NOTE]
 > If you have support for `%heaviest-chain-blocks-range-no-pow` scry (PR TBD), then you can also add `--block-range-scry-no-pow` and enjoy extra speed.
 
+Run by supplying database, and no gRPC:
+
+```
+RUST_LOG=info,iris_blocks=debug cargo run --release -- --db nockchain.sqlite
+```
+
 Once you have it up, you may connect to the database using `sqlite3`:
 
 ```
