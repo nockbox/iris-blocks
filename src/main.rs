@@ -1,0 +1,80 @@
+//use iris_blocks::IrisPeekProxy;
+use clap::Parser;
+use core::net::SocketAddr;
+use iris_blocks::chain_activations::ChainActivations;
+use iris_blocks::layers::{
+    l0::{L0Client, L0Config},
+    l1::L1Client,
+    layer::LayerDependency,
+};
+use iris_grpc_proto::pb::private::v1::nock_app_service_server::NockAppServiceServer;
+use std::sync::Arc;
+use tonic::transport::{Channel, Server, Uri};
+use tonic_web::GrpcWebLayer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+#[derive(Parser, Debug)]
+#[command(name = "iris-peek-proxy", about = "Iris peek proxy", long_about = None)]
+pub struct Args {
+    #[arg(short, long, default_value = "[::1]:50051")]
+    pub bind: SocketAddr,
+    #[arg(short, long)]
+    pub connect: Uri,
+    #[arg(short, long, default_value = "nockchain.sqlite")]
+    pub db: String,
+    #[arg(short, long, default_value = "false")]
+    pub run_migrations: bool,
+    #[command(flatten)]
+    pub l0: L0Config,
+}
+
+#[tokio::main]
+pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+
+    let sub = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(true)
+            .with_target(true)
+            .with_level(true),
+    );
+
+    #[cfg(all(feature = "tracy"))]
+    if std::env::var("TRACY_DISABLE").is_err() {
+        let tracy = tracing_tracy::TracyLayer::default();
+        sub.with(filter).with(tracy).init();
+    } else {
+        sub.with(filter).init();
+    }
+    #[cfg(not(feature = "tracy"))]
+    sub.with(filter).init();
+
+    let args = Args::parse();
+    let addr = args.bind;
+
+    let chan = Channel::builder(args.connect).connect().await?;
+    if args.run_migrations {
+        iris_blocks::db::run_migrations(&args.db);
+    }
+    let pool = iris_blocks::db::new_pool(&args.db, 1).await?;
+
+    let activations = ChainActivations::mainnet();
+    let l1_client = Arc::new(L1Client::new(activations.clone(), vec![]));
+    let l0_deps: Vec<Arc<dyn LayerDependency>> = vec![l1_client.clone()];
+
+    let client = L0Client::new(pool, chan, args.l0, activations.clone(), l0_deps);
+    client.run().await;
+
+    /*let proxy = IrisPeekProxy::new(chan);
+
+    Server::builder()
+       .accept_http1(true)
+       // This will apply the gRPC-Web translation layer
+       .layer(GrpcWebLayer::new())
+       .add_service(NockAppServiceServer::new(proxy))
+       .serve(addr)
+       .await?;*/
+
+    Ok(())
+}

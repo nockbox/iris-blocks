@@ -1,0 +1,49 @@
+cargo-features = ["profile-rustflags"]
+
+[package]
+name = "iris-blocks"
+version = "0.1.0"
+edition = "2021"
+keywords = ["nockchain", "iris", "wallet", "nock"]
+license = "MIT"
+repository = "https://github.com/nockbox/iris-blocks"
+rust-version = "1.88.0"
+description = "Block parser and accompanying utils for iris"
+documentation = "https://docs.rs/iris-blocks"
+homepage = "https://nockbox.org"
+authors = ["NockBox inc. <tech@nockbox.org>"]
+
+[dependencies]
+iris-ztd = { path = "../iris-rs/crates/iris-ztd", features = ["alloc"] }
+iris-nockchain-types = { path = "../iris-rs/crates/iris-nockchain-types" }
+iris-grpc-proto = { path = "../iris-rs/crates/iris-grpc-proto", features = ["private-api", "server"] }
+tonic = { version = "0.12" }
+bs58 = { version = "0.5", default-features = false }
+bitvec = { version = "1.0", default-features = false }
+arrayref = "0.3"
+num-traits = { version = "0.2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+arrayvec = "0.7"
+lru = { version = "0.7" }
+futures = "0.3"
+async-trait = "0.1"
+thiserror = "1"
+log = "0.4"
+tracing = "0.1"
+tracing-tracy = { version = "0.11.4", optional = true, features = ["fibers"] }
+tracy-client = { version = "=0.18.2", optional = true }
+
+diesel = { version = "2.2", default-features = false, features = ["sqlite", "returning_clauses_for_sqlite_3_35"] }
+diesel_migrations = { version = "2.2", default-features = false }
+diesel-async = { version = "0.5", default-features = false, features = ["bb8", "sync-connection-wrapper"] }
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+
+tonic-web = { version = "0.12", optional = true }
+tokio = { version = "1.42", features = ["full"], optional = true }
+clap = { version = "4.0", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+[features]
+default = ["binary", "tracy"]
+binary = ["tonic-web", "tokio", "clap", "tracing-subscriber"]
+tracy = ["tracing-tracy", "tracy-client"]
