@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS pk_to_pkh;
+DROP TABLE IF EXISTS name_owners;
+DROP TABLE IF EXISTS lock_owners;
+DROP TABLE IF EXISTS lock_paths;
+DROP TABLE IF EXISTS locks;
+DROP TABLE IF EXISTS lock_names;

@@ -145,6 +145,70 @@ impl core::ops::Deref for NoteName {
 }
 impl_digest_sql!(NoteName);
 
+/// A lock root digest — base58-encoded [`Digest`], `VARCHAR(55)`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    diesel::expression::AsExpression,
+    diesel::deserialize::FromSqlRow,
+)]
+#[diesel(sql_type = sql_types::DigestSql)]
+pub struct LockRootDigest(pub Digest);
+
+impl From<Digest> for LockRootDigest {
+    fn from(d: Digest) -> Self {
+        LockRootDigest(d)
+    }
+}
+impl From<LockRootDigest> for Digest {
+    fn from(t: LockRootDigest) -> Self {
+        t.0
+    }
+}
+impl core::ops::Deref for LockRootDigest {
+    type Target = Digest;
+    fn deref(&self) -> &Digest {
+        &self.0
+    }
+}
+impl_digest_sql!(LockRootDigest);
+
+/// A public key hash digest — base58-encoded [`Digest`], `VARCHAR(55)`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    diesel::expression::AsExpression,
+    diesel::deserialize::FromSqlRow,
+)]
+#[diesel(sql_type = sql_types::DigestSql)]
+pub struct PkhDigest(pub Digest);
+
+impl From<Digest> for PkhDigest {
+    fn from(d: Digest) -> Self {
+        PkhDigest(d)
+    }
+}
+impl From<PkhDigest> for Digest {
+    fn from(t: PkhDigest) -> Self {
+        t.0
+    }
+}
+impl core::ops::Deref for PkhDigest {
+    type Target = Digest;
+    fn deref(&self) -> &Digest {
+        &self.0
+    }
+}
+impl_digest_sql!(PkhDigest);
+
 const _: () = {
     use diesel::sqlite::Sqlite;
     const fn verify<T: ToSql<sql_types::DigestSql, Sqlite>>() {}
@@ -157,6 +221,8 @@ const _: () = {
     verify::<BlockId>();
     verify::<TxId>();
     verify::<NoteName>();
+    verify::<LockRootDigest>();
+    verify::<PkhDigest>();
     verify2::<String>();
 };
 

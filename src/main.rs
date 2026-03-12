@@ -6,6 +6,7 @@ use iris_blocks::layers::{
     l0::{L0Client, L0Config},
     l1::L1Client,
     l2::L2Client,
+    l3::L3Client,
     layer::LayerDependency,
 };
 use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;
@@ -68,7 +69,9 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let activations = ChainActivations::mainnet();
-    let l2_client = Arc::new(L2Client::new(activations.clone(), vec![]));
+    let l3_client = Arc::new(L3Client::new(activations.clone(), vec![]));
+    let l2_deps: Vec<Arc<dyn LayerDependency>> = vec![l3_client.clone()];
+    let l2_client = Arc::new(L2Client::new(activations.clone(), l2_deps));
     let l1_deps: Vec<Arc<dyn LayerDependency>> = vec![l2_client.clone()];
     let l1_client = Arc::new(L1Client::new(activations.clone(), l1_deps));
     let l0_deps: Vec<Arc<dyn LayerDependency>> = vec![l1_client.clone()];

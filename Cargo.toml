@@ -26,6 +26,7 @@ iris-ztd = { git = "https://github.com/nockbox/iris-rs/", features = ["alloc"] }
 iris-nockchain-types = { git = "https://github.com/nockbox/iris-rs" }
 iris-grpc-proto = { git = "https://github.com/nockbox/iris-rs", features = ["private-api", "server"] }
 tonic = { version = "0.12", default-features = false }
+iris-crypto = { git = "https://github.com/nockbox/iris-rs" }
 bs58 = { version = "0.5", default-features = false }
 bitvec = { version = "1.0", default-features = false }
 arrayref = "0.3"
