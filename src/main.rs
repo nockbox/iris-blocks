@@ -39,6 +39,7 @@ fn truncate_cell(value: &str, max: usize) -> String {
 fn print_balance_text(balance: &iris_blocks::query::WalletBalance) {
     print_section("Address");
     print_kv("type", format!("{:?}", balance.address.address_type));
+    print_kv("scope", format!("{:?}", balance.address.scope));
     print_kv("input", &balance.address.input);
     print_kv("pkh", &balance.address.pkh);
     print_kv(
@@ -47,21 +48,41 @@ fn print_balance_text(balance: &iris_blocks::query::WalletBalance) {
     );
 
     print_section("Balance");
-    print_kv("unspent_nicks", balance.unspent_nicks);
+    print_kv("balance_nicks", balance.balance_nicks);
     print_kv("unspent_notes", balance.unspent_note_count);
-    print_kv("unspent_v0_nicks", balance.unspent_v0_nicks);
-    print_kv("unspent_v1plus_nicks", balance.unspent_v1_nicks);
+    if balance.unspent_v0_nicks > 0 && balance.unspent_v1_nicks > 0 {
+        print_kv("  v0_nicks", balance.unspent_v0_nicks);
+        print_kv("  v1_nicks", balance.unspent_v1_nicks);
+    }
+
+    print_section("Accounting");
+    print_kv("received_nicks", balance.received_nicks);
     print_kv("tx_credits_nicks", balance.tx_credits_nicks);
     print_kv("coinbase_credits_nicks", balance.coinbase_credits_nicks);
-    print_kv("debits_nicks", balance.debits_nicks);
+    print_kv("spent_nicks", balance.spent_nicks);
     print_kv("fees_nicks", balance.fees_nicks);
+    let accounting = balance.received_nicks - balance.spent_nicks;
+    print_kv("net_nicks", accounting);
+    if accounting == balance.balance_nicks {
+        print_kv("check", "OK (received - spent == balance)");
+    } else {
+        print_kv(
+            "check",
+            format!(
+                "MISMATCH (received-spent {} != balance {})",
+                accounting, balance.balance_nicks
+            ),
+        );
+    }
 }
 
 fn print_tx_text(tx: &iris_blocks::query::TransactionDetail) {
     print_section("Transaction");
     print_kv("txid", &tx.txid);
     print_kv("block_id", &tx.block_id);
-    print_kv("height", tx.height);
+    print_kv("block_height", tx.block_height);
+    print_kv("block_timestamp", tx.block_timestamp);
+    print_kv("block_time_utc", &tx.block_time_utc);
     print_kv("version", tx.version);
     print_kv("fee_nicks", tx.fee_nicks);
     print_kv("total_size", tx.total_size);
@@ -108,33 +129,35 @@ fn print_tx_text(tx: &iris_blocks::query::TransactionDetail) {
 
     print_section(&format!("Credits ({})", tx.credits.len()));
     println!(
-        "{:<4} {:<10} {:<60} {:>14} {:>8}",
-        "idx", "rtype", "recipient", "amount_nicks", "height"
+        "{:<4} {:<10} {:<40} {:>14} {:>12} {:<25}",
+        "idx", "rtype", "recipient", "amount_nicks", "block_height", "block_time_utc"
     );
     for c in &tx.credits {
         println!(
-            "{:<4} {:<10} {:<60} {:>14} {:>8}",
+            "{:<4} {:<10} {:<40} {:>14} {:>12} {:<25}",
             c.idx,
             c.recipient_type,
-            truncate_cell(&c.recipient, 60),
+            truncate_cell(&c.recipient, 40),
             c.amount_nicks,
-            c.height
+            c.block_height,
+            truncate_cell(&c.block_time_utc, 25)
         );
     }
 
     print_section(&format!("Debits ({})", tx.debits.len()));
     println!(
-        "{:<100} {:<10} {:>14} {:>12} {:>8}",
-        "pk", "sole_owner", "amount_nicks", "fee_nicks", "height"
+        "{:<80} {:<10} {:>14} {:>12} {:>12} {:<25}",
+        "pk", "sole_owner", "amount_nicks", "fee_nicks", "block_height", "block_time_utc"
     );
     for d in &tx.debits {
         println!(
-            "{:<100} {:<10} {:>14} {:>12} {:>8}",
-            truncate_cell(&d.pk, 100),
+            "{:<80} {:<10} {:>14} {:>12} {:>12} {:<25}",
+            truncate_cell(&d.pk, 80),
             d.sole_owner,
             d.amount_nicks,
             d.fee_nicks,
-            d.height
+            d.block_height,
+            truncate_cell(&d.block_time_utc, 25)
         );
     }
 }
@@ -142,10 +165,11 @@ fn print_tx_text(tx: &iris_blocks::query::TransactionDetail) {
 fn print_block_text(block: &iris_blocks::query::BlockDetail) {
     print_section("Block");
     print_kv("block_id", &block.id);
-    print_kv("height", block.height);
+    print_kv("block_height", block.block_height);
     print_kv("version", block.version);
     print_kv("parent", &block.parent);
-    print_kv("timestamp", block.timestamp);
+    print_kv("block_timestamp", block.block_timestamp);
+    print_kv("block_time_utc", &block.block_time_utc);
     print_kv("msg", block.msg.as_deref().unwrap_or(""));
 
     print_section(&format!("Transactions ({})", block.transactions.len()));
@@ -162,17 +186,18 @@ fn print_block_text(block: &iris_blocks::query::BlockDetail) {
 
     print_section(&format!("Coinbase Credits ({})", block.coinbase_credits.len()));
     println!(
-        "{:<4} {:<10} {:<60} {:>14} {:>8}",
-        "idx", "rtype", "recipient", "amount_nicks", "height"
+        "{:<4} {:<10} {:<40} {:>14} {:>12} {:<25}",
+        "idx", "rtype", "recipient", "amount_nicks", "block_height", "block_time_utc"
     );
     for cc in &block.coinbase_credits {
         println!(
-            "{:<4} {:<10} {:<60} {:>14} {:>8}",
+            "{:<4} {:<10} {:<40} {:>14} {:>12} {:<25}",
             cc.idx,
             cc.recipient_type,
-            truncate_cell(&cc.recipient, 60),
+            truncate_cell(&cc.recipient, 40),
             cc.amount_nicks,
-            cc.height
+            cc.block_height,
+            truncate_cell(&cc.block_time_utc, 25)
         );
     }
 }
@@ -196,14 +221,15 @@ fn print_audit_text(report: &iris_blocks::query::AuditReport) {
 
     print_section(&format!("Transactions ({})", report.transactions.len()));
     println!(
-        "{:<55} {:>8} {:<10} {:>14} {:>14} {:>12} {:>14}",
-        "txid", "height", "direction", "incoming", "outgoing", "fee", "net"
+        "{:<55} {:>12} {:<25} {:<10} {:>14} {:>14} {:>12} {:>14}",
+        "txid", "block_height", "block_time_utc", "direction", "incoming", "outgoing", "fee", "net"
     );
     for tx in &report.transactions {
         println!(
-            "{:<55} {:>8} {:<10} {:>14} {:>14} {:>12} {:>14}",
+            "{:<55} {:>12} {:<25} {:<10} {:>14} {:>14} {:>12} {:>14}",
             truncate_cell(&tx.txid, 55),
-            tx.first_height,
+            tx.first_block_height,
+            truncate_cell(&tx.first_block_time_utc, 25),
             tx.direction,
             tx.incoming_nicks,
             tx.outgoing_nicks,
@@ -214,19 +240,21 @@ fn print_audit_text(report: &iris_blocks::query::AuditReport) {
 
     print_section(&format!("Ledger Entries ({})", report.ledger.len()));
     println!(
-        "{:<8} {:<10} {:<55} {:<10} {:>14} {:>12} {:<60}",
-        "height", "type", "txid", "rtype", "amount", "fee", "recipient"
+        "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<40}",
+        "block_height", "block_time_utc", "type", "txid", "rtype", "amount", "fee", "running", "recipient"
     );
     for e in &report.ledger {
         println!(
-            "{:<8} {:<10} {:<55} {:<10} {:>14} {:>12} {:<60}",
-            e.height,
+            "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<40}",
+            e.block_height,
+            truncate_cell(&e.block_time_utc, 25),
             e.entry_type,
             truncate_cell(e.txid.as_deref().unwrap_or("-"), 55),
             e.recipient_type.as_deref().unwrap_or("-"),
             e.amount_nicks,
             e.fee_nicks,
-            truncate_cell(e.recipient.as_deref().unwrap_or("-"), 60),
+            e.running_balance_nicks,
+            truncate_cell(e.recipient.as_deref().unwrap_or("-"), 40),
         );
     }
 }
@@ -346,7 +374,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let report = iris_blocks::query::audit_report(&mut conn, address).await?;
             if let Some(path) = args.csv {
                 let mut writer = csv::Writer::from_path(path)?;
-                for row in &report.ledger {
+                for row in report.ledger.iter().rev() {
                     writer.serialize(row)?;
                 }
                 writer.flush()?;

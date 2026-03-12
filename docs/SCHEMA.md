@@ -229,6 +229,21 @@ WHERE no.pkh = :pkh
   AND n.spent_txid IS NULL;
 ```
 
+### Version-scoped wallet views
+
+The CLI applies scope depending on input address type:
+
+- PKH input -> V1-only view (`n.version >= 1`, `recipient_type IN ('pk', 'pkh')`)
+- V0 raw key input -> V0-only view (`n.version = 0`, `recipient_type = 'v0pk'`)
+- DB PK input -> combined V0+V1 view
+
+For each scope, accounting is:
+
+- `received_nicks = tx_credits_nicks + coinbase_credits_nicks`
+- `spent_nicks = SUM(notes.assets WHERE spent_txid IS NOT NULL in same scope)`
+- `balance_nicks = SUM(notes.assets WHERE spent_txid IS NULL in same scope)`
+- invariant: `received_nicks - spent_nicks = balance_nicks`
+
 ### PKH -> known public keys
 
 ```sql
@@ -275,4 +290,22 @@ ORDER BY height, txid, idx;
   - `balance = sum(credits.amount) + sum(coinbase_credits.amount) - sum(debits.amount)`
 - Ground truth for wallet holdings:
   - unspent notes sum from `notes.assets` with `spent_txid IS NULL`
+- For scoped balances (V0-only/V1-only), use `notes.version` filter and derive `spent_nicks` from `notes` (not `debits`)
 - Never use `sum(debits.amount + debits.fee)`; this double-counts fees.
+
+## Audit CSV Columns
+
+`audit --csv` writes one ledger row per entry with:
+
+- `block_height`
+- `block_timestamp` (raw chain timestamp from `blocks.timestamp`)
+- `block_time_utc` (human-readable UTC derived from `block_timestamp`)
+- `entry_type` (`credit`, `coinbase`, `debit`)
+- `txid`
+- `block_id`
+- `recipient_type`
+- `recipient`
+- `amount_nicks`
+- `fee_nicks`
+- `counterparties`
+- `running_balance_nicks`

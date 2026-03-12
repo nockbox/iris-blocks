@@ -13,10 +13,18 @@ pub enum AddressType {
     V0RawPublicKey,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub enum VersionScope {
+    All,
+    V0Only,
+    V1Only,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AddressInfo {
     pub input: String,
     pub address_type: AddressType,
+    pub scope: VersionScope,
     pub pkh: String,
     pub db_public_key: Option<String>,
 }
@@ -65,6 +73,7 @@ pub async fn resolve_address(
         return Ok(AddressInfo {
             input: normalized.to_string(),
             address_type: AddressType::DbPublicKey,
+            scope: VersionScope::All,
             pkh: row.pkh.0.to_string(),
             db_public_key: Some(row.pk),
         });
@@ -75,6 +84,7 @@ pub async fn resolve_address(
         return Ok(AddressInfo {
             input: normalized.to_string(),
             address_type: AddressType::Pkh,
+            scope: VersionScope::V1Only,
             pkh: normalized.to_string(),
             db_public_key: None,
         });
@@ -85,6 +95,7 @@ pub async fn resolve_address(
         return Ok(AddressInfo {
             input: normalized.to_string(),
             address_type: AddressType::V0RawPublicKey,
+            scope: VersionScope::V0Only,
             pkh,
             db_public_key: Some(db_pk),
         });
