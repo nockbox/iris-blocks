@@ -38,6 +38,16 @@ layer_metadata
 sqlite>
 ```
 
+Trigger reset at layer:
+
+```
+sqlite> delete from layer_metadata where layer = "l1";
+```
+
+Deleting l1 metadata will force all downstream layers to resync. Deleting l0 will require full resync from gRPC.
+
+You may also overwrite the next_block_height to force rollback to a particular block.
+
 ## Layers
 
 ### L0

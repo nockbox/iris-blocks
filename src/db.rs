@@ -1,14 +1,17 @@
 //! Database connection pooling for iris-blocks (SQLite, async via diesel-async).
 
 use diesel::prelude::*;
+use diesel::sql_query;
 use diesel_async::{
     pooled_connection::{
         bb8::{self, Pool, PooledConnection, RunError},
-        AsyncDieselConnectionManager, PoolError,
+        AsyncDieselConnectionManager, ManagerConfig, PoolError,
     },
     sync_connection_wrapper::SyncConnectionWrapper,
+    AsyncConnection, RunQueryDsl,
 };
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+use futures::FutureExt;
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/sqlite");
 
@@ -37,7 +40,25 @@ pub use bb8::RunError as PoolRunError;
 // ---------------------------------------------------------------------------
 
 pub async fn new_pool(database_url: &str, max_size: u32) -> Result<DbPool, PoolError> {
-    let manager = AsyncDieselConnectionManager::<AsyncDbConnection>::new(database_url);
+    let mut config = ManagerConfig::<AsyncDbConnection>::default();
+
+    config.custom_setup = Box::new(|url| {
+        async move {
+            let mut conn = AsyncDbConnection::establish(url).await?;
+
+            sql_query("PRAGMA foreign_keys = ON;")
+                .execute(&mut conn)
+                .await
+                .map_err(ConnectionError::CouldntSetupConfiguration)?;
+
+            Ok::<AsyncDbConnection, ConnectionError>(conn)
+        }
+        .boxed()
+    });
+
+    let manager =
+        AsyncDieselConnectionManager::<AsyncDbConnection>::new_with_config(database_url, config);
+
     Pool::builder().max_size(max_size).build(manager).await
 }
 
