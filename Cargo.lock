@@ -449,12 +449,12 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9b6c2fc184a6fb6ebcf5f9a5e3bbfa84d8fd268cdfcce4ed508979a6259494d"
+source = "git+https://github.com/diesel-rs/diesel#fa746b65e628b394593bd0021c83c644ab7d0c5d"
 dependencies = [
  "diesel_derives",
  "downcast-rs",
  "libsqlite3-sys",
+ "serde_json",
  "sqlite-wasm-rs",
  "time",
 ]
@@ -475,8 +475,7 @@ dependencies = [
 [[package]]
 name = "diesel_derives"
 version = "2.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47618bf0fac06bb670c036e48404c26a865e6a71af4114dfd97dfe89936e404e"
+source = "git+https://github.com/diesel-rs/diesel#fa746b65e628b394593bd0021c83c644ab7d0c5d"
 dependencies = [
  "diesel_table_macro_syntax",
  "dsl_auto_type",
@@ -488,8 +487,7 @@ dependencies = [
 [[package]]
 name = "diesel_migrations"
 version = "2.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "745fd255645f0f1135f9ec55c7b00e0882192af9683ab4731e4bba3da82b8f9c"
+source = "git+https://github.com/diesel-rs/diesel#fa746b65e628b394593bd0021c83c644ab7d0c5d"
 dependencies = [
  "diesel",
  "migrations_internals",
@@ -499,8 +497,7 @@ dependencies = [
 [[package]]
 name = "diesel_table_macro_syntax"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe2444076b48641147115697648dc743c2c00b61adade0f01ce67133c7babe8c"
+source = "git+https://github.com/diesel-rs/diesel#fa746b65e628b394593bd0021c83c644ab7d0c5d"
 dependencies = [
  "syn",
 ]
@@ -525,8 +522,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dsl_auto_type"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd122633e4bef06db27737f21d3738fb89c8f6d5360d6d9d7635dda142a7757e"
+source = "git+https://github.com/diesel-rs/diesel#fa746b65e628b394593bd0021c83c644ab7d0c5d"
 dependencies = [
  "darling",
  "either",
@@ -825,7 +821,7 @@ dependencies = [
  "gloo-events",
  "gloo-utils 0.1.7",
  "serde",
- "serde-wasm-bindgen",
+ "serde-wasm-bindgen 0.5.0",
  "serde_urlencoded",
  "thiserror 1.0.69",
  "wasm-bindgen",
@@ -1187,6 +1183,9 @@ dependencies = [
  "lru",
  "num-traits",
  "serde",
+ "serde-wasm-bindgen 0.6.5",
+ "serde_json",
+ "sqlite-wasm-rs",
  "thiserror 1.0.69",
  "tokio",
  "tonic",
@@ -1471,8 +1470,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 [[package]]
 name = "migrations_internals"
 version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36c791ecdf977c99f45f23280405d7723727470f6689a5e6dbf513ac547ae10d"
+source = "git+https://github.com/diesel-rs/diesel#fa746b65e628b394593bd0021c83c644ab7d0c5d"
 dependencies = [
  "serde",
  "toml",
@@ -1481,8 +1479,7 @@ dependencies = [
 [[package]]
 name = "migrations_macros"
 version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36fc5ac76be324cfd2d3f2cf0fdf5d5d3c4f14ed8aaebadb09e304ba42282703"
+source = "git+https://github.com/diesel-rs/diesel#fa746b65e628b394593bd0021c83c644ab7d0c5d"
 dependencies = [
  "migrations_internals",
  "proc-macro2",
@@ -1897,6 +1894,17 @@ name = "serde-wasm-bindgen"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3b143e2833c57ab9ad3ea280d21fd34e285a42837aeb0ee301f4f41890fa00e"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
 dependencies = [
  "js-sys",
  "serde",

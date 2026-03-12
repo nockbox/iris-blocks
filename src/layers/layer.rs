@@ -1,4 +1,5 @@
 use super::shared_schema;
+use crate::rt::RtBound;
 use core::future::Future;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -144,16 +145,17 @@ pub trait LayerImpl: Layer {
         &'a self,
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
-    ) -> impl Future<Output = Result<(), LayerErrorSource>> + Send + 'a;
+    ) -> impl Future<Output = Result<(), LayerErrorSource>> + RtBound + 'a;
     fn update_blocks_impl<'a>(
         &'a self,
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
-    ) -> impl Future<Output = Result<(), LayerErrorSource>> + Send + 'a;
+    ) -> impl Future<Output = Result<(), LayerErrorSource>> + RtBound + 'a;
 }
 
-#[async_trait::async_trait]
-pub trait LayerDependency: Layer + Send + Sync {
+#[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
+pub trait LayerDependency: Layer + RtBound {
     async fn expire_blocks(
         &self,
         conn: &mut crate::db::AsyncDbConnection,
@@ -166,8 +168,9 @@ pub trait LayerDependency: Layer + Send + Sync {
     ) -> Result<(), LayerError>;
 }
 
-#[async_trait::async_trait]
-impl<T: ?Sized + LayerImpl + Send + Sync> LayerDependency for T {
+#[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
+#[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
+impl<T: ?Sized + LayerImpl + RtBound> LayerDependency for T {
     #[tracing::instrument(skip_all)]
     async fn expire_blocks(
         &self,

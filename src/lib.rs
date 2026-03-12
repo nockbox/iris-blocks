@@ -5,6 +5,7 @@ pub mod db;
 pub mod layers;
 mod rt;
 pub mod scry;
+pub mod sqlite_raw;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;

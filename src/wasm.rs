@@ -63,6 +63,7 @@ pub struct BlockExporter {
     finished_handle: oneshot::Receiver<()>,
     l0_stats: Option<watch::Receiver<Option<L0Stats>>>,
     l1_stats: Option<watch::Receiver<Option<L1Stats>>>,
+    query_tx: crate::layers::l0::DbQueryHandle,
 }
 
 #[wasm_bindgen]
@@ -141,7 +142,7 @@ impl BlockExporter {
         let mut cfg = L0Config::default();
         cfg.store_pow = false;
         cfg.block_range_config.block_range_scry_no_pow = scry_no_pow;
-        let l0_client = L0Client::new(conn, scry, cfg, activations.clone(), l0_deps);
+        let (l0_client, query_tx) = L0Client::new(conn, scry, cfg, activations.clone(), l0_deps);
         let l0_stats = Some(l0_client.stats_handle());
 
         let (stop_handle, stop_receiver) = oneshot::channel();
@@ -160,6 +161,7 @@ impl BlockExporter {
             finished_handle,
             l0_stats,
             l1_stats,
+            query_tx,
         })
     }
 
@@ -183,5 +185,15 @@ impl BlockExporter {
         let _ = changes.changed().await;
         let r = *changes.borrow();
         r
+    }
+
+    #[wasm_bindgen]
+    pub async fn query(&self, sql: String) -> Result<String, JsValue> {
+        let res = self
+            .query_tx
+            .query(sql)
+            .await
+            .map_err(|e| JsValue::from_str(&e))?;
+        Ok(serde_json::to_string(&res).map_err(|e| JsValue::from_str(&e.to_string()))?)
     }
 }

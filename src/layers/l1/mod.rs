@@ -224,6 +224,8 @@ impl LayerImpl for L1Client {
                             for note in outputs {
                                 new_notes.push(Note::tx_output(&block, &tx, note));
                             }
+
+                            crate::rt::yield_now().await;
                         }
 
                         let metadata = FixedLayerMetadata {

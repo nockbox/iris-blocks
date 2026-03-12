@@ -70,7 +70,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let l1_client = Arc::new(L1Client::new(activations.clone(), vec![]));
     let l0_deps: Vec<Arc<dyn LayerDependency>> = vec![l1_client.clone()];
 
-    let client = L0Client::new(conn, scry, args.l0, activations.clone(), l0_deps);
+    let (client, _query_tx) = L0Client::new(conn, scry, args.l0, activations.clone(), l0_deps);
     client.run().await;
 
     /*let proxy = IrisPeekProxy::new(chan);

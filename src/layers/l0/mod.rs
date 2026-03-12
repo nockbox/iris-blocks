@@ -9,6 +9,8 @@ use crate::StringDigest;
 use clap::Parser;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use futures::channel::{mpsc, oneshot};
+use futures::{FutureExt, StreamExt};
 use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;
 use iris_nockchain_types::BlockHeight;
 use iris_ztd::{jam, Digest, NounEncode};
@@ -50,6 +52,27 @@ pub struct L0Client<S: Scryable> {
     config: L0Config,
     stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
+    query_rx: mpsc::UnboundedReceiver<DbQueryRequest>,
+}
+
+pub struct DbQueryRequest {
+    pub sql: String,
+    pub responder: oneshot::Sender<Result<Vec<serde_json::Value>, String>>,
+}
+
+#[derive(Clone)]
+pub struct DbQueryHandle {
+    tx: mpsc::UnboundedSender<DbQueryRequest>,
+}
+
+impl DbQueryHandle {
+    pub async fn query(&self, sql: String) -> Result<Vec<serde_json::Value>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .unbounded_send(DbQueryRequest { sql, responder: tx })
+            .map_err(|e| e.to_string())?;
+        rx.await.map_err(|e| e.to_string())?
+    }
 }
 
 #[derive(Debug, Error)]
@@ -99,18 +122,24 @@ impl<S: Scryable> L0Client<S> {
         config: L0Config,
         activations: ChainActivations,
         dependencies: Vec<Arc<dyn LayerDependency>>,
-    ) -> Self {
+    ) -> (Self, DbQueryHandle) {
         let (stats_tx, stats_rx) = Self::verify_dependencies(&dependencies).unwrap();
-        Self {
-            conn,
-            client: client.clone(),
-            manager: client.map(|client| BlockRangeManager::new(client, config.block_range_config)),
-            activations,
-            dependencies,
-            config,
-            stats_tx,
-            stats_rx,
-        }
+        let (query_tx, query_rx) = mpsc::unbounded();
+        (
+            Self {
+                conn,
+                client: client.clone(),
+                manager: client
+                    .map(|client| BlockRangeManager::new(client, config.block_range_config)),
+                activations,
+                dependencies,
+                config,
+                stats_tx,
+                stats_rx,
+                query_rx,
+            },
+            DbQueryHandle { tx: query_tx },
+        )
     }
 
     async fn revert_to(
@@ -318,7 +347,9 @@ impl<S: Scryable> L0Client<S> {
                     fee: rtx.total_fees().0 as _,
                     total_size: tx.total_size() as _,
                     jam: jam(rtx.to_noun()),
-                })
+                });
+
+                crate::rt::yield_now().await;
             }
         }
 
@@ -390,7 +421,8 @@ impl<S: Scryable> L0Client<S> {
                 }
                 Err(L0Error::NoNewBlocks(_metadata, block, height)) => {
                     debug!("Chain up-to-date at block {block}, height {height}");
-                    rt::sleep(std::time::Duration::from_secs(30)).await;
+                    self.sleep_and_process_queries(std::time::Duration::from_secs(30))
+                        .await;
                 }
                 Err(e)
                     if matches!(
@@ -401,12 +433,57 @@ impl<S: Scryable> L0Client<S> {
                     ) =>
                 {
                     debug!("Failed to get new blocks: {e}. Sleeping for 30 seconds.");
-                    // We'll try again in a bit
-                    rt::sleep(std::time::Duration::from_secs(30)).await;
+                    self.sleep_and_process_queries(std::time::Duration::from_secs(30))
+                        .await;
                 }
                 Err(e) => {
                     error!("Error updating blocks: {e}");
-                    rt::sleep(std::time::Duration::from_secs(30)).await;
+                    self.sleep_and_process_queries(std::time::Duration::from_secs(30))
+                        .await;
+                }
+            }
+            crate::rt::yield_now().await;
+            self.process_queries().await;
+        }
+    }
+
+    async fn process_queries(&mut self) {
+        while let Some(req) = self.query_rx.next().now_or_never().flatten() {
+            self.process_query(req).await;
+        }
+    }
+
+    async fn process_query(&mut self, req: DbQueryRequest) {
+        let sql = req.sql;
+        let res = self
+            .conn
+            .spawn_blocking(
+                move |conn| -> Result<Vec<serde_json::Value>, diesel::result::Error> {
+                    crate::sqlite_raw::raw_query_json(conn, &sql).map_err(|e| {
+                        diesel::result::Error::DatabaseError(
+                            diesel::result::DatabaseErrorKind::Unknown,
+                            Box::new(e),
+                        )
+                    })
+                },
+            )
+            .await;
+        let res = match res {
+            Ok(val) => Ok(val),
+            Err(e) => Err(e.to_string()),
+        };
+        req.responder.send(res).ok();
+    }
+
+    async fn sleep_and_process_queries(&mut self, duration: std::time::Duration) {
+        let sleep = rt::sleep(duration).fuse();
+        let mut sleep = core::pin::pin!(sleep);
+        loop {
+            futures::select! {
+                _ = sleep => break,
+                req = self.query_rx.next() => {
+                    let Some(req) = req else { break; };
+                    self.process_query(req).await;
                 }
             }
         }

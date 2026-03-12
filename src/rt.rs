@@ -26,6 +26,18 @@ mod imp {
     impl<T: ?Sized + Send> RtBound for T {}
 
     pub type RtFuture<'a, T> = dyn Future<Output = T> + Send + 'a;
+
+    pub fn yield_now() -> impl Future<Output = ()> {
+        let mut hit = false;
+        core::future::poll_fn(move |cx| {
+            if hit {
+                return core::task::Poll::Ready(());
+            }
+            hit = true;
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        })
+    }
 }
 
 #[cfg(feature = "wasm")]
@@ -59,4 +71,8 @@ mod imp {
     impl<T: ?Sized> RtBound for T {}
 
     pub type RtFuture<'a, T> = dyn Future<Output = T> + 'a;
+
+    pub async fn yield_now() {
+        sleep(std::time::Duration::from_millis(1)).await;
+    }
 }
