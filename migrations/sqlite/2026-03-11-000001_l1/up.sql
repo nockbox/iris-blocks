@@ -27,3 +27,7 @@ CREATE INDEX idx_notes_spent_txid ON notes(spent_txid);
 CREATE INDEX idx_notes_coinbase ON notes(coinbase);
 CREATE INDEX idx_notes_spent ON notes(spent_txid) WHERE spent_txid IS NOT NULL;
 CREATE INDEX idx_notes_unspent ON notes(spent_txid) WHERE spent_txid IS NULL;
+
+-- Not really essential at the moment, but reverting blocks takes forever without these
+CREATE INDEX idx_notes_created_bid ON notes(created_bid);
+CREATE INDEX idx_notes_spent_bid ON notes(spent_bid);

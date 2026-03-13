@@ -73,6 +73,16 @@ impl LayerImpl for L1Client {
             .execute(conn)
             .await?;
 
+        diesel::update(notes::table)
+            .filter(notes::spent_height.ge(metadata.next_block_height))
+            .set((
+                notes::spent_height.eq(None::<i32>),
+                notes::spent_bid.eq(None::<BlockId>),
+                notes::spent_txid.eq(None::<TxId>),
+            ))
+            .execute(conn)
+            .await?;
+
         Self::update_layer_metadata(&metadata).execute(conn).await?;
 
         Ok(())
