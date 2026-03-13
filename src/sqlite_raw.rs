@@ -1,13 +1,17 @@
-use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 #[cfg(feature = "libsqlite3-sys")]
 use libsqlite3_sys as ffi;
-use serde_json::{Map, Number, Value};
+#[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
+use serde_json::{Map, Number};
+use serde_json::Value;
 #[cfg(feature = "sqlite-wasm-rs")]
 use sqlite_wasm_rs as ffi;
+#[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int};
+#[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
+use std::os::raw::c_char;
 
+#[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
 pub fn raw_query_json(conn: &mut SqliteConnection, sql: &str) -> Result<Vec<Value>, String> {
     // SAFETY:
     // - we do not store or close the raw sqlite3*
@@ -16,6 +20,12 @@ pub fn raw_query_json(conn: &mut SqliteConnection, sql: &str) -> Result<Vec<Valu
     unsafe { conn.with_raw_connection(|db| raw_query_json_impl(db, sql)) }
 }
 
+#[cfg(not(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs")))]
+pub fn raw_query_json(_conn: &mut SqliteConnection, _sql: &str) -> Result<Vec<Value>, String> {
+    Err("raw sqlite query requires libsqlite3-sys or sqlite-wasm-rs feature".to_string())
+}
+
+#[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
 unsafe fn raw_query_json_impl(db: *mut ffi::sqlite3, sql: &str) -> Result<Vec<Value>, String> {
     let sql = CString::new(sql).map_err(|e| e.to_string())?;
 
@@ -111,6 +121,7 @@ unsafe fn raw_query_json_impl(db: *mut ffi::sqlite3, sql: &str) -> Result<Vec<Va
     Ok(out)
 }
 
+#[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
 unsafe fn sqlite_err(db: *mut ffi::sqlite3) -> String {
     let msg = ffi::sqlite3_errmsg(db);
     if msg.is_null() {

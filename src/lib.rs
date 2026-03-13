@@ -2,6 +2,7 @@ use iris_ztd::{Digest, Noun, NounDecode, NounEncode};
 
 pub mod address;
 pub mod chain_activations;
+#[cfg(feature = "binary")]
 pub mod cli;
 pub mod db;
 pub mod layers;

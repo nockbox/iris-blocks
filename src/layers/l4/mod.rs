@@ -14,11 +14,14 @@ use log::*;
 use schema::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::watch;
 use tracing::Instrument;
 
 pub struct L4Client {
     activations: ChainActivations,
     deps: Vec<Arc<dyn LayerDependency>>,
+    _stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
+    stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,8 +32,13 @@ struct ResolvedRecipient {
 
 impl L4Client {
     pub fn new(activations: ChainActivations, deps: Vec<Arc<dyn LayerDependency>>) -> Self {
-        Self::verify_dependencies(&deps).unwrap();
-        Self { activations, deps }
+        let (stats_tx, stats_rx) = Self::verify_dependencies(&deps).unwrap();
+        Self {
+            activations,
+            deps,
+            _stats_tx: stats_tx,
+            stats_rx,
+        }
     }
 
     async fn resolve_recipients(
@@ -150,6 +158,10 @@ impl L4Client {
 impl LayerBase for L4Client {
     const ACCEPT_LAYERS: &'static [&'static str] = &["l3"];
     const LAYER: &'static str = "l4";
+    type Stats = ();
+    fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>> {
+        self.stats_rx.clone()
+    }
 }
 
 impl LayerImpl for L4Client {

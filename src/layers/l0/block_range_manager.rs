@@ -1,7 +1,6 @@
 use crate::rt::RtFuture;
 use crate::scry::{ScryError, Scryable};
 use clap::Parser;
-use futures::future::BoxFuture;
 use iris_nockchain_types::{BlockHeight, Page, Tx};
 use iris_ztd::{Digest, ZMap};
 use log::*;

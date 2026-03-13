@@ -11,7 +11,6 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, StreamExt};
-use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;
 use iris_nockchain_types::BlockHeight;
 use iris_ztd::{jam, Digest, NounEncode};
 use log::*;
@@ -20,8 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::watch;
-#[cfg(feature = "tokio")]
-use tonic::transport::Channel;
 
 mod block_range_manager;
 use block_range_manager::BlockRangeManager;

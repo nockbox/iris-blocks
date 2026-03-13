@@ -20,7 +20,7 @@ use tracing::Instrument;
 pub struct L3Client {
     activations: ChainActivations,
     deps: Vec<Arc<dyn LayerDependency>>,
-    stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
+    _stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
@@ -30,7 +30,7 @@ impl L3Client {
         Self {
             activations,
             deps,
-            stats_tx,
+            _stats_tx: stats_tx,
             stats_rx,
         }
     }
