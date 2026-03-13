@@ -1,6 +1,6 @@
 use clap::Parser;
 use iris_blocks::chain_activations::ChainActivations;
-use iris_blocks::cli::{Cli, Commands, OutputFormat};
+use iris_blocks::cli::{AuditView, Cli, Commands, OutputFormat};
 use iris_blocks::layers::shared_schema::FixedLayerMetadata;
 use iris_blocks::layers::{
     l0::L0Client,
@@ -273,6 +273,73 @@ fn print_audit_text(report: &iris_blocks::query::AuditReport) {
     }
 }
 
+fn print_audit_summary_text(report: &iris_blocks::query::AuditReport) {
+    print_balance_text(&report.balance);
+
+    print_section(&format!("Flow Summary ({})", report.flows.len()));
+    println!(
+        "{:<12} {:<25} {:<55} {:<10} {:<10} {:<40} {:>14} {:>10} {:>14}",
+        "block_height",
+        "block_time_utc",
+        "txid",
+        "type",
+        "rtype",
+        "recipient",
+        "amount",
+        "fee",
+        "running"
+    );
+    for row in &report.flows {
+        println!(
+            "{:<12} {:<25} {:<55} {:<10} {:<10} {:<40} {:>14} {:>10} {:>14}",
+            row.block_height,
+            truncate_cell(&row.block_time_utc, 25),
+            truncate_cell(row.txid.as_deref().unwrap_or("-"), 55),
+            row.entry_type,
+            row.recipient_type.as_deref().unwrap_or("-"),
+            truncate_cell(row.recipient.as_deref().unwrap_or("-"), 40),
+            row.amount_nicks,
+            row.fee_nicks,
+            row.running_balance_nicks,
+        );
+    }
+}
+
+fn print_audit_notes_text(report: &iris_blocks::query::AuditReport) {
+    print_balance_text(&report.balance);
+    print_section(&format!("Ledger Entries ({})", report.ledger.len()));
+    println!(
+        "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<40}",
+        "block_height", "block_time_utc", "type", "txid", "rtype", "amount", "fee", "running", "recipient"
+    );
+    for e in &report.ledger {
+        println!(
+            "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<40}",
+            e.block_height,
+            truncate_cell(&e.block_time_utc, 25),
+            e.entry_type,
+            truncate_cell(e.txid.as_deref().unwrap_or("-"), 55),
+            e.recipient_type.as_deref().unwrap_or("-"),
+            e.amount_nicks,
+            e.fee_nicks,
+            e.running_balance_nicks,
+            truncate_cell(e.recipient.as_deref().unwrap_or("-"), 40),
+        );
+    }
+}
+
+#[derive(serde::Serialize)]
+struct AuditSummaryJson<'a> {
+    balance: &'a iris_blocks::query::WalletBalance,
+    flows: &'a [iris_blocks::query::AuditFlowRow],
+}
+
+#[derive(serde::Serialize)]
+struct AuditNotesJson<'a> {
+    balance: &'a iris_blocks::query::WalletBalance,
+    ledger: &'a [iris_blocks::query::LedgerEntry],
+}
+
 fn serialize_json<T: serde::Serialize>(value: &T) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -291,14 +358,12 @@ fn sanitize_for_filename(input: &str) -> String {
         .collect()
 }
 
-fn resolve_audit_csv_path(
+fn resolve_csv_path(
     csv_arg: &str,
     address_input: &str,
+    file_prefix: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let file_name = format!(
-        "nockchain_transactions_{}.csv",
-        sanitize_for_filename(address_input)
-    );
+    let file_name = format!("{file_prefix}_{}.csv", sanitize_for_filename(address_input));
 
     if csv_arg.trim().is_empty() {
         return Ok(std::env::current_dir()?.join(file_name));
@@ -433,17 +498,41 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let address = iris_blocks::address::resolve_address(&mut conn, &args.address).await?;
             let report = iris_blocks::query::audit_report(&mut conn, address).await?;
             if let Some(csv_arg) = args.csv.as_deref() {
-                let path = resolve_audit_csv_path(csv_arg, &report.balance.address.input)?;
+                let path =
+                    resolve_csv_path(csv_arg, &report.balance.address.input, "nockchain_transactions")?;
+                let mut writer = csv::Writer::from_path(&path)?;
+                for row in report.flows.iter().rev() {
+                    writer.serialize(row)?;
+                }
+                writer.flush()?;
+                eprintln!("Summary CSV written to {}", path.display());
+            }
+            if let Some(csv_arg) = args.csv_notes.as_deref() {
+                let path = resolve_csv_path(csv_arg, &report.balance.address.input, "nockchain_notes")?;
                 let mut writer = csv::Writer::from_path(&path)?;
                 for row in report.ledger.iter().rev() {
                     writer.serialize(row)?;
                 }
                 writer.flush()?;
-                eprintln!("CSV written to {}", path.display());
+                eprintln!("Detailed CSV written to {}", path.display());
             }
             match args.format {
-                OutputFormat::Text => print_audit_text(&report),
-                OutputFormat::Json => serialize_json(&report)?,
+                OutputFormat::Text => match args.view {
+                    AuditView::Summary => print_audit_summary_text(&report),
+                    AuditView::Notes => print_audit_notes_text(&report),
+                    AuditView::Both => print_audit_text(&report),
+                },
+                OutputFormat::Json => match args.view {
+                    AuditView::Summary => serialize_json(&AuditSummaryJson {
+                        balance: &report.balance,
+                        flows: &report.flows,
+                    })?,
+                    AuditView::Notes => serialize_json(&AuditNotesJson {
+                        balance: &report.balance,
+                        ledger: &report.ledger,
+                    })?,
+                    AuditView::Both => serialize_json(&report)?,
+                },
             }
         }
     }

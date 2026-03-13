@@ -295,7 +295,26 @@ ORDER BY height, txid, idx;
 
 ## Audit CSV Columns
 
-`audit --csv` writes one ledger row per entry with:
+### Summary CSV (`audit --csv`)
+
+Flow-summary rows for accounting (recipient-level, not note-level):
+
+- `block_height`
+- `block_id`
+- `txid`
+- `block_timestamp` (raw chain timestamp from `blocks.timestamp`, biased `@da`-style seconds)
+- `block_unix_timestamp` (decoded unix timestamp seconds)
+- `block_time_utc` (human-readable UTC derived from `block_timestamp`)
+- `entry_type` (`incoming`, `outgoing`, `coinbase`)
+- `recipient_type`
+- `recipient`
+- `amount_nicks`
+- `fee_nicks` (tx-level fee, attached to one deterministic row per tx)
+- `running_balance_nicks`
+
+### Notes CSV (`audit --csv-notes`)
+
+Detailed note-level ledger rows:
 
 - `block_height`
 - `block_timestamp` (raw chain timestamp from `blocks.timestamp`, biased `@da`-style seconds)

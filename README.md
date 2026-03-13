@@ -31,7 +31,7 @@ Commands:
 - `tx <txid>`: transaction drilldown (spends, outputs, signers, credits, debits)
 - `block <height-or-id>`: block metadata, tx list, coinbase credits
 - `status`: layer cursors + key table row counts
-- `audit <address>`: full wallet audit with ledger + transaction summaries, optional CSV export via `--csv [PATH_OR_DIR]`
+- `audit <address>`: wallet audit with selectable text/json view (`--view summary|notes|both`), plus CSV exports for summary (`--csv`) and detailed notes based export (`--csv-notes`)
 
 ### Data sources
 
@@ -49,14 +49,28 @@ iris-blocks --db nockchain.sqlite sync --connect http://localhost:5555 --run-mig
 
 # Query by PKH or legacy V0 key
 iris-blocks --db nockchain.sqlite balance <address>
-iris-blocks --db nockchain.sqlite audit <address> --csv wallet_audit.csv
+iris-blocks --db nockchain.sqlite audit <address> --csv wallet_flow_summary.csv
 
-# Auto-name CSV in current directory:
-# nockchain_transactions_<wallet-address>.csv
+# Audit text/json view selection:
+iris-blocks --db nockchain.sqlite audit <address> --view summary
+iris-blocks --db nockchain.sqlite audit <address> --format json --view notes
+iris-blocks --db nockchain.sqlite audit <address> --view both
+
+# Auto-name summary CSV in current directory:
+# nockchain_transactions_<address>.csv
 iris-blocks --db nockchain.sqlite audit <address> --csv
 
-# Write auto-named CSV into a directory:
-iris-blocks --db nockchain.sqlite audit <address> --csv /Users/thomas/Downloads/
+# Auto-name detailed notes CSV:
+# nockchain_notes_<address>.csv
+iris-blocks --db nockchain.sqlite audit <address> --csv-notes
+
+# Write auto-named summary CSV into a directory:
+iris-blocks --db nockchain.sqlite audit <address> --csv /path/to/output-dir/
+
+# Write both summary and detailed CSV in one run:
+iris-blocks --db nockchain.sqlite audit <address> \
+  --csv /path/to/output-dir/ \
+  --csv-notes /path/to/output-dir/
 ```
 
 ## Units

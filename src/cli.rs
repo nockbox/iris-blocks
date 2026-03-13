@@ -9,6 +9,13 @@ pub enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AuditView {
+    Summary,
+    Notes,
+    Both,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "iris-blocks", about = "Layered nockchain indexer and query CLI")]
 pub struct Cli {
@@ -72,8 +79,29 @@ pub struct StatusArgs {
 #[derive(Debug, Parser, Clone)]
 pub struct AuditArgs {
     pub address: String,
-    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "PATH_OR_DIR")]
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "",
+        value_name = "PATH_OR_DIR",
+        help = "Write flow-summary CSV (default accounting view)"
+    )]
     pub csv: Option<String>,
+    #[arg(
+        long = "csv-notes",
+        num_args = 0..=1,
+        default_missing_value = "",
+        value_name = "PATH_OR_DIR",
+        help = "Write detailed note-level CSV (power view)"
+    )]
+    pub csv_notes: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = AuditView::Summary,
+        help = "Select audit output view for text/json"
+    )]
+    pub view: AuditView,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
 }

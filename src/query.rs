@@ -5,6 +5,7 @@ use diesel::sql_query;
 use diesel::sql_types::{BigInt, Bool, Integer, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -182,6 +183,22 @@ pub struct WalletTxSummary {
     pub net_nicks: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditFlowRow {
+    pub block_height: i32,
+    pub block_id: Option<String>,
+    pub txid: Option<String>,
+    pub block_timestamp: i64,
+    pub block_unix_timestamp: Option<i64>,
+    pub block_time_utc: String,
+    pub entry_type: String,
+    pub recipient_type: Option<String>,
+    pub recipient: Option<String>,
+    pub amount_nicks: i64,
+    pub fee_nicks: i64,
+    pub running_balance_nicks: i64,
+}
+
 fn chain_timestamp_to_unix_seconds(ts: i64) -> Option<i64> {
     // Chain timestamps are stored in a biased @da-like second format (u64).
     // The bias/epoch is not 2^63 relative to unix; it is the @da unix offset.
@@ -204,10 +221,37 @@ fn format_chain_timestamp_utc(ts: i64) -> String {
     }
 }
 
+fn recipient_matches_wallet(
+    scope: VersionScope,
+    pkh: &str,
+    wallet_pks: &HashSet<String>,
+    recipient_type: Option<&str>,
+    recipient: Option<&str>,
+) -> bool {
+    let Some(recipient_type) = recipient_type else {
+        return false;
+    };
+    let Some(recipient) = recipient else {
+        return false;
+    };
+    match scope {
+        VersionScope::V0Only => recipient_type == "v0pk" && wallet_pks.contains(recipient),
+        VersionScope::V1Only => {
+            (recipient_type == "pk" && wallet_pks.contains(recipient))
+                || (recipient_type == "pkh" && recipient == pkh)
+        }
+        VersionScope::All => {
+            ((recipient_type == "pk" || recipient_type == "v0pk") && wallet_pks.contains(recipient))
+                || (recipient_type == "pkh" && recipient == pkh)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditReport {
     pub balance: WalletBalance,
     pub transactions: Vec<WalletTxSummary>,
+    pub flows: Vec<AuditFlowRow>,
     pub ledger: Vec<LedgerEntry>,
 }
 
@@ -225,6 +269,12 @@ struct VersionSumRow {
     version: i32,
     #[diesel(sql_type = BigInt)]
     sum_nicks: i64,
+}
+
+#[derive(QueryableByName)]
+struct PkRow {
+    #[diesel(sql_type = Text)]
+    pk: String,
 }
 
 #[derive(QueryableByName)]
@@ -870,6 +920,14 @@ pub async fn audit_report(
         VersionScope::V1Only => " AND n.version >= 1",
     };
 
+    let wallet_pks = sql_query("SELECT pk FROM pk_to_pkh WHERE pkh = ?1")
+        .bind::<Text, _>(pkh.clone())
+        .load::<PkRow>(conn)
+        .await?
+        .into_iter()
+        .map(|r| r.pk)
+        .collect::<HashSet<_>>();
+
     let mut ledger = Vec::new();
 
     let credit_sql = match scope {
@@ -1034,7 +1092,7 @@ pub async fn audit_report(
                 COALESCE(b.timestamp, 0) AS block_timestamp,
                 'debit' AS entry_type,
                 n.spent_txid AS txid,
-                NULL AS block_id,
+                t.block_id AS block_id,
                 NULL AS recipient_type,
                 NULL AS recipient,
                 n.assets AS amount_nicks,
@@ -1055,7 +1113,7 @@ pub async fn audit_report(
          ORDER BY n.spent_height, n.spent_txid, n.first, n.last"
     );
     let spent_rows = sql_query(spent_sql)
-    .bind::<Text, _>(pkh)
+    .bind::<Text, _>(pkh.clone())
     .load::<LedgerRow>(conn)
     .await?;
 
@@ -1093,7 +1151,6 @@ pub async fn audit_report(
         entry.running_balance_nicks = running_balance_nicks;
     }
 
-    use std::collections::BTreeMap;
     let mut tx_map: BTreeMap<String, WalletTxSummary> = BTreeMap::new();
     for entry in &ledger {
         let Some(txid) = entry.txid.clone() else {
@@ -1137,10 +1194,148 @@ pub async fn audit_report(
         };
     }
 
-    let transactions = tx_map.into_values().collect();
+    let mut transactions = tx_map.into_values().collect::<Vec<_>>();
+    transactions.sort_by(|a, b| {
+        a.first_block_height
+            .cmp(&b.first_block_height)
+            .then_with(|| a.first_block_timestamp.cmp(&b.first_block_timestamp))
+            .then_with(|| a.txid.cmp(&b.txid))
+    });
+
+    // Summary flow rows are accounting-focused and recipient-level.
+    // They collapse note-level debits into tx output flows.
+    let mut flows = Vec::new();
+
+    // Incoming rows: wallet-owned credits and coinbase rows from ledger.
+    for entry in &ledger {
+        if entry.entry_type == "credit" || entry.entry_type == "coinbase" {
+            flows.push(AuditFlowRow {
+                block_height: entry.block_height,
+                block_id: entry.block_id.clone(),
+                txid: entry.txid.clone(),
+                block_timestamp: entry.block_timestamp,
+                block_unix_timestamp: entry.block_unix_timestamp,
+                block_time_utc: entry.block_time_utc.clone(),
+                entry_type: if entry.entry_type == "coinbase" {
+                    "coinbase".to_string()
+                } else {
+                    "incoming".to_string()
+                },
+                recipient_type: entry.recipient_type.clone(),
+                recipient: entry.recipient.clone(),
+                amount_nicks: entry.amount_nicks,
+                fee_nicks: 0,
+                running_balance_nicks: 0,
+            });
+        }
+    }
+
+    // Outgoing rows: recipient-level credits from wallet-spend txs excluding wallet recipients.
+    let outgoing_sql = format!(
+        "SELECT c.height AS block_height,
+                COALESCE(b.timestamp, 0) AS block_timestamp,
+                'outgoing' AS entry_type,
+                c.txid AS txid,
+                t.block_id AS block_id,
+                c.recipient_type AS recipient_type,
+                c.recipient AS recipient,
+                c.amount AS amount_nicks,
+                0 AS fee_nicks,
+                NULL AS counterparties
+         FROM credits c
+         INNER JOIN transactions t ON t.id = c.txid
+         LEFT JOIN blocks b ON b.height = c.height
+         WHERE EXISTS (
+             SELECT 1
+             FROM notes n
+             INNER JOIN name_owners no ON n.first = no.first
+             WHERE n.spent_txid = c.txid
+               AND no.pkh = ?1
+               AND n.spent_txid IS NOT NULL{note_version_filter}
+         )
+         ORDER BY c.height, c.txid, c.idx"
+    );
+    let outgoing_rows = sql_query(outgoing_sql)
+        .bind::<Text, _>(pkh.clone())
+        .load::<LedgerRow>(conn)
+        .await?;
+    for row in outgoing_rows {
+        if recipient_matches_wallet(
+            scope.clone(),
+            &pkh,
+            &wallet_pks,
+            row.recipient_type.as_deref(),
+            row.recipient.as_deref(),
+        ) {
+            continue;
+        }
+        flows.push(AuditFlowRow {
+            block_height: row.block_height,
+            block_id: row.block_id,
+            txid: row.txid,
+            block_timestamp: row.block_timestamp,
+            block_unix_timestamp: chain_timestamp_to_unix_seconds(row.block_timestamp),
+            block_time_utc: format_chain_timestamp_utc(row.block_timestamp),
+            entry_type: "outgoing".to_string(),
+            recipient_type: row.recipient_type,
+            recipient: row.recipient,
+            amount_nicks: row.amount_nicks,
+            fee_nicks: 0,
+            running_balance_nicks: 0,
+        });
+    }
+
+    // One fee assignment per tx, deterministic and stable.
+    let mut tx_fee_map: HashMap<String, i64> = HashMap::new();
+    for entry in &ledger {
+        if entry.entry_type == "debit" {
+            if let Some(txid) = entry.txid.as_ref() {
+                *tx_fee_map.entry(txid.clone()).or_insert(0) += entry.fee_nicks;
+            }
+        }
+    }
+
+    flows.sort_by(|a, b| {
+        a.block_height
+            .cmp(&b.block_height)
+            .then_with(|| a.block_timestamp.cmp(&b.block_timestamp))
+            .then_with(|| a.txid.cmp(&b.txid))
+            .then_with(|| a.entry_type.cmp(&b.entry_type))
+            .then_with(|| a.recipient_type.cmp(&b.recipient_type))
+            .then_with(|| a.recipient.cmp(&b.recipient))
+    });
+
+    for (txid, fee) in tx_fee_map {
+        if fee == 0 {
+            continue;
+        }
+        let outgoing_idx = flows
+            .iter()
+            .position(|row| row.txid.as_deref() == Some(&txid) && row.entry_type == "outgoing");
+        let any_idx = flows
+            .iter()
+            .position(|row| row.txid.as_deref() == Some(&txid));
+        if let Some(idx) = outgoing_idx.or(any_idx) {
+            flows[idx].fee_nicks = fee;
+        }
+    }
+
+    let mut running_flows_nicks = 0i64;
+    for row in &mut flows {
+        let mut delta = if row.entry_type == "outgoing" {
+            -row.amount_nicks
+        } else {
+            row.amount_nicks
+        };
+        delta -= row.fee_nicks;
+        running_flows_nicks += delta;
+        row.running_balance_nicks = running_flows_nicks;
+    }
+
     Ok(AuditReport {
         balance,
         transactions,
+        flows,
         ledger,
     })
 }
