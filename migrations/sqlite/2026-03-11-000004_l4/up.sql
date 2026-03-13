@@ -1,26 +1,15 @@
--- L4: double-entry accounting (SQLite)
+-- L4: credit info enrichment (SQLite)
 
-CREATE TABLE debits (
-    txid       TEXT    NOT NULL,
-    pk         TEXT    NOT NULL,
-    sole_owner INTEGER NOT NULL,
-    amount     INTEGER NOT NULL,
-    fee        INTEGER NOT NULL,
-    height     INTEGER NOT NULL,
-    PRIMARY KEY (txid, pk)
-);
-CREATE INDEX idx_debits_height ON debits(height);
-CREATE INDEX idx_debits_pk ON debits(pk);
-
-CREATE TABLE credits (
-    txid           TEXT    NOT NULL,
-    idx            INTEGER NOT NULL,
+CREATE TABLE credit_info (
+    txid           TEXT,
+    first          TEXT    NOT NULL,
+    height         INTEGER NOT NULL,
+    updated_height INTEGER NOT NULL,
     recipient_type TEXT    NOT NULL,
     recipient      TEXT    NOT NULL,
-    amount         INTEGER NOT NULL,
-    height         INTEGER NOT NULL,
-    PRIMARY KEY (txid, idx)
+    PRIMARY KEY (txid, first, height),
+    FOREIGN KEY (txid, first, height) REFERENCES credits(txid, first, height)
 );
-CREATE INDEX idx_credits_height ON credits(height);
-CREATE INDEX idx_credits_recipient ON credits(recipient);
-CREATE INDEX idx_credits_recipient_type ON credits(recipient_type);
+CREATE INDEX idx_credit_info_height ON credit_info(height);
+CREATE INDEX idx_credit_info_updated_height ON credit_info(updated_height);
+CREATE INDEX idx_credit_info_recipient ON credit_info(recipient);

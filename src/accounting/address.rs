@@ -1,8 +1,9 @@
-use crate::layers::l3::schema::{pk_to_pkh, PkToPkh};
+use crate::layers::l2::schema::{pkh_to_pk, PkhToPk};
+use crate::layers::shared_schema::{DbDigest, DbPublicKey};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use iris_crypto::PublicKey;
-use iris_ztd::{jam, Digest, Hashable, NounEncode};
+use iris_ztd::Digest;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -10,7 +11,6 @@ use thiserror::Error;
 pub enum AddressType {
     Pkh,
     DbPublicKey,
-    V0RawPublicKey,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -37,23 +37,6 @@ pub enum AddressError {
     Diesel(#[from] diesel::result::Error),
 }
 
-pub fn convert_raw_v0_pk_to_db_pk(raw_pk: &str) -> Result<(String, String), AddressError> {
-    let raw_bytes = bs58::decode(raw_pk)
-        .into_vec()
-        .map_err(|_| AddressError::InvalidAddress(raw_pk.to_string()))?;
-
-    // Cheetah public keys are 97 bytes in big-endian encoding (1 prefix + 96 coordinate bytes).
-    // Reject mismatched lengths so we never panic inside iris-crypto slicing.
-    if raw_bytes.len() != 97 {
-        return Err(AddressError::InvalidAddress(raw_pk.to_string()));
-    }
-
-    let pk = PublicKey::from_be_bytes(&raw_bytes);
-    let db_pk = bs58::encode(jam(pk.to_noun())).into_string();
-    let pkh = pk.hash().to_string();
-    Ok((db_pk, pkh))
-}
-
 pub async fn resolve_address(
     conn: &mut crate::db::AsyncDbConnection,
     address: &str,
@@ -64,10 +47,12 @@ pub async fn resolve_address(
     }
 
     // First try to treat the input as a DB-formatted PK.
-    if let Ok(db_pk) = crate::layers::shared_schema::DbPublicKey::try_from(normalized) {
-        if let Some(row) = pk_to_pkh::table
-            .filter(pk_to_pkh::pk.eq(db_pk))
-            .first::<PkToPkh>(conn)
+    if let Ok(pk) = PublicKey::try_from(normalized) {
+        let db_pk = DbPublicKey::from(pk);
+        println!("db_pk: {}", db_pk);
+        if let Some(row) = pkh_to_pk::table
+            .filter(pkh_to_pk::pk.eq(db_pk))
+            .first::<PkhToPk>(conn)
             .await
             .optional()?
         {
@@ -78,30 +63,42 @@ pub async fn resolve_address(
                 pkh: row.pkh.to_string(),
                 db_public_key: Some(row.pk.to_string()),
             });
+        } else {
+            return Ok(AddressInfo {
+                input: normalized.to_string(),
+                address_type: AddressType::DbPublicKey,
+                scope: VersionScope::V0Only,
+                pkh: "-".to_string(),
+                db_public_key: Some(db_pk.to_string()),
+            });
         }
     }
 
-    // Next, treat input as PKH digest if possible.
-    if Digest::try_from(normalized).is_ok() {
+    let digest = Digest::try_from(normalized)
+        .map_err(|_| AddressError::InvalidAddress(address.to_string()))?;
+    let digest = DbDigest::from(digest);
+
+    if let Some(row) = pkh_to_pk::table
+        .filter(pkh_to_pk::pkh.eq(digest))
+        .first::<PkhToPk>(conn)
+        .await
+        .optional()?
+    {
+        // TODO: restrict to v1 only?
         return Ok(AddressInfo {
             input: normalized.to_string(),
             address_type: AddressType::Pkh,
-            scope: VersionScope::V1Only,
-            pkh: normalized.to_string(),
+            scope: VersionScope::All,
+            pkh: row.pkh.to_string(),
+            db_public_key: Some(row.pk.to_string()),
+        });
+    } else {
+        return Ok(AddressInfo {
+            input: normalized.to_string(),
+            address_type: AddressType::Pkh,
+            scope: VersionScope::All,
+            pkh: digest.to_string(),
             db_public_key: None,
         });
     }
-
-    // Finally, try legacy V0 raw PK (bs58(pk.to_be_bytes()) form).
-    if let Ok((db_pk, pkh)) = convert_raw_v0_pk_to_db_pk(normalized) {
-        return Ok(AddressInfo {
-            input: normalized.to_string(),
-            address_type: AddressType::V0RawPublicKey,
-            scope: VersionScope::V0Only,
-            pkh,
-            db_public_key: Some(db_pk),
-        });
-    }
-
-    Err(AddressError::InvalidAddress(address.to_string()))
 }

@@ -1,7 +1,9 @@
-//! L2 layer: transaction internals.
+//! L2 layer: transaction internals + hash reversals + spend conditions.
 
 use crate::layers::shared_schema::{DbDigest, DbPublicKey};
 use diesel::prelude::*;
+
+// --- L2.1: Transaction internals ---
 
 diesel::table! {
     use diesel::sql_types::*;
@@ -22,8 +24,9 @@ diesel::table! {
     use diesel::sql_types::*;
     use crate::layers::shared_schema::sql_types::DigestSql;
 
-    tx_seeds (txid, idx) {
+    tx_seeds (txid, z, idx) {
         txid -> DigestSql,
+        z -> Integer,
         idx -> Integer,
         amount -> BigInt,
         first -> DigestSql,
@@ -57,7 +60,71 @@ diesel::table! {
     }
 }
 
-diesel::allow_tables_to_appear_in_same_query!(tx_spends, tx_seeds, tx_outputs, tx_signers);
+// --- L2.2: Hash reversals ---
+
+diesel::table! {
+    use diesel::sql_types::*;
+    use crate::layers::shared_schema::sql_types::DigestSql;
+
+    name_to_lock (first) {
+        first -> DigestSql,
+        root -> DigestSql,
+        height -> Integer,
+        block_id -> DigestSql,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+    use crate::layers::shared_schema::sql_types::{DigestSql, PublicKeySql};
+
+    pkh_to_pk (pkh) {
+        pkh -> DigestSql,
+        pk -> PublicKeySql,
+        height -> Integer,
+        block_id -> DigestSql,
+    }
+}
+
+// --- L2.3: Spend condition retrieval ---
+
+diesel::table! {
+    use diesel::sql_types::*;
+    use crate::layers::shared_schema::sql_types::DigestSql;
+
+    lock_tree (root) {
+        root -> DigestSql,
+        height -> Integer,
+        axis -> Integer,
+        hash -> DigestSql,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+    use crate::layers::shared_schema::sql_types::DigestSql;
+
+    spend_conditions (hash) {
+        hash -> DigestSql,
+        txid -> DigestSql,
+        z -> Integer,
+        height -> Integer,
+        jam -> Binary,
+    }
+}
+
+diesel::allow_tables_to_appear_in_same_query!(
+    tx_spends,
+    tx_seeds,
+    tx_outputs,
+    tx_signers,
+    name_to_lock,
+    pkh_to_pk,
+    lock_tree,
+    spend_conditions
+);
+
+// --- L2.1 structs ---
 
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = tx_spends, treat_none_as_default_value = false)]
@@ -75,6 +142,7 @@ pub struct TxSpend {
 #[diesel(table_name = tx_seeds, treat_none_as_default_value = false)]
 pub struct TxSeed {
     pub txid: DbDigest,
+    pub z: i32,
     pub idx: i32,
     pub amount: i64,
     pub first: DbDigest,
@@ -99,4 +167,45 @@ pub struct TxSigner {
     pub z: i32,
     pub pk: DbPublicKey,
     pub height: i32,
+}
+
+// --- L2.2 structs ---
+
+#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
+#[diesel(table_name = name_to_lock, treat_none_as_default_value = false)]
+pub struct NameToLock {
+    pub first: DbDigest,
+    pub root: DbDigest,
+    pub height: i32,
+    pub block_id: DbDigest,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
+#[diesel(table_name = pkh_to_pk, treat_none_as_default_value = false)]
+pub struct PkhToPk {
+    pub pkh: DbDigest,
+    pub pk: DbPublicKey,
+    pub height: i32,
+    pub block_id: DbDigest,
+}
+
+// --- L2.3 structs ---
+
+#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
+#[diesel(table_name = lock_tree, treat_none_as_default_value = false)]
+pub struct LockTree {
+    pub root: DbDigest,
+    pub height: i32,
+    pub axis: i32,
+    pub hash: DbDigest,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
+#[diesel(table_name = spend_conditions, treat_none_as_default_value = false)]
+pub struct SpendConditionRow {
+    pub hash: DbDigest,
+    pub txid: DbDigest,
+    pub z: i32,
+    pub height: i32,
+    pub jam: Vec<u8>,
 }

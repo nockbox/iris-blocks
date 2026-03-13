@@ -50,7 +50,10 @@ pub enum OutputFormat {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "iris-blocks", about = "Layered nockchain indexer and query CLI")]
+#[command(
+    name = "iris-blocks",
+    about = "Layered nockchain indexer and query CLI"
+)]
 pub struct Cli {
     #[arg(short, long, default_value = "nockchain.sqlite")]
     pub db: String,

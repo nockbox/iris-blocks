@@ -14,9 +14,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use std::sync::OnceLock;
 
-use tracing_subscriber::{
-    layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter,
-};
+use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
 
 static LOG_FILTER_HANDLE: OnceLock<reload::Handle<EnvFilter, tracing_subscriber::Registry>> =
     OnceLock::new();

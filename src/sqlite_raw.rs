@@ -1,9 +1,9 @@
 use diesel::sqlite::SqliteConnection;
 #[cfg(feature = "libsqlite3-sys")]
 use libsqlite3_sys as ffi;
+use serde_json::Value;
 #[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
 use serde_json::{Map, Number};
-use serde_json::Value;
 #[cfg(feature = "sqlite-wasm-rs")]
 use sqlite_wasm_rs as ffi;
 #[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]

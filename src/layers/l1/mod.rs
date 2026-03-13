@@ -137,7 +137,7 @@ impl LayerImpl for L1Client {
         for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
             let block_range_span =
                 tracing::info_span!("l1_update_block_range", block_height, end_block_height);
-            trace!("Syncing block {block_height}");
+            // trace!("Syncing block {block_height}");
             let last_block_height = core::cmp::min(block_height + step - 1, end_block_height);
 
             let block_span =

@@ -1,7 +1,7 @@
 use clap::Parser;
 
-use crate::{db, query};
-use super::{OutputFormat, serialize_json, print_section};
+use super::{print_section, serialize_json, OutputFormat};
+use crate::{accounting::query, db};
 
 #[derive(Debug, Parser, Clone)]
 pub struct StatusArgs {

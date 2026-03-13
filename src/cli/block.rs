@@ -1,7 +1,7 @@
 use clap::Parser;
 
-use crate::{db, query};
-use super::{OutputFormat, serialize_json, truncate_cell, print_section, print_kv};
+use super::{print_kv, print_section, serialize_json, truncate_cell, OutputFormat};
+use crate::{accounting::query, db};
 
 #[derive(Debug, Parser, Clone)]
 pub struct BlockArgs {
@@ -29,18 +29,14 @@ pub fn print_block_text(block: &query::BlockDetail) {
     print_kv("version", block.version);
     print_kv("parent", &block.parent);
     print_kv("block_timestamp", block.block_timestamp);
-    print_kv(
-        "block_unix_timestamp",
-        block
-            .block_unix_timestamp
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "invalid".to_string()),
-    );
     print_kv("block_time_utc", &block.block_time_utc);
     print_kv("msg", block.msg.as_deref().unwrap_or(""));
 
     print_section(&format!("Transactions ({})", block.transactions.len()));
-    println!("{:<55} {:<7} {:>12} {:>10}", "txid", "version", "fee_nicks", "total_size");
+    println!(
+        "{:<55} {:<7} {:>12} {:>10}",
+        "txid", "version", "fee_nicks", "total_size"
+    );
     for tx in &block.transactions {
         println!(
             "{:<55} {:<7} {:>12} {:>10}",
@@ -51,17 +47,18 @@ pub fn print_block_text(block: &query::BlockDetail) {
         );
     }
 
-    print_section(&format!("Coinbase Credits ({})", block.coinbase_credits.len()));
+    print_section(&format!(
+        "Coinbase Credits ({})",
+        block.coinbase_credits.len()
+    ));
     println!(
-        "{:<4} {:<10} {:<40} {:>14} {:>12} {:<25}",
-        "idx", "rtype", "recipient", "amount_nicks", "block_height", "block_time_utc"
+        "{:<55} {:>14} {:>12} {:<25}",
+        "first", "amount_nicks", "block_height", "block_time_utc"
     );
     for cc in &block.coinbase_credits {
         println!(
-            "{:<4} {:<10} {:<40} {:>14} {:>12} {:<25}",
-            cc.idx,
-            cc.recipient_type,
-            truncate_cell(&cc.recipient, 40),
+            "{:<55} {:>14} {:>12} {:<25}",
+            truncate_cell(&cc.first, 55),
             cc.amount_nicks,
             cc.block_height,
             truncate_cell(&cc.block_time_utc, 25)

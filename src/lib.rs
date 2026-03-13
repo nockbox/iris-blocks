@@ -1,13 +1,12 @@
 use iris_ztd::{Digest, Noun, NounDecode, NounEncode};
 
-pub mod address;
+pub mod accounting;
 pub mod chain_activations;
 #[cfg(feature = "binary")]
 pub mod cli;
 pub mod db;
 pub mod layers;
 mod rt;
-pub mod query;
 pub mod scry;
 pub mod sqlite_raw;
 

@@ -5,7 +5,7 @@ use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use iris_nockchain_types::{v1::SpendV1, Tx};
-use iris_ztd::{cue, Hashable, NounDecode, ZMap};
+use iris_ztd::{cue, jam, Digest, Hashable, NounDecode, NounEncode};
 use log::*;
 use schema::*;
 use std::sync::Arc;
@@ -13,10 +13,41 @@ use tokio::sync::watch;
 use tracing::Instrument;
 
 pub struct L2Client {
+    #[allow(dead_code)]
     activations: ChainActivations,
     deps: Vec<Arc<dyn LayerDependency>>,
     _stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
+}
+
+/// Per-block L2 output buffers, accumulated across all 3 sub-layers.
+struct L2BlockBuffers {
+    // L2.1
+    spends: Vec<TxSpend>,
+    seeds: Vec<TxSeed>,
+    outputs: Vec<TxOutput>,
+    signers: Vec<TxSigner>,
+    // L2.2
+    name_to_lock: Vec<NameToLock>,
+    pkh_to_pk: Vec<PkhToPk>,
+    // L2.3
+    lock_trees: Vec<LockTree>,
+    spend_conditions: Vec<SpendConditionRow>,
+}
+
+impl L2BlockBuffers {
+    fn new() -> Self {
+        Self {
+            spends: vec![],
+            seeds: vec![],
+            outputs: vec![],
+            signers: vec![],
+            name_to_lock: vec![],
+            pkh_to_pk: vec![],
+            lock_trees: vec![],
+            spend_conditions: vec![],
+        }
+    }
 }
 
 impl L2Client {
@@ -46,6 +77,265 @@ impl L2Client {
         i32::try_from(value).map_err(|_| {
             LayerErrorSource::OtherError(format!("numeric value out of range for {field}: {value}"))
         })
+    }
+
+    fn merkle_proof_siblings(axis: u64, path: &[Digest]) -> Vec<(i32, Digest)> {
+        let mut out = vec![];
+        let mut cur_axis = axis;
+        for sibling_hash in path {
+            let sibling_axis = if cur_axis % 2 == 0 {
+                cur_axis + 1
+            } else {
+                cur_axis - 1
+            };
+            out.push((sibling_axis as i32, *sibling_hash));
+            cur_axis /= 2;
+        }
+        out
+    }
+
+    /// L2.1: Collect transaction internals (spends, seeds, outputs, signers).
+    fn collect_tx_internals(
+        tx: &super::l0::schema::Transaction,
+        vtx: &Tx,
+        spend_version: i32,
+        bufs: &mut L2BlockBuffers,
+    ) -> Result<(), LayerErrorSource> {
+        match vtx {
+            Tx::V0(v0) => {
+                for (z, (name, input)) in v0.raw.inputs.0.iter().enumerate() {
+                    bufs.spends.push(TxSpend {
+                        txid: tx.id,
+                        z: Self::checked_usize_to_i32(z, "tx_spends.z")?,
+                        version: spend_version,
+                        first: name.first.into(),
+                        last: name.last.into(),
+                        fee: Self::checked_u64_to_i64(input.spend.fee.0, "tx_spends.fee")?,
+                        height: tx.height,
+                    });
+
+                    if let Some(signature) = &input.spend.signature {
+                        for (pk, _) in signature.0.iter() {
+                            bufs.signers.push(TxSigner {
+                                txid: tx.id,
+                                z: Self::checked_usize_to_i32(z, "tx_signers.z")?,
+                                pk: pk.clone().into(),
+                                height: tx.height,
+                            });
+                        }
+                    }
+
+                    let z_i32 = Self::checked_usize_to_i32(z, "tx_seeds.z")?;
+                    for (idx, seed) in input.spend.seeds.0.iter().enumerate() {
+                        bufs.seeds.push(TxSeed {
+                            txid: tx.id,
+                            z: z_i32,
+                            idx: idx as i32,
+                            amount: Self::checked_u64_to_i64(seed.gift.0, "tx_seeds.amount")?,
+                            first: seed.recipient.hash().into(),
+                            height: tx.height,
+                        });
+                    }
+                }
+            }
+            Tx::V1(v1) => {
+                for (z, (name, spend)) in v1.raw.spends.0.iter().enumerate() {
+                    bufs.spends.push(TxSpend {
+                        txid: tx.id,
+                        z: Self::checked_usize_to_i32(z, "tx_spends.z")?,
+                        version: spend_version,
+                        first: name.first.into(),
+                        last: name.last.into(),
+                        fee: Self::checked_u64_to_i64(spend.fee().0, "tx_spends.fee")?,
+                        height: tx.height,
+                    });
+
+                    match spend {
+                        SpendV1::S0(legacy_spend) => {
+                            for (pk, _) in legacy_spend.signature.0.iter() {
+                                bufs.signers.push(TxSigner {
+                                    txid: tx.id,
+                                    z: Self::checked_usize_to_i32(z, "tx_signers.z")?,
+                                    pk: pk.clone().into(),
+                                    height: tx.height,
+                                });
+                            }
+                        }
+                        SpendV1::S1(witness_spend) => {
+                            for (_, (pk, _)) in witness_spend.witness.pkh_signature.0.iter() {
+                                bufs.signers.push(TxSigner {
+                                    txid: tx.id,
+                                    z: Self::checked_usize_to_i32(z, "tx_signers.z")?,
+                                    pk: pk.clone().into(),
+                                    height: tx.height,
+                                });
+                            }
+                        }
+                    }
+
+                    let z_i32 = Self::checked_usize_to_i32(z, "tx_seeds.z")?;
+                    for (idx, seed) in spend.seeds().0.iter().enumerate() {
+                        let first = (true, seed.lock_root.hash()).hash();
+                        bufs.seeds.push(TxSeed {
+                            txid: tx.id,
+                            z: z_i32,
+                            idx: idx as i32,
+                            amount: Self::checked_u64_to_i64(seed.gift.0, "tx_seeds.amount")?,
+                            first: first.into(),
+                            height: tx.height,
+                        });
+                    }
+                }
+            }
+        }
+
+        let outputs = vtx.outputs().notes();
+        for (idx, note) in outputs.into_iter().enumerate() {
+            bufs.outputs.push(TxOutput {
+                txid: tx.id,
+                idx: Self::checked_usize_to_i32(idx, "tx_outputs.idx")?,
+                first: note.name().first.into(),
+                last: note.name().last.into(),
+                assets: Self::checked_u64_to_i64(note.assets().0, "tx_outputs.assets")?,
+                height: tx.height,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// L2.2: Collect hash reversals (name_to_lock, pkh_to_pk).
+    fn collect_hash_reversals(
+        tx: &super::l0::schema::Transaction,
+        vtx: &Tx,
+        block_id: DbDigest,
+        bufs: &mut L2BlockBuffers,
+    ) {
+        match vtx {
+            Tx::V0(v0) => {
+                // V0: extract pk→pkh from legacy signatures
+                for (_, input) in v0.raw.inputs.0.iter() {
+                    if let Some(signature) = &input.spend.signature {
+                        for (pk, _) in signature.0.iter() {
+                            let pkh = pk.hash();
+                            bufs.pkh_to_pk.push(PkhToPk {
+                                pkh: pkh.into(),
+                                pk: pk.clone().into(),
+                                height: tx.height,
+                                block_id,
+                            });
+                        }
+                    }
+                }
+            }
+            Tx::V1(v1) => {
+                for (_, spend) in v1.raw.spends.0.iter() {
+                    match spend {
+                        SpendV1::S0(legacy_spend) => {
+                            for (pk, _) in legacy_spend.signature.0.iter() {
+                                let pkh = pk.hash();
+                                bufs.pkh_to_pk.push(PkhToPk {
+                                    pkh: pkh.into(),
+                                    pk: pk.clone().into(),
+                                    height: tx.height,
+                                    block_id,
+                                });
+                            }
+                        }
+                        SpendV1::S1(witness_spend) => {
+                            // lock proof root → name's first
+                            let lock_proof = &witness_spend.witness.lock_merkle_proof;
+                            let root: DbDigest = lock_proof.proof().root.into();
+                            // name_to_lock is populated from seeds below,
+                            // and for witness spends we can also map input name → root
+                            // (handled in collect_spend_conditions for consistency)
+
+                            // pkh → pk from witness signatures
+                            for (pkh, (pk, _)) in &witness_spend.witness.pkh_signature.0 {
+                                bufs.pkh_to_pk.push(PkhToPk {
+                                    pkh: (*pkh).into(),
+                                    pk: pk.clone().into(),
+                                    height: tx.height,
+                                    block_id,
+                                });
+                            }
+                            let _ = root; // used in collect_spend_conditions
+                        }
+                    }
+
+                    // name_to_lock from seeds: seed.lock_root → first
+                    for seed in spend.seeds().0.iter() {
+                        let root_digest = seed.lock_root.hash();
+                        let first = (true, root_digest).hash();
+                        bufs.name_to_lock.push(NameToLock {
+                            first: first.into(),
+                            root: root_digest.into(),
+                            height: tx.height,
+                            block_id,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// L2.3: Collect spend conditions (lock_tree, spend_conditions) from V1 witness spends.
+    fn collect_spend_conditions(
+        tx: &super::l0::schema::Transaction,
+        vtx: &Tx,
+        block_id: DbDigest,
+        bufs: &mut L2BlockBuffers,
+    ) {
+        let Tx::V1(v1) = vtx else { return };
+
+        for (z, (name, spend)) in v1.raw.spends.0.iter().enumerate() {
+            let SpendV1::S1(witness_spend) = spend else {
+                continue;
+            };
+
+            let lock_proof = &witness_spend.witness.lock_merkle_proof;
+            let root: DbDigest = lock_proof.proof().root.into();
+            let sc = lock_proof.spend_condition();
+            let sc_hash: DbDigest = sc.hash().into();
+
+            // name_to_lock for spent input
+            let input_first: DbDigest = name.first.into();
+            bufs.name_to_lock.push(NameToLock {
+                first: input_first,
+                root,
+                height: tx.height,
+                block_id,
+            });
+
+            // lock_tree: root node
+            bufs.lock_trees.push(LockTree {
+                root,
+                height: tx.height,
+                axis: 1,
+                hash: root.0.into(),
+            });
+
+            // lock_tree: merkle proof siblings
+            for (axis, digest) in
+                Self::merkle_proof_siblings(lock_proof.axis(), &lock_proof.proof().path)
+            {
+                bufs.lock_trees.push(LockTree {
+                    root,
+                    height: tx.height,
+                    axis,
+                    hash: digest.into(),
+                });
+            }
+
+            // spend_conditions row
+            bufs.spend_conditions.push(SpendConditionRow {
+                hash: sc_hash,
+                txid: tx.id,
+                z: z as i32,
+                height: tx.height,
+                jam: jam(sc.to_noun()),
+            });
+        }
     }
 }
 
@@ -82,24 +372,46 @@ impl LayerImpl for L2Client {
 
         metadata.layer = Self::LAYER;
 
+        // L2.3
+        trace!("Dropping spend_conditions");
+        diesel::delete(spend_conditions::table)
+            .filter(spend_conditions::height.ge(metadata.next_block_height))
+            .execute(conn)
+            .await?;
+        trace!("Dropping lock_tree");
+        diesel::delete(lock_tree::table)
+            .filter(lock_tree::height.ge(metadata.next_block_height))
+            .execute(conn)
+            .await?;
+
+        // L2.2
+        trace!("Dropping pkh_to_pk");
+        diesel::delete(pkh_to_pk::table)
+            .filter(pkh_to_pk::height.ge(metadata.next_block_height))
+            .execute(conn)
+            .await?;
+        trace!("Dropping name_to_lock");
+        diesel::delete(name_to_lock::table)
+            .filter(name_to_lock::height.ge(metadata.next_block_height))
+            .execute(conn)
+            .await?;
+
+        // L2.1
         trace!("Dropping tx_signers");
         diesel::delete(tx_signers::table)
             .filter(tx_signers::height.ge(metadata.next_block_height))
             .execute(conn)
             .await?;
-
         trace!("Dropping tx_outputs");
         diesel::delete(tx_outputs::table)
             .filter(tx_outputs::height.ge(metadata.next_block_height))
             .execute(conn)
             .await?;
-
         trace!("Dropping tx_seeds");
         diesel::delete(tx_seeds::table)
             .filter(tx_seeds::height.ge(metadata.next_block_height))
             .execute(conn)
             .await?;
-
         trace!("Dropping tx_spends");
         diesel::delete(tx_spends::table)
             .filter(tx_spends::height.ge(metadata.next_block_height))
@@ -147,7 +459,7 @@ impl LayerImpl for L2Client {
         )
         .await?;
 
-        trace!("Syncing tx internals from {start_block_height} to {end_block_height}");
+        trace!("Syncing L2 from {start_block_height} to {end_block_height}");
         let step = 100u32;
         let mut cur_metadata = FixedLayerMetadata {
             layer: Self::LAYER,
@@ -169,10 +481,20 @@ impl LayerImpl for L2Client {
                         .instrument(get_txs_span)
                         .await?;
 
-                    let mut block_spends = vec![];
-                    let mut block_seeds = vec![];
-                    let mut block_outputs = vec![];
-                    let mut block_signers = vec![];
+                    // Get block_id for L2.2/L2.3
+                    let block_id: DbDigest = if !txs.is_empty() {
+                        txs[0].block_id
+                    } else {
+                        use super::l0::schema::blocks;
+                        blocks::table
+                            .filter(blocks::height.eq(height as i32))
+                            .select(blocks::id)
+                            .first::<DbDigest>(conn)
+                            .await
+                            .unwrap_or(DbDigest(iris_ztd::Digest::from_bytes(&[0; 32])))
+                    };
+
+                    let mut bufs = L2BlockBuffers::new();
 
                     for tx in txs {
                         let tx_height = u32::try_from(tx.height).map_err(|_| {
@@ -185,150 +507,19 @@ impl LayerImpl for L2Client {
                             &cue(&tx.jam).ok_or(LayerErrorSource::NounCue(tx_height, *tx.id))?,
                         )
                         .ok_or(LayerErrorSource::NounDecode(tx_height, *tx.id))?;
+                        let spend_version = Self::checked_u32_to_i32(
+                            u32::from(vtx.version()),
+                            "tx_spends.version",
+                        )?;
 
-                        let spend_version =
-                            Self::checked_u32_to_i32(u32::from(vtx.version()), "tx_spends.version")?;
-                        let mut global_seed_idx = 0i32;
+                        // L2.1: transaction internals
+                        Self::collect_tx_internals(&tx, &vtx, spend_version, &mut bufs)?;
+                        // L2.2: hash reversals
+                        Self::collect_hash_reversals(&tx, &vtx, block_id, &mut bufs);
+                        // L2.3: spend conditions
+                        Self::collect_spend_conditions(&tx, &vtx, block_id, &mut bufs);
 
-                        match &vtx {
-                            Tx::V0(v0) => {
-                                for (z, (name, input)) in v0.raw.inputs.0.iter().enumerate() {
-                                    block_spends.push(TxSpend {
-                                        txid: tx.id,
-                                        z: Self::checked_usize_to_i32(z, "tx_spends.z")?,
-                                        version: spend_version,
-                                        first: name.first.into(),
-                                        last: name.last.into(),
-                                        fee: Self::checked_u64_to_i64(
-                                            input.spend.fee.0,
-                                            "tx_spends.fee",
-                                        )?,
-                                        height: tx.height,
-                                    });
-
-                                    if let Some(signature) = &input.spend.signature {
-                                        for (pk, _) in signature.0.iter() {
-                                            block_signers.push(TxSigner {
-                                                txid: tx.id,
-                                                z: Self::checked_usize_to_i32(z, "tx_signers.z")?,
-                                                pk: pk.clone().into(),
-                                                height: tx.height,
-                                            });
-                                        }
-                                    }
-
-                                    for seed in &input.spend.seeds.0 {
-                                        block_seeds.push(TxSeed {
-                                            txid: tx.id,
-                                            idx: global_seed_idx,
-                                            amount: Self::checked_u64_to_i64(
-                                                seed.gift.0,
-                                                "tx_seeds.amount",
-                                            )?,
-                                            first: seed.recipient.hash().into(),
-                                            height: tx.height,
-                                        });
-                                        global_seed_idx = global_seed_idx.checked_add(1).ok_or_else(
-                                            || {
-                                                LayerErrorSource::OtherError(
-                                                    "tx_seeds.idx overflow".to_string(),
-                                                )
-                                            },
-                                        )?;
-                                    }
-                                }
-                            }
-                            Tx::V1(v1) => {
-                                let spends_map = ZMap::from_iter(
-                                    v1.raw
-                                        .spends
-                                        .0
-                                        .iter()
-                                        .map(|(name, spend)| (*name, spend.clone())),
-                                );
-                                for (z, (name, spend)) in spends_map.into_iter().enumerate() {
-                                    block_spends.push(TxSpend {
-                                        txid: tx.id,
-                                        z: Self::checked_usize_to_i32(z, "tx_spends.z")?,
-                                        version: spend_version,
-                                        first: name.first.into(),
-                                        last: name.last.into(),
-                                        fee: Self::checked_u64_to_i64(
-                                            spend.fee().0,
-                                            "tx_spends.fee",
-                                        )?,
-                                        height: tx.height,
-                                    });
-
-                                    match &spend {
-                                        SpendV1::S0(legacy_spend) => {
-                                            for (pk, _) in legacy_spend.signature.0.iter() {
-                                                block_signers.push(TxSigner {
-                                                    txid: tx.id,
-                                                    z: Self::checked_usize_to_i32(
-                                                        z,
-                                                        "tx_signers.z",
-                                                    )?,
-                                                    pk: pk.clone().into(),
-                                                    height: tx.height,
-                                                });
-                                            }
-                                        }
-                                        SpendV1::S1(witness_spend) => {
-                                            for (_, (pk, _)) in
-                                                witness_spend.witness.pkh_signature.0.iter()
-                                            {
-                                                block_signers.push(TxSigner {
-                                                    txid: tx.id,
-                                                    z: Self::checked_usize_to_i32(
-                                                        z,
-                                                        "tx_signers.z",
-                                                    )?,
-                                                    pk: pk.clone().into(),
-                                                    height: tx.height,
-                                                });
-                                            }
-                                        }
-                                    }
-
-                                    for seed in spend.seeds().0.iter() {
-                                        let first = (true, seed.lock_root.hash()).hash();
-                                        block_seeds.push(TxSeed {
-                                            txid: tx.id,
-                                            idx: global_seed_idx,
-                                            amount: Self::checked_u64_to_i64(
-                                                seed.gift.0,
-                                                "tx_seeds.amount",
-                                            )?,
-                                            first: first.into(),
-                                            height: tx.height,
-                                        });
-                                        global_seed_idx = global_seed_idx.checked_add(1).ok_or_else(
-                                            || {
-                                                LayerErrorSource::OtherError(
-                                                    "tx_seeds.idx overflow".to_string(),
-                                                )
-                                            },
-                                        )?;
-                                    }
-                                }
-                            }
-                        }
-
-                        let outputs = vtx.outputs().notes();
-                        for (idx, note) in outputs.into_iter().enumerate() {
-                            block_outputs.push(TxOutput {
-                                txid: tx.id,
-                                idx: Self::checked_usize_to_i32(idx, "tx_outputs.idx")?,
-                                first: note.name().first.into(),
-                                last: note.name().last.into(),
-                                assets: Self::checked_u64_to_i64(
-                                    note.assets().0,
-                                    "tx_outputs.assets",
-                                )?,
-                                height: tx.height,
-                            });
-                        }
+                        crate::rt::yield_now().await;
                     }
 
                     cur_metadata = FixedLayerMetadata {
@@ -340,31 +531,63 @@ impl LayerImpl for L2Client {
                     conn.spawn_blocking(move |conn| {
                         use diesel::query_dsl::methods::ExecuteDsl;
                         conn.transaction(move |conn| {
-                            if !block_spends.is_empty() {
-                                let q1 =
-                                    diesel::insert_into(tx_spends::table).values(&block_spends);
-                                ExecuteDsl::execute(q1, conn)?;
+                            // L2.1
+                            if !bufs.spends.is_empty() {
+                                ExecuteDsl::execute(
+                                    diesel::insert_into(tx_spends::table).values(&bufs.spends),
+                                    conn,
+                                )?;
+                            }
+                            if !bufs.seeds.is_empty() {
+                                ExecuteDsl::execute(
+                                    diesel::insert_into(tx_seeds::table).values(&bufs.seeds),
+                                    conn,
+                                )?;
+                            }
+                            if !bufs.outputs.is_empty() {
+                                ExecuteDsl::execute(
+                                    diesel::insert_into(tx_outputs::table).values(&bufs.outputs),
+                                    conn,
+                                )?;
+                            }
+                            if !bufs.signers.is_empty() {
+                                ExecuteDsl::execute(
+                                    diesel::insert_into(tx_signers::table).values(&bufs.signers),
+                                    conn,
+                                )?;
+                            }
+                            // L2.2
+                            if !bufs.name_to_lock.is_empty() {
+                                ExecuteDsl::execute(
+                                    diesel::insert_or_ignore_into(name_to_lock::table)
+                                        .values(&bufs.name_to_lock),
+                                    conn,
+                                )?;
+                            }
+                            if !bufs.pkh_to_pk.is_empty() {
+                                ExecuteDsl::execute(
+                                    diesel::insert_or_ignore_into(pkh_to_pk::table)
+                                        .values(&bufs.pkh_to_pk),
+                                    conn,
+                                )?;
+                            }
+                            // L2.3
+                            if !bufs.lock_trees.is_empty() {
+                                ExecuteDsl::execute(
+                                    diesel::insert_or_ignore_into(lock_tree::table)
+                                        .values(&bufs.lock_trees),
+                                    conn,
+                                )?;
+                            }
+                            if !bufs.spend_conditions.is_empty() {
+                                ExecuteDsl::execute(
+                                    diesel::insert_or_ignore_into(spend_conditions::table)
+                                        .values(&bufs.spend_conditions),
+                                    conn,
+                                )?;
                             }
 
-                            if !block_seeds.is_empty() {
-                                let q2 = diesel::insert_into(tx_seeds::table).values(&block_seeds);
-                                ExecuteDsl::execute(q2, conn)?;
-                            }
-
-                            if !block_outputs.is_empty() {
-                                let q3 =
-                                    diesel::insert_into(tx_outputs::table).values(&block_outputs);
-                                ExecuteDsl::execute(q3, conn)?;
-                            }
-
-                            if !block_signers.is_empty() {
-                                let q4 =
-                                    diesel::insert_into(tx_signers::table).values(&block_signers);
-                                ExecuteDsl::execute(q4, conn)?;
-                            }
-
-                            let q5 = Self::update_layer_metadata(&next_metadata);
-                            ExecuteDsl::execute(q5, conn)?;
+                            ExecuteDsl::execute(Self::update_layer_metadata(&next_metadata), conn)?;
                             Ok(())
                         })
                     })
@@ -388,15 +611,12 @@ impl LayerImpl for L2Client {
 
 #[cfg(test)]
 mod tests {
-    // LOCAL-ONLY TEST HARNESS:
-    // These tests are for local validation against a real SQLite snapshot (`TEST_DB_PATH`)
-    // and are not part of production runtime behavior.
-    // Remove this module if you want a PR that includes only runtime flow changes.
     use super::*;
     use crate::layers::l0::schema::transactions;
     use diesel::dsl::count_star;
     use diesel_async::RunQueryDsl;
     use iris_crypto::PublicKey;
+    use iris_nockchain_types::RawTx;
     use iris_ztd::{cue, jam, NounDecode, NounEncode, ZMap};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};

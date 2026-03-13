@@ -1,9 +1,12 @@
 use clap::{Parser, ValueEnum};
 use std::path::{Path, PathBuf};
 
-use crate::{address, db, query};
-use super::{OutputFormat, serialize_json, truncate_cell, print_section};
 use super::balance::print_balance_text;
+use super::{print_section, serialize_json, truncate_cell, OutputFormat};
+use crate::{
+    accounting::{address, query},
+    db,
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AuditView {
@@ -49,7 +52,11 @@ impl AuditArgs {
         let report = query::audit_report(&mut conn, addr).await?;
 
         if let Some(csv_arg) = self.csv.as_deref() {
-            let path = resolve_csv_path(csv_arg, &report.balance.address.input, "nockchain_transactions")?;
+            let path = resolve_csv_path(
+                csv_arg,
+                &report.balance.address.input,
+                "nockchain_transactions",
+            )?;
             let mut writer = csv::Writer::from_path(&path)?;
             for row in report.flows.iter().rev() {
                 writer.serialize(row)?;
@@ -177,12 +184,20 @@ pub fn print_audit_text(report: &query::AuditReport) {
 
     print_section(&format!("Ledger Entries ({})", report.ledger.len()));
     println!(
-        "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<40}",
-        "block_height", "block_time_utc", "type", "txid", "rtype", "amount", "fee", "running", "recipient"
+        "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<55}",
+        "block_height",
+        "block_time_utc",
+        "type",
+        "txid",
+        "rtype",
+        "amount",
+        "fee",
+        "running",
+        "recipient"
     );
     for e in &report.ledger {
         println!(
-            "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<40}",
+            "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<55}",
             e.block_height,
             truncate_cell(&e.block_time_utc, 25),
             e.entry_type,
@@ -191,7 +206,7 @@ pub fn print_audit_text(report: &query::AuditReport) {
             e.amount_nicks,
             e.fee_nicks,
             e.running_balance_nicks,
-            truncate_cell(e.recipient.as_deref().unwrap_or("-"), 40),
+            truncate_cell(e.recipient.as_deref().unwrap_or("-"), 55),
         );
     }
 }
@@ -201,18 +216,26 @@ pub fn print_audit_summary_text(report: &query::AuditReport) {
 
     print_section(&format!("Flow Summary ({})", report.flows.len()));
     println!(
-        "{:<12} {:<25} {:<55} {:<10} {:<10} {:<40} {:>14} {:>10} {:>14}",
-        "block_height", "block_time_utc", "txid", "type", "rtype", "recipient", "amount", "fee", "running"
+        "{:<12} {:<25} {:<55} {:<10} {:<10} {:<55} {:>14} {:>10} {:>14}",
+        "block_height",
+        "block_time_utc",
+        "txid",
+        "type",
+        "rtype",
+        "recipient",
+        "amount",
+        "fee",
+        "running"
     );
     for row in &report.flows {
         println!(
-            "{:<12} {:<25} {:<55} {:<10} {:<10} {:<40} {:>14} {:>10} {:>14}",
+            "{:<12} {:<25} {:<55} {:<10} {:<10} {:<55} {:>14} {:>10} {:>14}",
             row.block_height,
             truncate_cell(&row.block_time_utc, 25),
             truncate_cell(row.txid.as_deref().unwrap_or("-"), 55),
             row.entry_type,
             row.recipient_type.as_deref().unwrap_or("-"),
-            truncate_cell(row.recipient.as_deref().unwrap_or("-"), 40),
+            truncate_cell(row.recipient.as_deref().unwrap_or("-"), 55),
             row.amount_nicks,
             row.fee_nicks,
             row.running_balance_nicks,
@@ -224,12 +247,20 @@ pub fn print_audit_notes_text(report: &query::AuditReport) {
     print_balance_text(&report.balance);
     print_section(&format!("Ledger Entries ({})", report.ledger.len()));
     println!(
-        "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<40}",
-        "block_height", "block_time_utc", "type", "txid", "rtype", "amount", "fee", "running", "recipient"
+        "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<55}",
+        "block_height",
+        "block_time_utc",
+        "type",
+        "txid",
+        "rtype",
+        "amount",
+        "fee",
+        "running",
+        "recipient"
     );
     for e in &report.ledger {
         println!(
-            "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<40}",
+            "{:<12} {:<25} {:<10} {:<55} {:<10} {:>14} {:>12} {:>14} {:<55}",
             e.block_height,
             truncate_cell(&e.block_time_utc, 25),
             e.entry_type,
@@ -238,7 +269,7 @@ pub fn print_audit_notes_text(report: &query::AuditReport) {
             e.amount_nicks,
             e.fee_nicks,
             e.running_balance_nicks,
-            truncate_cell(e.recipient.as_deref().unwrap_or("-"), 40),
+            truncate_cell(e.recipient.as_deref().unwrap_or("-"), 55),
         );
     }
 }

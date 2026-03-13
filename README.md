@@ -114,49 +114,65 @@ Data is not persisted.
 
 Canonical block/transaction storage.
 
-- `blocks`: `id`, `height`, `version`, `parent`, `timestamp`, `msg`, `jam`
-- `transactions`: `id`, `block_id`, `height`, `version`, `fee`, `total_size`, `jam`
+- `blocks`: PK (`id`), UNIQUE (`height`), `version`, UNIQUE (`parent`), `timestamp`, `msg`, `jam`
+- `transactions`: PK (`id`), `block_id`, `height`, `version`, `fee`, `total_size`, `jam`
 
 ### L1
 
 Note lifecycle (created/spent/unspent notes).
 
-- `notes`: `first`, `last`, `version`, `assets`, `coinbase`, `created_*`, `spent_*`, `jam`
+- `notes`: PK (`first`, `last`), `version`, `assets`, `coinbase`, `created_*`, `spent_*`, `jam`
 
 ### L2
 
+#### L2.1
+
 Transaction internals and ordering.
 
-- `tx_spends`: `txid`, `z`, `version`, `first`, `last`, `fee`, `height`
-- `tx_seeds`: `txid`, `idx`, `amount`, `first`, `height`
-- `tx_outputs`: `txid`, `idx`, `first`, `last`, `assets`, `height`
-- `tx_signers`: `txid`, `z`, `pk`, `height`
+- `tx_spends`: PK (`txid`, `z`), `version`, UNIQUE (`first`, `last`), `fee`, `height`
+- `tx_seeds`: PK (`txid`, `z`, `idx`), `amount`, `first`, `height`
+- `tx_outputs`: PK (`txid`, `idx`), UNIQUE (`first`, `last`), `assets`, `height`
+- `tx_signers`: PK (`txid`, `z`, `pk`), `height`
+
+#### L2.2
+
+Hash reversals.
+
+- `name_to_lock`: PK (`first`), UNIQUE (`root`), `height`, `block_id`
+- `pkh_to_pk`: PK (`pkh`), UNIQUE (`pk`), `height`, `block_id`
+
+#### L2.3
+
+Spend condition retrieval.
+
+- `lock_tree`: PK (`root`), `height`, `axis`, `hash`
+- `spend_conditions`: PK (`hash`), UNIQUE (`txid`, `z`), `height`, `jam`
 
 ### L3
 
-Ownership and lock/name mapping.
+Double entry accounting ledger.
 
-- `lock_names`: `root`, `first`, `height`
-- `locks`: `root`, `idx`, `hash`, `jam`, `height`
-- `lock_paths`: `root`, `axis`, `hash`, `height`
-- `lock_owners`: `root`, `pkh`, `height`
-- `name_owners`: `first`, `pkh`, `height`
-- `pk_to_pkh`: `pk`, `pkh`, `height`
+- `credits`: PK (NULLABLE (`txid`), `first`, `height`), `block_id`, `amount`
+- `debits`: PK (NULLABLE (`txid`), NULLABLE (`first`), `height`), `block_id`, `amount`, `fee`
+
+_Null txid/first imply coinbase_
 
 ### L4
 
-Debit/credit accounting projection.
+Additional accounting information, more frequently recomputed.
 
-- `debits`: `txid`, `pk`, `sole_owner`, `amount`, `fee`, `height`
-- `credits`: `txid`, `idx`, `recipient_type`, `recipient`, `amount`, `height`
-- `coinbase_credits`: `block_id`, `idx`, `recipient_type`, `recipient`, `amount`, `height`
+- `credit_info`: PK (`txid`, `first`, `height`), `updated_height`, `recipient_type`, `recipient`
 
-`recipient_type` values:
+_Reset behavior is as follows: collect all rows where `updated_height >= next_block_height`, and set L4's `next_block_height` to the minimum of `height` in the row set._
 
-- `pk`: resolved public key recipient
-- `v0pk`: legacy V0 public key recipient
+_Update behavior is as follows: collect all new spend conditions within the range `[local_next_block_height, next_block_height)`, and for each related name (transitively through matching lock trees of SP), update the corresponding `credit_info` rows._
+
+## Recipients
+
+- `pk`: resolved or v0 public key recipient
 - `pkh`: public key hash recipient
 - `lock`: unresolved or multi-owner lock-level recipient
+- `musig`: multi-sig recipient
 
 ## Address mapping model
 

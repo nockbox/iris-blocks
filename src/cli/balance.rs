@@ -1,7 +1,10 @@
 use clap::Parser;
 
-use crate::{address, db, query};
-use super::{OutputFormat, print_kv, print_section, serialize_json};
+use super::{print_kv, print_section, serialize_json, OutputFormat};
+use crate::{
+    accounting::{address, query},
+    db,
+};
 
 #[derive(Debug, Parser, Clone)]
 pub struct BalanceArgs {

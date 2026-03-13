@@ -1,2 +1,1 @@
-DROP TABLE IF EXISTS credits;
-DROP TABLE IF EXISTS debits;
+DROP TABLE IF EXISTS credit_info;

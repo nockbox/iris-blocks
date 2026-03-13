@@ -3,7 +3,7 @@ use diesel::{
     Queryable, Selectable,
 };
 use iris_crypto::PublicKey;
-use iris_ztd::{Digest, Hashable};
+use iris_ztd::Digest;
 
 // ---------------------------------------------------------------------------
 // Custom SQL type
@@ -42,6 +42,8 @@ pub mod sql_types {
     Copy,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Hash,
     diesel::expression::AsExpression,
     diesel::deserialize::FromSqlRow,
@@ -81,11 +83,18 @@ impl<DB: diesel::backend::Backend> diesel::serialize::ToSql<sql_types::DigestSql
     }
 }
 
-impl<DB: diesel::backend::Backend> diesel::deserialize::FromSql<sql_types::DigestSql, DB> for DbDigest where *const str: diesel::deserialize::FromSql<diesel::sql_types::Text, DB> {
+impl<DB: diesel::backend::Backend> diesel::deserialize::FromSql<sql_types::DigestSql, DB>
+    for DbDigest
+where
+    *const str: diesel::deserialize::FromSql<diesel::sql_types::Text, DB>,
+{
     fn from_sql(
         bytes: <DB as diesel::backend::Backend>::RawValue<'_>,
     ) -> diesel::deserialize::Result<Self> {
-        let s = <*const str as diesel::deserialize::FromSql<diesel::sql_types::Text, DB>>::from_sql(bytes)?;
+        let s =
+            <*const str as diesel::deserialize::FromSql<diesel::sql_types::Text, DB>>::from_sql(
+                bytes,
+            )?;
         let s = unsafe { &*s };
         Digest::try_from(s).map(Self::from).map_err(Into::into)
     }
@@ -103,12 +112,6 @@ impl<DB: diesel::backend::Backend> diesel::deserialize::FromSql<sql_types::Diges
 )]
 #[diesel(sql_type = sql_types::PublicKeySql)]
 pub struct DbPublicKey(pub PublicKey);
-
-impl std::hash::Hash for DbPublicKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(&self.0.hash(), state);
-    }
-}
 
 impl From<PublicKey> for DbPublicKey {
     fn from(d: PublicKey) -> Self {
@@ -128,9 +131,7 @@ impl core::ops::Deref for DbPublicKey {
 }
 impl core::fmt::Display for DbPublicKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        use iris_ztd::{jam, NounEncode};
-        let s = bs58::encode(jam(self.0.to_noun())).into_string();
-        f.write_str(&s)
+        write!(f, "{}", self.0)
     }
 }
 
@@ -143,27 +144,26 @@ impl<DB: diesel::backend::Backend> diesel::serialize::ToSql<sql_types::PublicKey
         Ok(diesel::serialize::IsNull::No)
     }
 }
-impl TryFrom<&str> for DbPublicKey {
-    type Error = String;
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        use iris_ztd::{cue, NounDecode};
-        let bytes = bs58::decode(s).into_vec().map_err(|e| e.to_string())?;
-        let n = cue(&bytes).ok_or_else(|| "invalid noun".to_string())?;
-        let pk = PublicKey::from_noun(&n).ok_or_else(|| "failed to decode public key from noun".to_string())?;
-        Ok(DbPublicKey(pk))
-    }
-}
 
-impl<DB: diesel::backend::Backend> diesel::deserialize::FromSql<sql_types::PublicKeySql, DB> for DbPublicKey where *const str: diesel::deserialize::FromSql<diesel::sql_types::Text, DB> {
+impl<DB: diesel::backend::Backend> diesel::deserialize::FromSql<sql_types::PublicKeySql, DB>
+    for DbPublicKey
+where
+    *const str: diesel::deserialize::FromSql<diesel::sql_types::Text, DB>,
+{
     fn from_sql(
         bytes: <DB as diesel::backend::Backend>::RawValue<'_>,
     ) -> diesel::deserialize::Result<Self> {
-        use iris_ztd::{cue, NounDecode};
-        let s = <*const str as diesel::deserialize::FromSql<diesel::sql_types::Text, DB>>::from_sql(bytes)?;
+        let s =
+            <*const str as diesel::deserialize::FromSql<diesel::sql_types::Text, DB>>::from_sql(
+                bytes,
+            )?;
         let s = unsafe { &*s };
-        let bytes = bs58::decode(s).into_vec().map_err(|e| diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::Unknown, Box::new(e.to_string())))?;
-        let n = cue(&bytes).ok_or_else(|| diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::Unknown, Box::new("invalid noun in public key".to_string())))?;
-        let pk = PublicKey::from_noun(&n).ok_or_else(|| diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::Unknown, Box::new("failed to decode public key from noun".to_string())))?;
+        let pk = PublicKey::try_from(s).map_err(|e| {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::Unknown,
+                Box::new(e.to_string()),
+            )
+        })?;
         Ok(DbPublicKey(pk))
     }
 }

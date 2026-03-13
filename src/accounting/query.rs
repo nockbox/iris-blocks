@@ -1,8 +1,8 @@
-use crate::address::{AddressInfo, VersionScope};
+use super::address::{AddressInfo, VersionScope};
 use chrono::{DateTime, TimeZone, Utc};
 use diesel::prelude::*;
 use diesel::sql_query;
-use diesel::sql_types::{BigInt, Bool, Integer, Nullable, Text};
+use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -60,25 +60,22 @@ pub struct TxOutputDetail {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TxCreditDetail {
-    pub idx: i32,
-    pub recipient_type: String,
-    pub recipient: String,
+    pub first: String,
+    pub recipient_type: Option<String>,
+    pub recipient: Option<String>,
     pub amount_nicks: i64,
     pub block_height: i32,
     pub block_timestamp: i64,
-    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TxDebitDetail {
-    pub pk: String,
-    pub sole_owner: bool,
+    pub first: String,
     pub amount_nicks: i64,
     pub fee_nicks: i64,
     pub block_height: i32,
     pub block_timestamp: i64,
-    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
 }
 
@@ -88,7 +85,6 @@ pub struct TransactionDetail {
     pub block_id: String,
     pub block_height: i32,
     pub block_timestamp: i64,
-    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
     pub version: i32,
     pub fee_nicks: i64,
@@ -102,13 +98,10 @@ pub struct TransactionDetail {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CoinbaseCreditDetail {
-    pub idx: i32,
-    pub recipient_type: String,
-    pub recipient: String,
+    pub first: String,
     pub amount_nicks: i64,
     pub block_height: i32,
     pub block_timestamp: i64,
-    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
 }
 
@@ -127,7 +120,6 @@ pub struct BlockDetail {
     pub version: i32,
     pub parent: String,
     pub block_timestamp: i64,
-    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
     pub msg: Option<String>,
     pub transactions: Vec<BlockTransaction>,
@@ -156,7 +148,6 @@ pub struct SyncStatus {
 pub struct LedgerEntry {
     pub block_height: i32,
     pub block_timestamp: i64,
-    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
     pub entry_type: String,
     pub txid: Option<String>,
@@ -174,7 +165,6 @@ pub struct WalletTxSummary {
     pub txid: String,
     pub first_block_height: i32,
     pub first_block_timestamp: i64,
-    pub first_block_unix_timestamp: Option<i64>,
     pub first_block_time_utc: String,
     pub direction: String,
     pub incoming_nicks: i64,
@@ -189,7 +179,6 @@ pub struct AuditFlowRow {
     pub block_id: Option<String>,
     pub txid: Option<String>,
     pub block_timestamp: i64,
-    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
     pub entry_type: String,
     pub recipient_type: Option<String>,
@@ -199,22 +188,8 @@ pub struct AuditFlowRow {
     pub running_balance_nicks: i64,
 }
 
-fn chain_timestamp_to_unix_seconds(ts: i64) -> Option<i64> {
-    // Chain timestamps are stored in a biased @da-like second format (u64).
-    // The bias/epoch is not 2^63 relative to unix; it is the @da unix offset.
-    // See urbit @da epoch constant: 0x8000000cce9e0d80.
-    const DA_UNIX_EPOCH_BIASED_SECONDS: i128 = 0x8000_000c_ce9e_0d80;
-
-    let raw_u64 = ts as u64;
-    let unix_seconds_i128 = raw_u64 as i128 - DA_UNIX_EPOCH_BIASED_SECONDS;
-    i64::try_from(unix_seconds_i128).ok()
-}
-
 fn format_chain_timestamp_utc(ts: i64) -> String {
-    let Some(unix_seconds) = chain_timestamp_to_unix_seconds(ts) else {
-        return format!("invalid({ts})");
-    };
-    let dt_opt: Option<DateTime<Utc>> = Utc.timestamp_opt(unix_seconds, 0).single();
+    let dt_opt: Option<DateTime<Utc>> = Utc.timestamp_opt(ts, 0).single();
     match dt_opt {
         Some(dt) => dt.to_rfc3339(),
         None => format!("invalid({ts})"),
@@ -222,7 +197,7 @@ fn format_chain_timestamp_utc(ts: i64) -> String {
 }
 
 fn recipient_matches_wallet(
-    scope: VersionScope,
+    _scope: VersionScope,
     pkh: &str,
     wallet_pks: &HashSet<String>,
     recipient_type: Option<&str>,
@@ -234,16 +209,10 @@ fn recipient_matches_wallet(
     let Some(recipient) = recipient else {
         return false;
     };
-    match scope {
-        VersionScope::V0Only => recipient_type == "v0pk" && wallet_pks.contains(recipient),
-        VersionScope::V1Only => {
-            (recipient_type == "pk" && wallet_pks.contains(recipient))
-                || (recipient_type == "pkh" && recipient == pkh)
-        }
-        VersionScope::All => {
-            ((recipient_type == "pk" || recipient_type == "v0pk") && wallet_pks.contains(recipient))
-                || (recipient_type == "pkh" && recipient == pkh)
-        }
+    match recipient_type {
+        "pk" => wallet_pks.contains(recipient),
+        "pkh" => recipient == pkh,
+        _ => false,
     }
 }
 
@@ -343,12 +312,12 @@ struct TxOutputRow {
 
 #[derive(QueryableByName)]
 struct TxCreditRow {
-    #[diesel(sql_type = Integer)]
-    idx: i32,
     #[diesel(sql_type = Text)]
-    recipient_type: String,
-    #[diesel(sql_type = Text)]
-    recipient: String,
+    first: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    recipient_type: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    recipient: Option<String>,
     #[diesel(sql_type = BigInt)]
     amount: i64,
     #[diesel(sql_type = Integer)]
@@ -360,9 +329,7 @@ struct TxCreditRow {
 #[derive(QueryableByName)]
 struct TxDebitRow {
     #[diesel(sql_type = Text)]
-    pk: String,
-    #[diesel(sql_type = Bool)]
-    sole_owner: bool,
+    first: String,
     #[diesel(sql_type = BigInt)]
     amount: i64,
     #[diesel(sql_type = BigInt)]
@@ -403,12 +370,8 @@ struct BlockTxRow {
 
 #[derive(QueryableByName)]
 struct CoinbaseRow {
-    #[diesel(sql_type = Integer)]
-    idx: i32,
     #[diesel(sql_type = Text)]
-    recipient_type: String,
-    #[diesel(sql_type = Text)]
-    recipient: String,
+    first: String,
     #[diesel(sql_type = BigInt)]
     amount: i64,
     #[diesel(sql_type = Integer)]
@@ -455,6 +418,10 @@ struct LedgerRow {
     counterparties: Option<String>,
 }
 
+/// Wallet balance derived from L1 notes + L3 credits/debits.
+///
+/// The wallet is identified by `pkh`.  We use `pkh_to_pk` (L2.2) to look up
+/// known public keys, then query notes that belong to the wallet via credits.
 pub async fn wallet_balance(
     conn: &mut crate::db::AsyncDbConnection,
     address: AddressInfo,
@@ -467,24 +434,55 @@ pub async fn wallet_balance(
         VersionScope::V1Only => " AND n.version >= 1",
     };
 
+    // Unspent notes owned by this wallet (via credit_info recipient resolution)
     let unspent_query = format!(
         "SELECT COALESCE(SUM(n.assets), 0) AS sum_nicks, COUNT(*) AS note_count
          FROM notes n
-         INNER JOIN name_owners no ON n.first = no.first
-         WHERE no.pkh = ?1
-           AND n.spent_txid IS NULL{note_version_filter}"
+         WHERE n.spent_txid IS NULL{note_version_filter}
+           AND (
+             n.first IN (
+               SELECT ci.first FROM credit_info ci
+               WHERE ci.recipient_type = 'pkh' AND ci.recipient = ?1
+             )
+             OR n.first IN (
+               SELECT ci.first FROM credit_info ci
+               WHERE ci.recipient_type = 'pk' AND ci.recipient IN (
+                 SELECT pk FROM pkh_to_pk WHERE pkh = ?1
+               )
+             )
+             OR (n.coinbase = 1 AND n.first IN (
+               SELECT c.first FROM credits c
+               WHERE c.txid IS NULL AND c.first IN (
+                 SELECT ntl.first FROM name_to_lock ntl
+                 WHERE ntl.first IN (
+                   SELECT ci2.first FROM credit_info ci2
+                   WHERE ci2.recipient_type = 'pkh' AND ci2.recipient = ?1
+                 )
+               )
+             ))
+           )"
     );
     let unspent = sql_query(unspent_query)
-    .bind::<Text, _>(pkh.clone())
-    .get_result::<SumCountRow>(conn)
-    .await?;
+        .bind::<Text, _>(pkh.clone())
+        .get_result::<SumCountRow>(conn)
+        .await?;
 
     let by_version = sql_query(
         "SELECT n.version AS version, COALESCE(SUM(n.assets), 0) AS sum_nicks
          FROM notes n
-         INNER JOIN name_owners no ON n.first = no.first
-         WHERE no.pkh = ?1
-           AND n.spent_txid IS NULL
+         WHERE n.spent_txid IS NULL
+           AND (
+             n.first IN (
+               SELECT ci.first FROM credit_info ci
+               WHERE ci.recipient_type = 'pkh' AND ci.recipient = ?1
+             )
+             OR n.first IN (
+               SELECT ci.first FROM credit_info ci
+               WHERE ci.recipient_type = 'pk' AND ci.recipient IN (
+                 SELECT pk FROM pkh_to_pk WHERE pkh = ?1
+               )
+             )
+           )
          GROUP BY n.version",
     )
     .bind::<Text, _>(pkh.clone())
@@ -506,91 +504,79 @@ pub async fn wallet_balance(
         (0, 0)
     };
 
-    let tx_credits_sql = match scope {
-        VersionScope::V0Only => {
-            "SELECT COALESCE(SUM(amount), 0) AS sum_nicks
-             FROM credits
-             WHERE recipient_type = 'v0pk'
-               AND recipient IN (SELECT pk FROM pk_to_pkh WHERE pkh = ?1)"
-        }
-        VersionScope::V1Only => {
-            "SELECT COALESCE(SUM(amount), 0) AS sum_nicks
-             FROM credits
-             WHERE (recipient_type = 'pk' AND recipient IN (
-                     SELECT pk FROM pk_to_pkh WHERE pkh = ?1
-                   ))
-                OR (recipient_type = 'pkh' AND recipient = ?1)"
-        }
-        VersionScope::All => {
-            "SELECT COALESCE(SUM(amount), 0) AS sum_nicks
-             FROM credits
-             WHERE (recipient_type IN ('pk', 'v0pk') AND recipient IN (
-                     SELECT pk FROM pk_to_pkh WHERE pkh = ?1
-                   ))
-                OR (recipient_type = 'pkh' AND recipient = ?1)"
-        }
-    };
+    // TX credits (non-coinbase) for this wallet
+    let tx_credits_sql = "SELECT COALESCE(SUM(c.amount), 0) AS sum_nicks
+         FROM credits c
+         WHERE c.txid IS NOT NULL
+           AND (
+             c.first IN (
+               SELECT ci.first FROM credit_info ci
+               WHERE ci.recipient_type = 'pkh' AND ci.recipient = ?1
+             )
+             OR c.first IN (
+               SELECT ci.first FROM credit_info ci
+               WHERE ci.recipient_type = 'pk' AND ci.recipient IN (
+                 SELECT pk FROM pkh_to_pk WHERE pkh = ?1
+               )
+             )
+           )";
     let tx_credits_nicks = sql_query(tx_credits_sql)
-    .bind::<Text, _>(pkh.clone())
-    .get_result::<SumRow>(conn)
-    .await?
-    .sum_nicks;
+        .bind::<Text, _>(pkh.clone())
+        .get_result::<SumRow>(conn)
+        .await?
+        .sum_nicks;
 
-    let coinbase_sql = match scope {
-        VersionScope::V0Only => {
-            "SELECT COALESCE(SUM(amount), 0) AS sum_nicks
-             FROM coinbase_credits
-             WHERE recipient_type = 'v0pk'
-               AND recipient IN (SELECT pk FROM pk_to_pkh WHERE pkh = ?1)"
-        }
-        VersionScope::V1Only => {
-            "SELECT COALESCE(SUM(amount), 0) AS sum_nicks
-             FROM coinbase_credits
-             WHERE (recipient_type = 'pk' AND recipient IN (
-                     SELECT pk FROM pk_to_pkh WHERE pkh = ?1
-                   ))
-                OR (recipient_type = 'pkh' AND recipient = ?1)"
-        }
-        VersionScope::All => {
-            "SELECT COALESCE(SUM(amount), 0) AS sum_nicks
-             FROM coinbase_credits
-             WHERE (recipient_type IN ('pk', 'v0pk') AND recipient IN (
-                     SELECT pk FROM pk_to_pkh WHERE pkh = ?1
-                   ))
-                OR (recipient_type = 'pkh' AND recipient = ?1)"
-        }
-    };
+    // Coinbase credits (txid IS NULL) for this wallet
+    let coinbase_sql = "SELECT COALESCE(SUM(c.amount), 0) AS sum_nicks
+         FROM credits c
+         WHERE c.txid IS NULL
+           AND (
+             c.first IN (
+               SELECT ci.first FROM credit_info ci
+               WHERE ci.recipient_type = 'pkh' AND ci.recipient = ?1
+             )
+             OR c.first IN (
+               SELECT ci.first FROM credit_info ci
+               WHERE ci.recipient_type = 'pk' AND ci.recipient IN (
+                 SELECT pk FROM pkh_to_pk WHERE pkh = ?1
+               )
+             )
+           )";
     let coinbase_credits_nicks = sql_query(coinbase_sql)
-    .bind::<Text, _>(pkh.clone())
-    .get_result::<SumRow>(conn)
-    .await?
-    .sum_nicks;
+        .bind::<Text, _>(pkh.clone())
+        .get_result::<SumRow>(conn)
+        .await?
+        .sum_nicks;
 
+    // Spent notes
     let spent_query = format!(
-        "SELECT COALESCE(SUM(n.assets), 0) AS sum_nicks
-         FROM notes n
-         INNER JOIN name_owners no ON n.first = no.first
-         WHERE no.pkh = ?1
-           AND n.spent_txid IS NOT NULL{note_version_filter}"
-    );
-    let spent_nicks = sql_query(spent_query)
-    .bind::<Text, _>(pkh.clone())
-    .get_result::<SumRow>(conn)
-    .await?
-    .sum_nicks;
-
-    let fees_query = format!(
-        "SELECT COALESCE(SUM(t.fee), 0) AS sum_nicks
-         FROM transactions t
-         WHERE t.id IN (
-             SELECT DISTINCT n.spent_txid
-             FROM notes n
-             INNER JOIN name_owners no ON n.first = no.first
-             WHERE no.pkh = ?1
-               AND n.spent_txid IS NOT NULL{note_version_filter}
+        "SELECT COALESCE(SUM(d.amount), 0) AS sum_nicks
+         FROM debits d
+         WHERE d.first IN (
+             SELECT ci.first FROM credit_info ci
+             WHERE (ci.recipient_type = 'pkh' AND ci.recipient = ?1)
+                OR (ci.recipient_type = 'pk' AND ci.recipient IN (
+                     SELECT pk FROM pkh_to_pk WHERE pkh = ?1
+                   ))
          )"
     );
-    let fees_nicks = sql_query(fees_query)
+    let spent_nicks = sql_query(spent_query)
+        .bind::<Text, _>(pkh.clone())
+        .get_result::<SumRow>(conn)
+        .await?
+        .sum_nicks;
+
+    // Fees
+    let fees_sql = "SELECT COALESCE(SUM(d.fee), 0) AS sum_nicks
+         FROM debits d
+         WHERE d.first IN (
+             SELECT ci.first FROM credit_info ci
+             WHERE (ci.recipient_type = 'pkh' AND ci.recipient = ?1)
+                OR (ci.recipient_type = 'pk' AND ci.recipient IN (
+                     SELECT pk FROM pkh_to_pk WHERE pkh = ?1
+                   ))
+         )";
+    let fees_nicks = sql_query(fees_sql)
         .bind::<Text, _>(pkh.clone())
         .get_result::<SumRow>(conn)
         .await?
@@ -624,8 +610,8 @@ pub async fn wallet_balance(
 pub async fn resolve_address(
     conn: &mut crate::db::AsyncDbConnection,
     address: &str,
-) -> Result<AddressInfo, crate::address::AddressError> {
-    crate::address::resolve_address(conn, address).await
+) -> Result<AddressInfo, super::address::AddressError> {
+    super::address::resolve_address(conn, address).await
 }
 
 pub async fn transaction_detail(
@@ -683,9 +669,9 @@ pub async fn transaction_detail(
     .collect();
 
     let outputs = sql_query(
-        "SELECT o.idx, o.first, o.last, o.assets, c.recipient_type, c.recipient
+        "SELECT o.idx, o.first, o.last, o.assets, ci.recipient_type, ci.recipient
          FROM tx_outputs o
-         LEFT JOIN credits c ON c.txid = o.txid AND c.idx = o.idx
+         LEFT JOIN credit_info ci ON ci.txid = o.txid AND ci.first = o.first
          WHERE o.txid = ?1
          ORDER BY o.idx",
     )
@@ -703,48 +689,48 @@ pub async fn transaction_detail(
     })
     .collect();
 
+    // Credits from L3
     let credits = sql_query(
-        "SELECT c.idx, c.recipient_type, c.recipient, c.amount, c.height AS block_height, COALESCE(b.timestamp, 0) AS block_timestamp
+        "SELECT c.first, ci.recipient_type, ci.recipient, c.amount, c.height AS block_height, COALESCE(b.timestamp, 0) AS block_timestamp
          FROM credits c
+         LEFT JOIN credit_info ci ON ci.txid = c.txid AND ci.first = c.first AND ci.height = c.height
          LEFT JOIN blocks b ON b.height = c.height
          WHERE c.txid = ?1
-         ORDER BY c.idx",
+         ORDER BY c.first",
     )
     .bind::<Text, _>(txid.to_string())
     .load::<TxCreditRow>(conn)
     .await?
     .into_iter()
     .map(|r| TxCreditDetail {
-        idx: r.idx,
+        first: r.first,
         recipient_type: r.recipient_type,
         recipient: r.recipient,
         amount_nicks: r.amount,
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
-        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
     })
     .collect();
 
+    // Debits from L3
     let debits = sql_query(
-        "SELECT d.pk, d.sole_owner, d.amount, d.fee, d.height AS block_height, COALESCE(b.timestamp, 0) AS block_timestamp
+        "SELECT d.first, d.amount, d.fee, d.height AS block_height, COALESCE(b.timestamp, 0) AS block_timestamp
          FROM debits d
          LEFT JOIN blocks b ON b.height = d.height
          WHERE d.txid = ?1
-         ORDER BY d.pk",
+         ORDER BY d.first",
     )
     .bind::<Text, _>(txid.to_string())
     .load::<TxDebitRow>(conn)
     .await?
     .into_iter()
     .map(|r| TxDebitDetail {
-        pk: r.pk,
-        sole_owner: r.sole_owner,
+        first: r.first,
         amount_nicks: r.amount,
         fee_nicks: r.fee,
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
-        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
     })
     .collect();
@@ -754,7 +740,6 @@ pub async fn transaction_detail(
         block_id: base.block_id,
         block_height: base.height,
         block_timestamp: base.block_timestamp,
-        block_unix_timestamp: chain_timestamp_to_unix_seconds(base.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(base.block_timestamp),
         version: base.version,
         fee_nicks: base.fee,
@@ -821,24 +806,21 @@ pub async fn block_detail(
     .collect();
 
     let coinbase_credits = sql_query(
-        "SELECT cc.idx, cc.recipient_type, cc.recipient, cc.amount, cc.height AS block_height, COALESCE(b.timestamp, 0) AS block_timestamp
-         FROM coinbase_credits cc
-         LEFT JOIN blocks b ON b.height = cc.height
-         WHERE cc.block_id = ?1
-         ORDER BY cc.idx",
+        "SELECT c.first, c.amount, c.height AS block_height, COALESCE(b.timestamp, 0) AS block_timestamp
+         FROM credits c
+         LEFT JOIN blocks b ON b.height = c.height
+         WHERE c.block_id = ?1 AND c.txid IS NULL
+         ORDER BY c.first",
     )
     .bind::<Text, _>(block_id)
     .load::<CoinbaseRow>(conn)
     .await?
     .into_iter()
     .map(|r| CoinbaseCreditDetail {
-        idx: r.idx,
-        recipient_type: r.recipient_type,
-        recipient: r.recipient,
+        first: r.first,
         amount_nicks: r.amount,
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
-        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
     })
     .collect();
@@ -849,7 +831,6 @@ pub async fn block_detail(
         version: base.version,
         parent: base.parent,
         block_timestamp: base.timestamp,
-        block_unix_timestamp: chain_timestamp_to_unix_seconds(base.timestamp),
         block_time_utc: format_chain_timestamp_utc(base.timestamp),
         msg: base.msg,
         transactions,
@@ -857,7 +838,9 @@ pub async fn block_detail(
     })
 }
 
-pub async fn sync_status(conn: &mut crate::db::AsyncDbConnection) -> Result<SyncStatus, QueryError> {
+pub async fn sync_status(
+    conn: &mut crate::db::AsyncDbConnection,
+) -> Result<SyncStatus, QueryError> {
     let layers = sql_query(
         "SELECT layer, next_block_height
          FROM layer_metadata
@@ -880,15 +863,13 @@ pub async fn sync_status(conn: &mut crate::db::AsyncDbConnection) -> Result<Sync
         "tx_seeds",
         "tx_outputs",
         "tx_signers",
-        "lock_names",
-        "locks",
-        "lock_paths",
-        "lock_owners",
-        "name_owners",
-        "pk_to_pkh",
-        "debits",
+        "name_to_lock",
+        "pkh_to_pk",
+        "lock_tree",
+        "spend_conditions",
         "credits",
-        "coinbase_credits",
+        "debits",
+        "credit_info",
     ];
 
     let mut table_counts = Vec::with_capacity(tables.len());
@@ -920,7 +901,7 @@ pub async fn audit_report(
         VersionScope::V1Only => " AND n.version >= 1",
     };
 
-    let wallet_pks = sql_query("SELECT pk FROM pk_to_pkh WHERE pkh = ?1")
+    let wallet_pks = sql_query("SELECT pk FROM pkh_to_pk WHERE pkh = ?1")
         .bind::<Text, _>(pkh.clone())
         .load::<PkRow>(conn)
         .await?
@@ -930,74 +911,37 @@ pub async fn audit_report(
 
     let mut ledger = Vec::new();
 
-    let credit_sql = match scope {
-        VersionScope::V0Only => {
-            "SELECT c.height AS block_height,
-                    COALESCE(b.timestamp, 0) AS block_timestamp,
-                    'credit' AS entry_type,
-                    c.txid AS txid,
-                    t.block_id AS block_id,
-                    c.recipient_type AS recipient_type,
-                    c.recipient AS recipient,
-                    c.amount AS amount_nicks,
-                    0 AS fee_nicks,
-                    (SELECT GROUP_CONCAT(DISTINCT s.pk) FROM tx_signers s WHERE s.txid = c.txid) AS counterparties
-             FROM credits c
-             LEFT JOIN transactions t ON t.id = c.txid
-             LEFT JOIN blocks b ON b.height = c.height
-             WHERE c.recipient_type = 'v0pk'
-               AND c.recipient IN (SELECT pk FROM pk_to_pkh WHERE pkh = ?1)
-             ORDER BY c.height, c.txid, c.idx"
-        }
-        VersionScope::V1Only => {
-            "SELECT c.height AS block_height,
-                    COALESCE(b.timestamp, 0) AS block_timestamp,
-                    'credit' AS entry_type,
-                    c.txid AS txid,
-                    t.block_id AS block_id,
-                    c.recipient_type AS recipient_type,
-                    c.recipient AS recipient,
-                    c.amount AS amount_nicks,
-                    0 AS fee_nicks,
-                    (SELECT GROUP_CONCAT(DISTINCT s.pk) FROM tx_signers s WHERE s.txid = c.txid) AS counterparties
-             FROM credits c
-             LEFT JOIN transactions t ON t.id = c.txid
-             LEFT JOIN blocks b ON b.height = c.height
-             WHERE (c.recipient_type = 'pk' AND c.recipient IN (
-                     SELECT pk FROM pk_to_pkh WHERE pkh = ?1
-                   ))
-                OR (c.recipient_type = 'pkh' AND c.recipient = ?1)
-             ORDER BY c.height, c.txid, c.idx"
-        }
-        VersionScope::All => {
-            "SELECT c.height AS block_height,
-                    COALESCE(b.timestamp, 0) AS block_timestamp,
-                    'credit' AS entry_type,
-                    c.txid AS txid,
-                    t.block_id AS block_id,
-                    c.recipient_type AS recipient_type,
-                    c.recipient AS recipient,
-                    c.amount AS amount_nicks,
-                    0 AS fee_nicks,
-                    (SELECT GROUP_CONCAT(DISTINCT s.pk) FROM tx_signers s WHERE s.txid = c.txid) AS counterparties
-             FROM credits c
-             LEFT JOIN transactions t ON t.id = c.txid
-             LEFT JOIN blocks b ON b.height = c.height
-             WHERE (c.recipient_type IN ('pk', 'v0pk') AND c.recipient IN (
-                     SELECT pk FROM pk_to_pkh WHERE pkh = ?1
-                   ))
-                OR (c.recipient_type = 'pkh' AND c.recipient = ?1)
-             ORDER BY c.height, c.txid, c.idx"
-        }
-    };
+    // Credits for this wallet (non-coinbase)
+    let credit_sql =
+        "SELECT c.height AS block_height,
+                COALESCE(b.timestamp, 0) AS block_timestamp,
+                'credit' AS entry_type,
+                c.txid AS txid,
+                t.block_id AS block_id,
+                ci.recipient_type AS recipient_type,
+                ci.recipient AS recipient,
+                c.amount AS amount_nicks,
+                0 AS fee_nicks,
+                (SELECT GROUP_CONCAT(DISTINCT s.pk) FROM tx_signers s WHERE s.txid = c.txid) AS counterparties
+         FROM credits c
+         LEFT JOIN transactions t ON t.id = c.txid
+         LEFT JOIN blocks b ON b.height = c.height
+         LEFT JOIN credit_info ci ON ci.txid = c.txid AND ci.first = c.first AND ci.height = c.height
+         WHERE c.txid IS NOT NULL
+           AND (
+             (ci.recipient_type = 'pkh' AND ci.recipient = ?1)
+             OR (ci.recipient_type = 'pk' AND ci.recipient IN (
+                   SELECT pk FROM pkh_to_pk WHERE pkh = ?1
+                 ))
+           )
+         ORDER BY c.height, c.txid, c.first";
     let credit_rows = sql_query(credit_sql)
-    .bind::<Text, _>(pkh.clone())
-    .load::<LedgerRow>(conn)
-    .await?;
+        .bind::<Text, _>(pkh.clone())
+        .load::<LedgerRow>(conn)
+        .await?;
     ledger.extend(credit_rows.into_iter().map(|r| LedgerEntry {
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
-        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
         entry_type: r.entry_type,
         txid: r.txid,
@@ -1010,71 +954,36 @@ pub async fn audit_report(
         running_balance_nicks: 0,
     }));
 
-    let coinbase_sql = match scope {
-        VersionScope::V0Only => {
-            "SELECT cc.height AS block_height,
-                    COALESCE(b.timestamp, 0) AS block_timestamp,
-                    'coinbase' AS entry_type,
-                    NULL AS txid,
-                    cc.block_id AS block_id,
-                    cc.recipient_type AS recipient_type,
-                    cc.recipient AS recipient,
-                    cc.amount AS amount_nicks,
-                    0 AS fee_nicks,
-                    NULL AS counterparties
-             FROM coinbase_credits cc
-             LEFT JOIN blocks b ON b.height = cc.height
-             WHERE cc.recipient_type = 'v0pk'
-               AND cc.recipient IN (SELECT pk FROM pk_to_pkh WHERE pkh = ?1)
-             ORDER BY cc.height, cc.idx"
-        }
-        VersionScope::V1Only => {
-            "SELECT cc.height AS block_height,
-                    COALESCE(b.timestamp, 0) AS block_timestamp,
-                    'coinbase' AS entry_type,
-                    NULL AS txid,
-                    cc.block_id AS block_id,
-                    cc.recipient_type AS recipient_type,
-                    cc.recipient AS recipient,
-                    cc.amount AS amount_nicks,
-                    0 AS fee_nicks,
-                    NULL AS counterparties
-             FROM coinbase_credits cc
-             LEFT JOIN blocks b ON b.height = cc.height
-             WHERE (cc.recipient_type = 'pk' AND cc.recipient IN (
-                     SELECT pk FROM pk_to_pkh WHERE pkh = ?1
-                   ))
-                OR (cc.recipient_type = 'pkh' AND cc.recipient = ?1)
-             ORDER BY cc.height, cc.idx"
-        }
-        VersionScope::All => {
-            "SELECT cc.height AS block_height,
-                    COALESCE(b.timestamp, 0) AS block_timestamp,
-                    'coinbase' AS entry_type,
-                    NULL AS txid,
-                    cc.block_id AS block_id,
-                    cc.recipient_type AS recipient_type,
-                    cc.recipient AS recipient,
-                    cc.amount AS amount_nicks,
-                    0 AS fee_nicks,
-                    NULL AS counterparties
-             FROM coinbase_credits cc
-             LEFT JOIN blocks b ON b.height = cc.height
-             WHERE (cc.recipient_type IN ('pk', 'v0pk') AND cc.recipient IN (
-                     SELECT pk FROM pk_to_pkh WHERE pkh = ?1
-                   ))
-                OR (cc.recipient_type = 'pkh' AND cc.recipient = ?1)
-             ORDER BY cc.height, cc.idx"
-        }
-    };
+    // Coinbase credits for this wallet
+    let coinbase_sql =
+        "SELECT c.height AS block_height,
+                COALESCE(b.timestamp, 0) AS block_timestamp,
+                'coinbase' AS entry_type,
+                NULL AS txid,
+                c.block_id AS block_id,
+                ci.recipient_type AS recipient_type,
+                ci.recipient AS recipient,
+                c.amount AS amount_nicks,
+                0 AS fee_nicks,
+                NULL AS counterparties
+         FROM credits c
+         LEFT JOIN blocks b ON b.height = c.height
+         LEFT JOIN credit_info ci ON ci.txid = c.txid AND ci.first = c.first AND ci.height = c.height
+         WHERE c.txid IS NULL
+           AND (
+             (ci.recipient_type = 'pkh' AND ci.recipient = ?1)
+             OR (ci.recipient_type = 'pk' AND ci.recipient IN (
+                   SELECT pk FROM pkh_to_pk WHERE pkh = ?1
+                 ))
+           )
+         ORDER BY c.height, c.first";
     let coinbase_rows = sql_query(coinbase_sql)
-    .bind::<Text, _>(pkh.clone())
-    .load::<LedgerRow>(conn)
-    .await?;
+        .bind::<Text, _>(pkh.clone())
+        .load::<LedgerRow>(conn)
+        .await?;
     ledger.extend(coinbase_rows.into_iter().map(|r| LedgerEntry {
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
-        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
         entry_type: r.entry_type,
         txid: r.txid,
@@ -1087,6 +996,7 @@ pub async fn audit_report(
         running_balance_nicks: 0,
     }));
 
+    // Debits: spent notes owned by this wallet
     let spent_sql = format!(
         "SELECT n.spent_height AS block_height,
                 COALESCE(b.timestamp, 0) AS block_timestamp,
@@ -1103,24 +1013,30 @@ pub async fn audit_report(
                     ) = 1 THEN COALESCE(t.fee, 0)
                     ELSE 0
                 END AS fee_nicks,
-                (SELECT GROUP_CONCAT(DISTINCT c.recipient) FROM credits c WHERE c.txid = n.spent_txid) AS counterparties
+                (SELECT GROUP_CONCAT(DISTINCT ci2.recipient) FROM credit_info ci2 WHERE ci2.txid = n.spent_txid) AS counterparties
          FROM notes n
-         INNER JOIN name_owners no ON n.first = no.first
          LEFT JOIN transactions t ON t.id = n.spent_txid
          LEFT JOIN blocks b ON b.height = n.spent_height
-         WHERE no.pkh = ?1
-           AND n.spent_txid IS NOT NULL{note_version_filter}
+         WHERE n.spent_txid IS NOT NULL{note_version_filter}
+           AND (
+             n.first IN (
+               SELECT ci.first FROM credit_info ci
+               WHERE (ci.recipient_type = 'pkh' AND ci.recipient = ?1)
+                  OR (ci.recipient_type = 'pk' AND ci.recipient IN (
+                       SELECT pk FROM pkh_to_pk WHERE pkh = ?1
+                     ))
+             )
+           )
          ORDER BY n.spent_height, n.spent_txid, n.first, n.last"
     );
     let spent_rows = sql_query(spent_sql)
-    .bind::<Text, _>(pkh.clone())
-    .load::<LedgerRow>(conn)
-    .await?;
+        .bind::<Text, _>(pkh.clone())
+        .load::<LedgerRow>(conn)
+        .await?;
 
     ledger.extend(spent_rows.into_iter().map(|r| LedgerEntry {
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
-        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
         entry_type: r.entry_type,
         txid: r.txid,
@@ -1160,7 +1076,6 @@ pub async fn audit_report(
             txid,
             first_block_height: entry.block_height,
             first_block_timestamp: entry.block_timestamp,
-            first_block_unix_timestamp: entry.block_unix_timestamp,
             first_block_time_utc: entry.block_time_utc.clone(),
             direction: "incoming".to_string(),
             incoming_nicks: 0,
@@ -1172,7 +1087,6 @@ pub async fn audit_report(
         if entry.block_height < summary.first_block_height {
             summary.first_block_height = entry.block_height;
             summary.first_block_timestamp = entry.block_timestamp;
-            summary.first_block_unix_timestamp = entry.block_unix_timestamp;
             summary.first_block_time_utc = entry.block_time_utc.clone();
         }
         match entry.entry_type.as_str() {
@@ -1202,11 +1116,10 @@ pub async fn audit_report(
             .then_with(|| a.txid.cmp(&b.txid))
     });
 
-    // Summary flow rows are accounting-focused and recipient-level.
-    // They collapse note-level debits into tx output flows.
+    // Summary flow rows
     let mut flows = Vec::new();
 
-    // Incoming rows: wallet-owned credits and coinbase rows from ledger.
+    // Incoming rows from ledger
     for entry in &ledger {
         if entry.entry_type == "credit" || entry.entry_type == "coinbase" {
             flows.push(AuditFlowRow {
@@ -1214,7 +1127,6 @@ pub async fn audit_report(
                 block_id: entry.block_id.clone(),
                 txid: entry.txid.clone(),
                 block_timestamp: entry.block_timestamp,
-                block_unix_timestamp: entry.block_unix_timestamp,
                 block_time_utc: entry.block_time_utc.clone(),
                 entry_type: if entry.entry_type == "coinbase" {
                     "coinbase".to_string()
@@ -1232,28 +1144,34 @@ pub async fn audit_report(
 
     // Outgoing rows: recipient-level credits from wallet-spend txs excluding wallet recipients.
     let outgoing_sql = format!(
-        "SELECT c.height AS block_height,
+        "SELECT ci.height AS block_height,
                 COALESCE(b.timestamp, 0) AS block_timestamp,
                 'outgoing' AS entry_type,
-                c.txid AS txid,
+                ci.txid AS txid,
                 t.block_id AS block_id,
-                c.recipient_type AS recipient_type,
-                c.recipient AS recipient,
+                ci.recipient_type AS recipient_type,
+                ci.recipient AS recipient,
                 c.amount AS amount_nicks,
                 0 AS fee_nicks,
                 NULL AS counterparties
-         FROM credits c
-         INNER JOIN transactions t ON t.id = c.txid
-         LEFT JOIN blocks b ON b.height = c.height
+         FROM credit_info ci
+         INNER JOIN credits c ON c.txid = ci.txid AND c.first = ci.first AND c.height = ci.height
+         INNER JOIN transactions t ON t.id = ci.txid
+         LEFT JOIN blocks b ON b.height = ci.height
          WHERE EXISTS (
              SELECT 1
              FROM notes n
-             INNER JOIN name_owners no ON n.first = no.first
-             WHERE n.spent_txid = c.txid
-               AND no.pkh = ?1
+             WHERE n.spent_txid = ci.txid
                AND n.spent_txid IS NOT NULL{note_version_filter}
+               AND n.first IN (
+                 SELECT ci3.first FROM credit_info ci3
+                 WHERE (ci3.recipient_type = 'pkh' AND ci3.recipient = ?1)
+                    OR (ci3.recipient_type = 'pk' AND ci3.recipient IN (
+                         SELECT pk FROM pkh_to_pk WHERE pkh = ?1
+                       ))
+               )
          )
-         ORDER BY c.height, c.txid, c.idx"
+         ORDER BY ci.height, ci.txid, ci.first"
     );
     let outgoing_rows = sql_query(outgoing_sql)
         .bind::<Text, _>(pkh.clone())
@@ -1274,7 +1192,6 @@ pub async fn audit_report(
             block_id: row.block_id,
             txid: row.txid,
             block_timestamp: row.block_timestamp,
-            block_unix_timestamp: chain_timestamp_to_unix_seconds(row.block_timestamp),
             block_time_utc: format_chain_timestamp_utc(row.block_timestamp),
             entry_type: "outgoing".to_string(),
             recipient_type: row.recipient_type,
@@ -1285,7 +1202,7 @@ pub async fn audit_report(
         });
     }
 
-    // One fee assignment per tx, deterministic and stable.
+    // One fee assignment per tx
     let mut tx_fee_map: HashMap<String, i64> = HashMap::new();
     for entry in &ledger {
         if entry.entry_type == "debit" {

@@ -1,18 +1,22 @@
 pub mod schema;
 
 use super::{
-    l1::schema::{notes, Note as L1Note},
-    l2::schema::{tx_outputs, tx_signers, tx_spends, TxOutput, TxSigner, TxSpend},
-    l3::schema::{lock_names, name_owners, pk_to_pkh, LockName, NameOwner, PkToPkh},
+    l0::schema::blocks,
+    l1::schema::notes,
+    l2::schema::{name_to_lock, spend_conditions},
+    l3::schema::credits,
     layer::*,
     shared_schema::*,
 };
 use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use iris_nockchain_types::v1::SpendCondition;
+use iris_nockchain_types::Page;
+use iris_ztd::{cue, Hashable, NounDecode};
 use log::*;
 use schema::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::Instrument;
@@ -22,12 +26,6 @@ pub struct L4Client {
     deps: Vec<Arc<dyn LayerDependency>>,
     _stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedRecipient {
-    recipient_type: String,
-    recipient: String,
 }
 
 impl L4Client {
@@ -41,118 +39,112 @@ impl L4Client {
         }
     }
 
-    async fn resolve_recipients(
+    /// Determine recipient_type and recipient from a V1 spend condition.
+    fn resolve_recipient(sc: &SpendCondition) -> (String, String) {
+        let pkhs: Vec<_> = sc.pkh().collect();
+        if pkhs.len() == 1 && pkhs[0].hashes.len() == 1 {
+            if let Some(pkh) = pkhs[0].hashes.iter().next() {
+                return ("pkh".to_string(), pkh.to_string());
+            } else {
+                ("musig".to_string(), sc.hash().to_string())
+            }
+        } else if pkhs.len() > 1 {
+            ("musig".to_string(), sc.hash().to_string())
+        } else {
+            ("lock".to_string(), sc.hash().to_string())
+        }
+    }
+
+    /// Resolve a V0 note's recipient by decoding its JAM and extracting the sig pubkeys.
+    fn resolve_v0_recipient(note_jam: &[u8]) -> Result<(String, String), LayerErrorSource> {
+        let noun = cue(note_jam)
+            .ok_or_else(|| LayerErrorSource::OtherError("failed to cue v0 note".to_string()))?;
+        let note = iris_nockchain_types::v0::NoteV0::from_noun(&noun)
+            .ok_or_else(|| LayerErrorSource::OtherError("failed to decode v0 note".to_string()))?;
+        if note.sig.pubkeys.len() == 1 {
+            let pk = note
+                .sig
+                .pubkeys
+                .iter()
+                .next()
+                .expect("v0 note has 1 pubkey but iter empty");
+            Ok(("pk".to_string(), DbPublicKey::from(*pk).to_string()))
+        } else {
+            // Multi-sig V0 note
+            Ok(("musig".to_string(), note.sig.hash().to_string()))
+        }
+    }
+
+    /// Resolve a V1 credit recipient via name_to_lock → spend_conditions.
+    async fn resolve_v1_recipient(
         conn: &mut crate::db::AsyncDbConnection,
-        firsts: &[DbDigest],
-    ) -> Result<HashMap<iris_ztd::Digest, ResolvedRecipient>, LayerErrorSource> {
-        let mut uniq_firsts = vec![];
-        let mut seen = HashSet::new();
-        for first in firsts {
-            if seen.insert(*first) {
-                uniq_firsts.push(*first);
+        first: DbDigest,
+    ) -> Result<(String, String), LayerErrorSource> {
+        let root: DbDigest = name_to_lock::table
+            .filter(name_to_lock::first.eq(first))
+            .select(name_to_lock::root)
+            .first::<DbDigest>(conn)
+            .await
+            .map_err(|_| {
+                LayerErrorSource::OtherError(format!(
+                    "missing name_to_lock entry for first={first}"
+                ))
+            })?;
+
+        let sc_row = spend_conditions::table
+            .filter(spend_conditions::hash.eq(root))
+            .first::<super::l2::schema::SpendConditionRow>(conn)
+            .await
+            .optional()?;
+
+        let Some(sc_row) = sc_row else {
+            return Ok(("lock".to_string(), root.to_string()));
+        };
+
+        let sc = SpendCondition::from_noun(&cue(&sc_row.jam).ok_or_else(|| {
+            LayerErrorSource::OtherError(format!("failed to cue spend condition for root={root}"))
+        })?)
+        .ok_or_else(|| {
+            LayerErrorSource::OtherError(format!(
+                "failed to decode spend condition for root={root}"
+            ))
+        })?;
+
+        Ok(Self::resolve_recipient(&sc))
+    }
+
+    /// Build a map from coinbase note `first` → (recipient_type, recipient).
+    /// For V0: sig contains public keys → recipient is the pk itself.
+    /// For V1: the CoinbaseSplit key IS the PKH directly.
+    fn coinbase_recipients(
+        page: &Page,
+        constants: iris_nockchain_types::BlockchainConstants,
+    ) -> BTreeMap<DbDigest, (String, String)> {
+        let notes = page.coinbase(constants);
+        let mut map = BTreeMap::new();
+        match page {
+            Page::V0(p) => {
+                for (note, (sig, _)) in notes.iter().zip(p.coinbase.0.iter()) {
+                    let first = DbDigest(note.name().first);
+                    let pk = sig
+                        .pubkeys
+                        .iter()
+                        .next()
+                        .expect("v0 coinbase sig must have at least one pubkey");
+                    map.insert(
+                        first,
+                        ("pk".to_string(), DbPublicKey::from(*pk).to_string()),
+                    );
+                }
+            }
+            Page::V1(p) => {
+                for (note, (pkh, _)) in notes.iter().zip(p.coinbase.0.iter()) {
+                    let first = DbDigest(note.name().first);
+                    map.insert(first, ("pkh".to_string(), pkh.to_string()));
+                }
             }
         }
-        if uniq_firsts.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let owner_rows = name_owners::table
-            .filter(name_owners::first.eq_any(&uniq_firsts))
-            .load::<NameOwner>(conn)
-            .await?;
-        let mut owners_by_first: HashMap<iris_ztd::Digest, HashSet<iris_ztd::Digest>> =
-            HashMap::new();
-        for row in owner_rows {
-            owners_by_first
-                .entry(*row.first)
-                .or_default()
-                .insert(*row.pkh);
-        }
-
-        let single_pkhs: Vec<DbDigest> = owners_by_first
-            .iter()
-            .filter_map(|(_, s)| {
-                if s.len() == 1 {
-                    s.iter().next().copied().map(DbDigest::from)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let pk_rows = if single_pkhs.is_empty() {
-            vec![]
-        } else {
-            pk_to_pkh::table
-                .filter(pk_to_pkh::pkh.eq_any(single_pkhs))
-                .load::<PkToPkh>(conn)
-                .await?
-        };
-        let mut pk_by_pkh: HashMap<iris_ztd::Digest, iris_crypto::PublicKey> =
-            HashMap::new();
-        for row in pk_rows {
-            pk_by_pkh.entry(*row.pkh).or_insert(*row.pk);
-        }
-
-        let unresolved_firsts: Vec<DbDigest> = uniq_firsts
-            .iter()
-            .copied()
-            .filter(|first| owners_by_first.get(&first.0).map(|s| s.len()).unwrap_or(0) != 1)
-            .collect();
-        let lock_rows = if unresolved_firsts.is_empty() {
-            vec![]
-        } else {
-            lock_names::table
-                .filter(lock_names::first.eq_any(unresolved_firsts))
-                .load::<LockName>(conn)
-                .await?
-        };
-        let mut root_by_first: HashMap<iris_ztd::Digest, DbDigest> = HashMap::new();
-        for row in lock_rows {
-            root_by_first.entry(*row.first).or_insert(row.root);
-        }
-
-        let mut resolved = HashMap::new();
-        for first in uniq_firsts {
-            let entry = if let Some(set) = owners_by_first.get(&first.0) {
-                if set.len() == 1 {
-                    let pkh = *set.iter().next().expect("single owner exists");
-                    if let Some(pk) = pk_by_pkh.get(&pkh) {
-                        ResolvedRecipient {
-                            recipient_type: "pk".to_string(),
-                            recipient: DbPublicKey::from(pk.clone()).to_string(),
-                        }
-                    } else {
-                        ResolvedRecipient {
-                            recipient_type: "pkh".to_string(),
-                            recipient: pkh.to_string(),
-                        }
-                    }
-                } else if let Some(root) = root_by_first.get(&first.0) {
-                    ResolvedRecipient {
-                        recipient_type: "lock".to_string(),
-                        recipient: (**root).to_string(),
-                    }
-                } else {
-                    ResolvedRecipient {
-                        recipient_type: "lock".to_string(),
-                        recipient: (*first).to_string(),
-                    }
-                }
-            } else if let Some(root) = root_by_first.get(&first.0) {
-                ResolvedRecipient {
-                    recipient_type: "lock".to_string(),
-                    recipient: (**root).to_string(),
-                }
-            } else {
-                ResolvedRecipient {
-                    recipient_type: "lock".to_string(),
-                    recipient: (*first).to_string(),
-                }
-            };
-            resolved.insert(first.0, entry);
-        }
-
-        Ok(resolved)
+        map
     }
 }
 
@@ -189,21 +181,19 @@ impl LayerImpl for L4Client {
 
         metadata.layer = Self::LAYER;
 
-        trace!("Dropping coinbase_credits");
-        diesel::delete(coinbase_credits::table)
-            .filter(coinbase_credits::height.ge(metadata.next_block_height))
-            .execute(conn)
+        let min_height: Option<i32> = credit_info::table
+            .filter(credit_info::updated_height.ge(metadata.next_block_height))
+            .select(diesel::dsl::min(credit_info::height))
+            .first::<Option<i32>>(conn)
             .await?;
-        trace!("Dropping credits");
-        diesel::delete(credits::table)
-            .filter(credits::height.ge(metadata.next_block_height))
-            .execute(conn)
-            .await?;
-        trace!("Dropping debits");
-        diesel::delete(debits::table)
-            .filter(debits::height.ge(metadata.next_block_height))
-            .execute(conn)
-            .await?;
+
+        if let Some(min_h) = min_height {
+            diesel::delete(credit_info::table)
+                .filter(credit_info::height.ge(min_h))
+                .execute(conn)
+                .await?;
+            metadata.next_block_height = min_h;
+        }
 
         Self::update_layer_metadata(&metadata).execute(conn).await?;
         Ok(())
@@ -215,8 +205,6 @@ impl LayerImpl for L4Client {
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: FixedLayerMetadata,
     ) -> Result<(), LayerErrorSource> {
-        let _ = &self.activations;
-
         if metadata.next_block_height == 0 {
             for dep in &self.deps {
                 dep.update_blocks(conn, metadata).await?;
@@ -248,7 +236,8 @@ impl LayerImpl for L4Client {
         )
         .await?;
 
-        trace!("Syncing accounting from {start_block_height} to {end_block_height}");
+        trace!("Syncing credit_info from {start_block_height} to {end_block_height}");
+        let constants = self.activations.constants();
         let step = 100u32;
         let mut cur_metadata = FixedLayerMetadata {
             layer: Self::LAYER,
@@ -262,210 +251,129 @@ impl LayerImpl for L4Client {
 
             async {
                 for height in block_height..=last_block_height {
-                    let get_inputs_span = tracing::info_span!("l4_db_get_inputs", height);
-                    let (spends, signers, outputs) = async {
-                        let spends = tx_spends::table
-                            .filter(tx_spends::height.eq(height as i32))
-                            .load::<TxSpend>(conn)
-                            .await?;
-                        let signers = tx_signers::table
-                            .filter(tx_signers::height.eq(height as i32))
-                            .load::<TxSigner>(conn)
-                            .await?;
-                        let outputs = tx_outputs::table
-                            .filter(tx_outputs::height.eq(height as i32))
-                            .load::<TxOutput>(conn)
-                            .await?;
-                        Ok::<_, LayerErrorSource>((spends, signers, outputs))
-                    }
-                    .instrument(get_inputs_span)
-                    .await?;
+                    let h = height as i32;
 
-                    let v0_txids: HashSet<iris_ztd::Digest> = spends
-                        .iter()
-                        .filter(|s| s.version == 0)
-                        .map(|s| *s.txid)
-                        .collect();
+                    let mut block_info = vec![];
 
-                    let mut debit_rows: Vec<Debit> = vec![];
-                    if !spends.is_empty() && !signers.is_empty() {
-                        let mut firsts: Vec<DbDigest> = vec![];
-                        let mut lasts: Vec<DbDigest> = vec![];
-                        let mut seen_note = HashSet::new();
-                        for s in &spends {
-                            if seen_note.insert((*s.first, *s.last)) {
-                                firsts.push(s.first);
-                                lasts.push(s.last);
-                            }
-                        }
-
-                        let note_rows = notes::table
-                            .filter(notes::first.eq_any(&firsts))
-                            .filter(notes::last.eq_any(&lasts))
-                            .load::<L1Note>(conn)
-                            .await?;
-                        let note_assets: HashMap<(iris_ztd::Digest, iris_ztd::Digest), i64> =
-                            note_rows
-                                .into_iter()
-                                .map(|n| ((*n.first, *n.last), n.assets))
-                                .collect();
-
-                        let spend_by_txz: HashMap<(iris_ztd::Digest, i32), &TxSpend> =
-                            spends.iter().map(|s| ((*s.txid, s.z), s)).collect();
-
-                        let mut signer_counts_by_txz: HashMap<(iris_ztd::Digest, i32), usize> =
-                            HashMap::new();
-                        let mut signer_spends: HashMap<(iris_ztd::Digest, DbPublicKey), Vec<i32>> =
-                            HashMap::new();
-                        for signer in &signers {
-                            *signer_counts_by_txz.entry((*signer.txid, signer.z)).or_default() += 1;
-                            signer_spends
-                                .entry((*signer.txid, signer.pk))
-                                .or_default()
-                                .push(signer.z);
-                        }
-
-                        for ((txid, pk), zs) in signer_spends {
-                            let mut amount = 0i64;
-                            let mut fee = 0i64;
-                            let mut sole_owner = true;
-                            let mut seen_z = HashSet::new();
-
-                            for z in zs {
-                                if !seen_z.insert(z) {
-                                    continue;
-                                }
-                                let Some(spend) = spend_by_txz.get(&(txid, z)).copied() else {
-                                    warn!("Missing spend row for tx {} z {}", txid, z);
-                                    continue;
-                                };
-
-                                fee += spend.fee;
-                                if signer_counts_by_txz
-                                    .get(&(txid, z))
-                                    .copied()
-                                    .unwrap_or_default()
-                                    != 1
-                                {
-                                    sole_owner = false;
-                                }
-
-                                if let Some(v) = note_assets.get(&(*spend.first, *spend.last)) {
-                                    amount += *v;
-                                } else {
-                                    warn!(
-                                        "Missing note assets for input ({}, {})",
-                                        *spend.first, *spend.last
-                                    );
-                                }
-                            }
-
-                            if amount > 0 || fee > 0 {
-                                debit_rows.push(Debit {
-                                    txid: txid.into(),
-                                    pk,
-                                    sole_owner,
-                                    amount,
-                                    fee,
-                                    height: height as i32,
-                                });
-                            }
-                        }
-                    }
-
-                    let mut credit_rows: Vec<Credit> = vec![];
-                    let mut coinbase_credit_rows: Vec<CoinbaseCredit> = vec![];
-                    if !outputs.is_empty() {
-                        let output_firsts: Vec<DbDigest> = outputs.iter().map(|o| o.first).collect();
-                        let resolved_by_first = Self::resolve_recipients(conn, &output_firsts).await?;
-
-                        for output in outputs {
-                            let mut resolved = resolved_by_first.get(&*output.first).cloned().unwrap_or(
-                                ResolvedRecipient {
-                                    recipient_type: "lock".to_string(),
-                                    recipient: (*output.first).to_string(),
-                                },
-                            );
-
-                            if v0_txids.contains(&*output.txid) && resolved.recipient_type == "pk" {
-                                resolved.recipient_type = "v0pk".to_string();
-                            }
-
-                            credit_rows.push(Credit {
-                                txid: output.txid,
-                                idx: output.idx,
-                                recipient_type: resolved.recipient_type,
-                                recipient: resolved.recipient,
-                                amount: output.assets,
-                                height: output.height,
-                            });
-                        }
-                    }
-
-                    let cb_notes: Vec<L1Note> = notes::table
-                        .filter(notes::coinbase.eq(true))
-                        .filter(notes::created_height.eq(height as i32))
-                        .order_by((notes::first, notes::last))
-                        .load::<L1Note>(conn)
+                    // ── Non-coinbase credits (txid IS NOT NULL) ──
+                    let tx_credits = credits::table
+                        .filter(credits::height.eq(h))
+                        .filter(credits::txid.is_not_null())
+                        .select((credits::txid, credits::first))
+                        .load::<(Option<DbDigest>, DbDigest)>(conn)
                         .await?;
-                    if !cb_notes.is_empty() {
-                        let cb_firsts: Vec<DbDigest> = cb_notes.iter().map(|n| n.first).collect();
-                        let resolved_by_first = Self::resolve_recipients(conn, &cb_firsts).await?;
 
-                        for (idx, note) in cb_notes.into_iter().enumerate() {
-                            let mut resolved =
-                                resolved_by_first
-                                    .get(&*note.first)
-                                    .cloned()
-                                    .unwrap_or(ResolvedRecipient {
-                                        recipient_type: "lock".to_string(),
-                                        recipient: (*note.first).to_string(),
-                                    });
+                    for (txid_opt, first) in tx_credits {
+                        let txid = txid_opt.expect("txid IS NOT NULL but got None");
 
-                            if note.version == 0 && resolved.recipient_type == "pk" {
-                                resolved.recipient_type = "v0pk".to_string();
-                            }
+                        // Determine note version to branch V0 vs V1
+                        let note_version: i32 = notes::table
+                            .filter(notes::first.eq(first))
+                            .select(notes::version)
+                            .first::<i32>(conn)
+                            .await
+                            .map_err(|_| {
+                                LayerErrorSource::OtherError(format!(
+                                    "missing note for first={first} txid={txid}"
+                                ))
+                            })?;
 
-                            coinbase_credit_rows.push(CoinbaseCredit {
-                                block_id: note.created_bid,
-                                idx: idx as i32,
-                                recipient_type: resolved.recipient_type,
-                                recipient: resolved.recipient,
-                                amount: note.assets,
-                                height: note.created_height,
+                        let (recipient_type, recipient) = if note_version == 0 {
+                            // V0: decode note JAM to extract sig pubkeys
+                            let note_jam: Vec<u8> = notes::table
+                                .filter(notes::first.eq(first))
+                                .select(notes::jam)
+                                .first::<Vec<u8>>(conn)
+                                .await?;
+                            Self::resolve_v0_recipient(&note_jam)?
+                        } else {
+                            // V1: name_to_lock → spend_conditions
+                            Self::resolve_v1_recipient(conn, first).await?
+                        };
+
+                        block_info.push(CreditInfo {
+                            txid: Some(txid),
+                            first,
+                            height: h,
+                            updated_height: h,
+                            recipient_type,
+                            recipient,
+                        });
+                    }
+
+                    // ── Coinbase credits (txid IS NULL) ──
+                    let coinbase_credits = credits::table
+                        .filter(credits::height.eq(h))
+                        .filter(credits::txid.is_null())
+                        .select(credits::first)
+                        .load::<DbDigest>(conn)
+                        .await?;
+
+                    if !coinbase_credits.is_empty() {
+                        let block_jam: Vec<u8> = blocks::table
+                            .filter(blocks::height.eq(h))
+                            .select(blocks::jam)
+                            .first::<Vec<u8>>(conn)
+                            .await?;
+
+                        let page = Page::from_noun(
+                            &cue(&block_jam).ok_or(LayerErrorSource::OtherError(
+                                format!("failed to cue block at height {h}"),
+                            ))?,
+                        )
+                        .ok_or(LayerErrorSource::OtherError(
+                            format!("failed to decode block page at height {h}"),
+                        ))?;
+
+                        let cb_recipients = Self::coinbase_recipients(&page, constants);
+
+                        for first in coinbase_credits {
+                            let (recipient_type, recipient) = cb_recipients
+                                .get(&first)
+                                .ok_or_else(|| {
+                                    LayerErrorSource::OtherError(format!(
+                                        "coinbase credit first={first} not found in block page at height {h}"
+                                    ))
+                                })?
+                                .clone();
+
+                            block_info.push(CreditInfo {
+                                txid: None,
+                                first,
+                                height: h,
+                                updated_height: h,
+                                recipient_type,
+                                recipient,
                             });
                         }
                     }
 
                     cur_metadata = FixedLayerMetadata {
                         layer: Self::LAYER,
-                        next_block_height: height as i32 + 1,
+                        next_block_height: h + 1,
                     };
                     let next_metadata = cur_metadata;
 
                     conn.spawn_blocking(move |conn| {
                         use diesel::query_dsl::methods::ExecuteDsl;
                         conn.transaction(move |conn| {
-                            if !debit_rows.is_empty() {
-                                let q1 = diesel::insert_or_ignore_into(debits::table).values(&debit_rows);
-                                ExecuteDsl::execute(q1, conn)?;
+                            if !block_info.is_empty() {
+                                ExecuteDsl::execute(
+                                    diesel::insert_into(credit_info::table).values(&block_info),
+                                    conn,
+                                )?;
                             }
-                            if !credit_rows.is_empty() {
-                                let q2 = diesel::insert_or_ignore_into(credits::table).values(&credit_rows);
-                                ExecuteDsl::execute(q2, conn)?;
-                            }
-                            if !coinbase_credit_rows.is_empty() {
-                                let q3 = diesel::insert_or_ignore_into(coinbase_credits::table)
-                                    .values(&coinbase_credit_rows);
-                                ExecuteDsl::execute(q3, conn)?;
-                            }
-                            let q4 = Self::update_layer_metadata(&next_metadata);
-                            ExecuteDsl::execute(q4, conn)?;
+                            ExecuteDsl::execute(
+                                Self::update_layer_metadata(&next_metadata),
+                                conn,
+                            )?;
                             Ok(())
                         })
                     })
                     .instrument(tracing::info_span!("l4_commit_block", height))
                     .await?;
+
+                    crate::rt::yield_now().await;
                 }
 
                 Ok::<(), LayerErrorSource>(())
@@ -479,457 +387,5 @@ impl LayerImpl for L4Client {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::layers::{l2::L2Client, l3::L3Client};
-    use diesel::dsl::count_star;
-    use diesel_async::RunQueryDsl;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_db_path() -> Option<PathBuf> {
-        std::env::var("TEST_DB_PATH").ok().map(PathBuf::from)
-    }
-
-    fn temp_copy_path() -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        std::env::temp_dir().join(format!("iris-blocks-l4-test-{ts}.sqlite"))
-    }
-
-    async fn setup_conn_and_client() -> Option<(crate::db::AsyncDbConnection, L4Client, PathBuf)> {
-        let src = test_db_path()?;
-        if !src.exists() {
-            return None;
-        }
-
-        let dst = temp_copy_path();
-        std::fs::copy(src, &dst).ok()?;
-
-        let mut conn = crate::db::new_conn(dst.to_str().expect("db path"))
-            .await
-            .ok()?;
-        crate::db::run_migrations(&mut conn).await;
-        let client = L4Client::new(ChainActivations::mainnet(), vec![]);
-        Some((conn, client, dst))
-    }
-
-    async fn run_l4_range(
-        client: &L4Client,
-        conn: &mut crate::db::AsyncDbConnection,
-        start: i32,
-        end: i32,
-    ) {
-        let activations = ChainActivations::mainnet();
-        let l2 = L2Client::new(activations.clone(), vec![]);
-        let l3 = L3Client::new(activations, vec![]);
-
-        L2Client::update_layer_metadata(&FixedLayerMetadata {
-            layer: "l2",
-            next_block_height: start,
-        })
-        .execute(conn)
-        .await
-        .expect("seed l2 metadata");
-        L3Client::update_layer_metadata(&FixedLayerMetadata {
-            layer: "l3",
-            next_block_height: start,
-        })
-        .execute(conn)
-        .await
-        .expect("seed l3 metadata");
-        L4Client::update_layer_metadata(&FixedLayerMetadata {
-            layer: "l4",
-            next_block_height: start,
-        })
-        .execute(conn)
-        .await
-        .expect("seed l4 metadata");
-
-        l2.update_blocks(
-            conn,
-            FixedLayerMetadata {
-                layer: "l1",
-                next_block_height: end + 1,
-            },
-        )
-        .await
-        .expect("l2 update");
-        l3.update_blocks(
-            conn,
-            FixedLayerMetadata {
-                layer: "l2",
-                next_block_height: end + 1,
-            },
-        )
-        .await
-        .expect("l3 update");
-        client
-            .update_blocks(
-                conn,
-                FixedLayerMetadata {
-                    layer: "l3",
-                    next_block_height: end + 1,
-                },
-            )
-            .await
-            .expect("l4 update");
-    }
-
-    #[tokio::test]
-    async fn test_l4_single_tx_debits() {
-        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
-            eprintln!("Skipping test_l4_single_tx_debits: TEST_DB_PATH not set");
-            return;
-        };
-
-        let target_height = 9745;
-        run_l4_range(&client, &mut conn, target_height, target_height).await;
-
-        let rows = debits::table
-            .filter(debits::height.eq(target_height))
-            .load::<Debit>(&mut conn)
-            .await
-            .expect("load debits");
-        assert!(!rows.is_empty());
-        for row in rows {
-            assert!(row.amount > 0);
-            assert!(row.fee >= 0);
-
-            let spends_for_tx = tx_spends::table
-                .filter(tx_spends::txid.eq(row.txid))
-                .load::<TxSpend>(&mut conn)
-                .await
-                .expect("load spends for tx");
-
-            let mut expected_sole_owner = true;
-            for spend in spends_for_tx {
-                let c = tx_signers::table
-                    .filter(
-                        tx_signers::txid
-                            .eq(row.txid)
-                            .and(tx_signers::z.eq(spend.z)),
-                    )
-                    .select(count_star())
-                    .first::<i64>(&mut conn)
-                    .await
-                    .expect("count signers for spend");
-                if c != 1 {
-                    expected_sole_owner = false;
-                }
-            }
-            assert_eq!(row.sole_owner, expected_sole_owner);
-        }
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn test_l4_single_tx_credits() {
-        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
-            eprintln!("Skipping test_l4_single_tx_credits: TEST_DB_PATH not set");
-            return;
-        };
-
-        let target_height = 9745;
-        run_l4_range(&client, &mut conn, target_height, target_height).await;
-
-        let outputs = tx_outputs::table
-            .filter(tx_outputs::height.eq(target_height))
-            .load::<TxOutput>(&mut conn)
-            .await
-            .expect("load tx_outputs");
-        let output_map: HashMap<(iris_ztd::Digest, i32), i64> =
-            outputs.into_iter().map(|o| ((*o.txid, o.idx), o.assets)).collect();
-
-        let rows = credits::table
-            .filter(credits::height.eq(target_height))
-            .load::<Credit>(&mut conn)
-            .await
-            .expect("load credits");
-        assert!(!rows.is_empty());
-
-        for row in rows {
-            assert!(matches!(row.recipient_type.as_str(), "pk" | "v0pk" | "pkh" | "lock"));
-            let expected_assets = output_map
-                .get(&(*row.txid, row.idx))
-                .copied()
-                .expect("credit row has matching output");
-            assert_eq!(row.amount, expected_assets);
-        }
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn test_l4_sync_block_range() {
-        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
-            eprintln!("Skipping test_l4_sync_block_range: TEST_DB_PATH not set");
-            return;
-        };
-
-        run_l4_range(&client, &mut conn, 9740, 9750).await;
-
-        let debits_count = debits::table
-            .select(count_star())
-            .first::<i64>(&mut conn)
-            .await
-            .expect("count debits");
-        let credits_count = credits::table
-            .select(count_star())
-            .first::<i64>(&mut conn)
-            .await
-            .expect("count credits");
-
-        assert!(debits_count > 0);
-        assert!(credits_count > 0);
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn test_l4_expire_blocks() {
-        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
-            eprintln!("Skipping test_l4_expire_blocks: TEST_DB_PATH not set");
-            return;
-        };
-
-        run_l4_range(&client, &mut conn, 39000, 39010).await;
-        let rollback = 39005i32;
-        client
-            .expire_blocks(
-                &mut conn,
-                FixedLayerMetadata {
-                    layer: "l3",
-                    next_block_height: rollback,
-                },
-            )
-            .await
-            .expect("expire l4");
-
-        let high_debits = debits::table
-            .filter(debits::height.ge(rollback))
-            .select(count_star())
-            .first::<i64>(&mut conn)
-            .await
-            .expect("count high debits");
-        let high_credits = credits::table
-            .filter(credits::height.ge(rollback))
-            .select(count_star())
-            .first::<i64>(&mut conn)
-            .await
-            .expect("count high credits");
-        let high_coinbase = coinbase_credits::table
-            .filter(coinbase_credits::height.ge(rollback))
-            .select(count_star())
-            .first::<i64>(&mut conn)
-            .await
-            .expect("count high coinbase credits");
-        assert_eq!(high_debits, 0);
-        assert_eq!(high_credits, 0);
-        assert_eq!(high_coinbase, 0);
-
-        let m = L4Client::layer_metadata(&mut conn)
-            .await
-            .expect("layer metadata")
-            .expect("metadata exists");
-        assert_eq!(m.next_block_height, rollback);
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn test_l4_debit_credit_balance() {
-        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
-            eprintln!("Skipping test_l4_debit_credit_balance: TEST_DB_PATH not set");
-            return;
-        };
-
-        let target_height = 9745;
-        run_l4_range(&client, &mut conn, target_height, target_height).await;
-
-        let rows = debits::table
-            .filter(debits::height.eq(target_height))
-            .load::<Debit>(&mut conn)
-            .await
-            .expect("load debits");
-        let mut by_tx: HashMap<iris_ztd::Digest, Vec<Debit>> = HashMap::new();
-        for row in rows {
-            by_tx.entry(*row.txid).or_default().push(row);
-        }
-
-        let selected_tx = by_tx
-            .iter()
-            .find_map(|(txid, ds)| {
-                if !ds.is_empty() && ds.iter().all(|d| d.sole_owner) {
-                    Some(*txid)
-                } else {
-                    None
-                }
-            })
-            .expect("at least one all-sole-owner tx exists");
-
-        let selected_debits = by_tx.get(&selected_tx).expect("debits for tx");
-        let debit_amount_sum: i64 = selected_debits.iter().map(|d| d.amount).sum();
-        let fee_sum: i64 = selected_debits.iter().map(|d| d.fee).sum();
-
-        let credit_amount_sum = credits::table
-            .filter(credits::txid.eq(DbDigest(selected_tx)))
-            .select(credits::amount)
-            .load::<i64>(&mut conn)
-            .await
-            .expect("load credits for tx")
-            .into_iter()
-            .sum::<i64>();
-
-        assert_eq!(debit_amount_sum, credit_amount_sum + fee_sum);
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn test_l4_recipient_type_valid() {
-        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
-            eprintln!("Skipping test_l4_recipient_type_valid: TEST_DB_PATH not set");
-            return;
-        };
-
-        run_l4_range(&client, &mut conn, 9740, 9750).await;
-
-        let rows = credits::table
-            .load::<Credit>(&mut conn)
-            .await
-            .expect("load credits");
-        assert!(!rows.is_empty());
-        for row in rows {
-            assert!(matches!(row.recipient_type.as_str(), "pk" | "v0pk" | "pkh" | "lock"));
-            assert!(!row.recipient.is_empty());
-        }
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn test_l4_coinbase_credits_exist() {
-        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
-            eprintln!("Skipping test_l4_coinbase_credits_exist: TEST_DB_PATH not set");
-            return;
-        };
-
-        run_l4_range(&client, &mut conn, 0, 5).await;
-
-        let rows = coinbase_credits::table
-            .filter(coinbase_credits::height.le(5))
-            .load::<CoinbaseCredit>(&mut conn)
-            .await
-            .expect("load coinbase credits");
-        assert!(!rows.is_empty());
-        for row in rows {
-            assert!(row.amount > 0);
-            assert!(matches!(row.recipient_type.as_str(), "pk" | "v0pk" | "pkh" | "lock"));
-            assert!(!row.recipient.is_empty());
-        }
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn test_l4_coinbase_credits_expire() {
-        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
-            eprintln!("Skipping test_l4_coinbase_credits_expire: TEST_DB_PATH not set");
-            return;
-        };
-
-        run_l4_range(&client, &mut conn, 0, 10).await;
-        let rollback = 5i32;
-        client
-            .expire_blocks(
-                &mut conn,
-                FixedLayerMetadata {
-                    layer: "l3",
-                    next_block_height: rollback,
-                },
-            )
-            .await
-            .expect("expire l4");
-
-        let high = coinbase_credits::table
-            .filter(coinbase_credits::height.ge(rollback))
-            .select(count_star())
-            .first::<i64>(&mut conn)
-            .await
-            .expect("count high coinbase credits");
-        assert_eq!(high, 0);
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn test_l4_full_balance() {
-        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
-            eprintln!("Skipping test_l4_full_balance: TEST_DB_PATH not set");
-            return;
-        };
-
-        run_l4_range(&client, &mut conn, 5629, 9750).await;
-
-        let pk_types = vec!["pk", "v0pk"];
-
-        let candidate_pk = coinbase_credits::table
-            .inner_join(debits::table.on(
-                diesel::dsl::sql::<diesel::sql_types::Bool>("coinbase_credits.recipient = debits.pk")
-                    .and(coinbase_credits::recipient_type.eq_any(&pk_types))
-                    .and(debits::sole_owner.eq(true)),
-            ))
-            .select(debits::pk)
-            .first::<DbPublicKey>(&mut conn)
-            .await;
-
-        let Ok(pk) = candidate_pk else {
-            eprintln!("Skipping test_l4_full_balance: no pk found in both coinbase_credits and debits");
-            let _ = std::fs::remove_file(path);
-            return;
-        };
-
-        let tx_received = credits::table
-            .filter(credits::recipient_type.eq_any(&pk_types).and(credits::recipient.eq(pk.to_string())))
-            .select(credits::amount)
-            .load::<i64>(&mut conn)
-            .await
-            .expect("load tx credits")
-            .into_iter()
-            .sum::<i64>();
-        let coinbase_received = coinbase_credits::table
-            .filter(
-                coinbase_credits::recipient_type
-                    .eq_any(&pk_types)
-                    .and(coinbase_credits::recipient.eq(pk.to_string())),
-            )
-            .select(coinbase_credits::amount)
-            .load::<i64>(&mut conn)
-            .await
-            .expect("load coinbase credits")
-            .into_iter()
-            .sum::<i64>();
-        let spent_amount = debits::table
-            .filter(debits::pk.eq(pk).and(debits::sole_owner.eq(true)))
-            .load::<Debit>(&mut conn)
-            .await
-            .expect("load debits")
-            .into_iter()
-            .map(|d| d.amount)
-            .sum::<i64>();
-
-        let balance = tx_received + coinbase_received - spent_amount;
-        assert!(balance >= 0);
-
-        let _ = std::fs::remove_file(path);
     }
 }

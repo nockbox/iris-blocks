@@ -1,7 +1,7 @@
 use clap::Parser;
 
-use crate::{db, query};
-use super::{OutputFormat, serialize_json, truncate_cell, print_section, print_kv};
+use super::{print_kv, print_section, serialize_json, truncate_cell, OutputFormat};
+use crate::{accounting::query, db};
 
 #[derive(Debug, Parser, Clone)]
 pub struct TxArgs {
@@ -28,12 +28,6 @@ pub fn print_tx_text(tx: &query::TransactionDetail) {
     print_kv("block_id", &tx.block_id);
     print_kv("block_height", tx.block_height);
     print_kv("block_timestamp", tx.block_timestamp);
-    print_kv(
-        "block_unix_timestamp",
-        tx.block_unix_timestamp
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "invalid".to_string()),
-    );
     print_kv("block_time_utc", &tx.block_time_utc);
     print_kv("version", tx.version);
     print_kv("fee_nicks", tx.fee_nicks);
@@ -81,15 +75,15 @@ pub fn print_tx_text(tx: &query::TransactionDetail) {
 
     print_section(&format!("Credits ({})", tx.credits.len()));
     println!(
-        "{:<4} {:<10} {:<40} {:>14} {:>12} {:<25}",
-        "idx", "rtype", "recipient", "amount_nicks", "block_height", "block_time_utc"
+        "{:<55} {:<10} {:<40} {:>14} {:>12} {:<25}",
+        "first", "rtype", "recipient", "amount_nicks", "block_height", "block_time_utc"
     );
     for c in &tx.credits {
         println!(
-            "{:<4} {:<10} {:<40} {:>14} {:>12} {:<25}",
-            c.idx,
-            c.recipient_type,
-            truncate_cell(&c.recipient, 40),
+            "{:<55} {:<10} {:<40} {:>14} {:>12} {:<25}",
+            truncate_cell(&c.first, 55),
+            c.recipient_type.as_deref().unwrap_or("-"),
+            truncate_cell(c.recipient.as_deref().unwrap_or("-"), 40),
             c.amount_nicks,
             c.block_height,
             truncate_cell(&c.block_time_utc, 25)
@@ -98,14 +92,13 @@ pub fn print_tx_text(tx: &query::TransactionDetail) {
 
     print_section(&format!("Debits ({})", tx.debits.len()));
     println!(
-        "{:<80} {:<10} {:>14} {:>12} {:>12} {:<25}",
-        "pk", "sole_owner", "amount_nicks", "fee_nicks", "block_height", "block_time_utc"
+        "{:<55} {:>14} {:>12} {:>12} {:<25}",
+        "first", "amount_nicks", "fee_nicks", "block_height", "block_time_utc"
     );
     for d in &tx.debits {
         println!(
-            "{:<80} {:<10} {:>14} {:>12} {:>12} {:<25}",
-            truncate_cell(&d.pk, 80),
-            d.sole_owner,
+            "{:<55} {:>14} {:>12} {:>12} {:<25}",
+            truncate_cell(&d.first, 55),
             d.amount_nicks,
             d.fee_nicks,
             d.block_height,

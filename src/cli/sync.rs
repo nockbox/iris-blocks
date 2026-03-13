@@ -68,12 +68,16 @@ impl SyncArgs {
             Some(uri) => uri,
             None => {
                 eprintln!("No connection URI provided. Syncing upper layers once.");
-                let l0_metadata = L0Client::<NockAppServiceClient<Channel>>::layer_metadata(&mut conn)
-                    .await?.unwrap();
-                l1_client.update_blocks(&mut conn, l0_metadata).await
+                let l0_metadata =
+                    L0Client::<NockAppServiceClient<Channel>>::layer_metadata(&mut conn)
+                        .await?
+                        .unwrap();
+                l1_client
+                    .update_blocks(&mut conn, l0_metadata)
+                    .await
                     .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
                 return Ok(());
-            },
+            }
         };
         let scry = Some(NockAppServiceClient::new(
             Channel::builder(connect).connect().await?,
