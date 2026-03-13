@@ -6,7 +6,7 @@ use diesel::prelude::*;
 // Schema
 // ---------------------------------------------------------------------------
 
-use crate::layers::shared_schema::{BlockId, TxId};
+use crate::layers::shared_schema::DbDigest;
 
 diesel::table! {
     use diesel::sql_types::*;
@@ -48,10 +48,10 @@ diesel::allow_tables_to_appear_in_same_query!(blocks, transactions);
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = blocks, treat_none_as_default_value = false)]
 pub struct Block {
-    pub id: BlockId,
+    pub id: DbDigest,
     pub height: i32,
     pub version: i32,
-    pub parent: BlockId,
+    pub parent: DbDigest,
     pub timestamp: i64,
     pub msg: Option<String>,
     pub jam: Vec<u8>,
@@ -60,10 +60,10 @@ pub struct Block {
 #[derive(Debug, Clone, Queryable, Selectable)]
 #[diesel(table_name = blocks)]
 pub struct JamlessBlock {
-    pub id: BlockId,
+    pub id: DbDigest,
     pub height: i32,
     pub version: i32,
-    pub parent: BlockId,
+    pub parent: DbDigest,
     pub timestamp: i64,
     pub msg: Option<String>,
 }
@@ -71,8 +71,8 @@ pub struct JamlessBlock {
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = transactions, treat_none_as_default_value = false)]
 pub struct Transaction {
-    pub id: TxId,
-    pub block_id: BlockId,
+    pub id: DbDigest,
+    pub block_id: DbDigest,
     pub height: i32,
     pub version: i32,
     pub fee: i64,

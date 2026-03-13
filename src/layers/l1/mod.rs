@@ -4,7 +4,7 @@ use super::{l0::schema::*, layer::*, shared_schema::*};
 use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use iris_nockchain_types::{Nicks, Page, RawTx};
+use iris_nockchain_types::{Nicks, Page, Tx};
 use iris_ztd::{cue, NounDecode};
 use log::*;
 use schema::*;
@@ -77,8 +77,8 @@ impl LayerImpl for L1Client {
             .filter(notes::spent_height.ge(metadata.next_block_height))
             .set((
                 notes::spent_height.eq(None::<i32>),
-                notes::spent_bid.eq(None::<BlockId>),
-                notes::spent_txid.eq(None::<TxId>),
+                notes::spent_bid.eq(None::<DbDigest>),
+                notes::spent_txid.eq(None::<DbDigest>),
             ))
             .execute(conn)
             .await?;
@@ -95,6 +95,9 @@ impl LayerImpl for L1Client {
         metadata: FixedLayerMetadata,
     ) -> Result<(), LayerErrorSource> {
         if metadata.next_block_height == 0 {
+            for dep in &self.deps {
+                dep.update_blocks(conn, metadata).await?;
+            }
             return Ok(());
         }
 
@@ -106,6 +109,10 @@ impl LayerImpl for L1Client {
         let end_block_height = metadata.next_block_height as u32 - 1;
 
         if start_block_height > end_block_height {
+            let dep_metadata = cur_metadata.unwrap_or(metadata);
+            for dep in &self.deps {
+                dep.update_blocks(conn, dep_metadata).await?;
+            }
             return Ok(());
         }
 
@@ -122,11 +129,15 @@ impl LayerImpl for L1Client {
         let constants = self.activations.constants();
 
         let step = 100u32;
+        let mut cur_metadata = FixedLayerMetadata {
+            layer: Self::LAYER,
+            next_block_height: start_block_height as i32,
+        };
 
         for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
             let block_range_span =
                 tracing::info_span!("l1_update_block_range", block_height, end_block_height);
-            trace!("Syncing block {block_height}");
+            // trace!("Syncing block {block_height}");
             let last_block_height = core::cmp::min(block_height + step - 1, end_block_height);
 
             let block_span =
@@ -164,20 +175,20 @@ impl LayerImpl for L1Client {
                             .await?;
 
                         for tx in txs {
-                            let raw =
-                                RawTx::from_noun(&cue(&tx.jam).ok_or(LayerErrorSource::NounCue(block_height, *tx.id))?)
+                            let vtx =
+                                Tx::from_noun(&cue(&tx.jam).ok_or(LayerErrorSource::NounCue(block_height, *tx.id))?)
                                     .ok_or(LayerErrorSource::NounDecode(block_height, *tx.id))?;
-                            let outputs = raw.outputs(block_height, self.activations.tx_engine(block_height));
+                            let outputs = vtx.outputs().notes();
                             let fees = Nicks::from(tx.fee as u64);
 
-                            let names = raw.input_names();
+                            let names = vtx.input_names();
 
                             let names_cond = names
                                 .iter()
                                 .map(|n| {
                                     notes::first
-                                        .eq(NoteName(n.first))
-                                        .and(notes::last.eq(NoteName(n.last)))
+                                        .eq(DbDigest(n.first))
+                                        .and(notes::last.eq(DbDigest(n.last)))
                                 })
                                 .collect::<Vec<_>>();
 
@@ -238,10 +249,11 @@ impl LayerImpl for L1Client {
                             crate::rt::yield_now().await;
                         }
 
-                        let metadata = FixedLayerMetadata {
+                        cur_metadata = FixedLayerMetadata {
                             layer: Self::LAYER,
                             next_block_height: block_height as i32 + 1,
                         };
+                        let metadata = cur_metadata;
 
                         conn.spawn_blocking(move |conn| {
                             use diesel::query_dsl::methods::ExecuteDsl;
@@ -288,6 +300,10 @@ impl LayerImpl for L1Client {
                 }
                 .instrument(block_range_span)
                 .await?;
+        }
+
+        for dep in &self.deps {
+            dep.update_blocks(conn, cur_metadata).await?;
         }
 
         Ok(())

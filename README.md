@@ -1,52 +1,82 @@
-# Layered Nockchain Block Exporter / API
+# Layered Nockchain Indexer and Query CLI
 
-Iris Blocks is built on iris and incrementally builds an accurate database representation of the nockchain network. From there it exposes nockchain's public and (subset of) private APIs for querying data from this cached state.
+`iris-blocks` incrementally syncs nockchain data into a local SQLite database and exposes query commands over that indexed state.
 
-Iris Blocks builds the database in layers, (often) each depending on the previous ones. Reorgs are handled by L0 invalidations cascading up the graph of layers.
+The database is built in layers (`l0` -> `l4`) where each layer depends on the previous one. Reorgs are handled by cascading invalidation from `l0` upwards.
 
-## Running
+## CLI
 
-> [!WARNING]
-> The project is not done, it may not be supported, **you will not get any support.**
-> Use at your own risk
-
-Run by pointing to a private nockchain gRPC API:
-
-```
-RUST_LOG=info,iris_blocks=debug cargo run --release -- --connect http://localhost:5555 --run-migrations --store-pow=false
+```bash
+iris-blocks --help
 ```
 
-> [!NOTE]
-> If you have support for `%heaviest-chain-blocks-range-no-pow` scry (PR TBD), then you can also add `--block-range-scry-no-pow` and enjoy extra speed.
+### From source (Cargo)
 
-Run by supplying database, and no gRPC:
+The CLI binary target is feature-gated. Use `--features binary` when running from source:
 
-```
-RUST_LOG=info,iris_blocks=debug cargo run --release -- --db nockchain.sqlite
-```
+```bash
+# Show CLI help
+cargo +nightly run --features binary -- --help
 
-Once you have it up, you may connect to the database using `sqlite3`:
-
-```
-$ sqlite3 nockchain.sqlite
-SQLite version 3.50.4 2025-07-30 19:33:53
-Enter ".help" for usage hints.
-sqlite> .tables
-__diesel_schema_migrations  notes
-blocks                      transactions
-layer_metadata
-sqlite>
+# Example query
+cargo +nightly run --features binary -- \
+  --db nockchain.sqlite \
+  balance <address>
 ```
 
-Trigger reset at layer:
+Commands:
 
+- `sync`: connect to a node and update local DB state
+- `balance <address>`: wallet balance view (ground truth from unspent notes)
+- `tx <txid>`: transaction drilldown (spends, outputs, signers, credits, debits)
+- `block <height-or-id>`: block metadata, tx list, coinbase credits
+- `status`: layer cursors + key table row counts
+- `audit <address>`: wallet audit with selectable text/json view (`--view summary|notes|both`), plus CSV exports for summary (`--csv`) and detailed notes based export (`--csv-notes`)
+
+### Data sources
+
+- Local file mode (query commands): `--db <path>` points to a SQLite file
+- Node mode (sync): `sync --connect <grpc-uri>`
+
+Examples:
+
+```bash
+# Initialize/upgrade schema locally (no node sync)
+iris-blocks --db nockchain.sqlite sync --run-migrations
+
+# Sync from node
+iris-blocks --db nockchain.sqlite sync --connect http://localhost:5555 --run-migrations
+
+# Query by PKH or legacy V0 key
+iris-blocks --db nockchain.sqlite balance <address>
+iris-blocks --db nockchain.sqlite audit <address> --csv wallet_flow_summary.csv
+
+# Audit text/json view selection:
+iris-blocks --db nockchain.sqlite audit <address> --view summary
+iris-blocks --db nockchain.sqlite audit <address> --format json --view notes
+iris-blocks --db nockchain.sqlite audit <address> --view both
+
+# Auto-name summary CSV in current directory:
+# nockchain_transactions_<address>.csv
+iris-blocks --db nockchain.sqlite audit <address> --csv
+
+# Auto-name detailed notes CSV:
+# nockchain_notes_<address>.csv
+iris-blocks --db nockchain.sqlite audit <address> --csv-notes
+
+# Write auto-named summary CSV into a directory:
+iris-blocks --db nockchain.sqlite audit <address> --csv /path/to/output-dir/
+
+# Write both summary and detailed CSV in one run:
+iris-blocks --db nockchain.sqlite audit <address> \
+  --csv /path/to/output-dir/ \
+  --csv-notes /path/to/output-dir/
 ```
-sqlite> delete from layer_metadata where layer = "l1";
-```
 
-Deleting l1 metadata will force all downstream layers to resync. Deleting l0 will require full resync from gRPC.
+## Units
 
-You may also overwrite the next_block_height to force rollback to a particular block.
+- All amounts are represented in **nicks**.
+- This repository does not convert values to NOCK in CLI output.
 
 ## Wasm
 
@@ -54,6 +84,18 @@ You may build this as a wasm module with:
 
 ```
 wasm-pack build --features=wasm --target web --out-dir pkg --scope nockbox
+```
+
+If you run a direct wasm target check (`cargo +nightly check --features wasm --target wasm32-unknown-unknown`),
+`sqlite-wasm-rs` requires a wasm-capable clang toolchain (Apple clang alone is not enough).
+One working approach:
+
+```bash
+nix shell nixpkgs#llvmPackages_18.clang nixpkgs#llvmPackages_18.llvm -c sh -lc '
+  export CC_wasm32_unknown_unknown="$(command -v clang)"
+  export AR_wasm32_unknown_unknown="$(command -v llvm-ar)"
+  cargo +nightly check --features wasm --target wasm32-unknown-unknown
+'
 ```
 
 And then use it with:
@@ -66,99 +108,78 @@ const e = await new BlockExporter(["l0", "l1"], ":memory:", true, "http://localh
 
 Data is not persisted.
 
-## Layers
+## Layer Summary
 
 ### L0
 
-This layer tracks blocks and transactions.
+Canonical block/transaction storage.
 
-Schema:
-
-```
-blocks:
-id (base58 not null), height (u32 not null), version (u8 not null), parent (base58 not null), timestamp (u64 not null), msg (varchar), jam (bytes not null)
-
-transactions:
-id (base58 not null), block_id (base58 not null), height (u32 not null), version (u8 not null), fee (u64 not null), jam (bytes not null)
-```
+- `blocks`: PK (`id`), UNIQUE (`height`), `version`, UNIQUE (`parent`), `timestamp`, `msg`, `jam`
+- `transactions`: PK (`id`), `block_id`, `height`, `version`, `fee`, `total_size`, `jam`
 
 ### L1
 
-This layer tracks active and spent balance (notes) of the chain.
+Note lifecycle (created/spent/unspent notes).
 
-Schema:
+- `notes`: PK (`first`, `last`), `version`, `assets`, `coinbase`, `created_*`, `spent_*`, `jam`
 
-```
-notes:
-first (base58 not null), last (base58 not null), version (u8 not null), assets (u64 not null), coinbase (bool not null), created_txid (base58), spent_txid (base58), created_height (u32 not null), spent_height (u32), created_bid (base58 not null), spent_bid (base58), jam (bytes not null)
-```
+### L2
 
-### L2 (TODO)
+#### L2.1
 
-This layer parses additional information about transactions, such as inputs and outputs, with their exact ordering.
+Transaction internals and ordering.
 
-Schema:
+- `tx_spends`: PK (`txid`, `z`), `version`, UNIQUE (`first`, `last`), `fee`, `height`
+- `tx_seeds`: PK (`txid`, `z`, `idx`), `amount`, `first`, `height`
+- `tx_outputs`: PK (`txid`, `idx`), UNIQUE (`first`, `last`), `assets`, `height`
+- `tx_signers`: PK (`txid`, `z`, `pk`), `height`
 
-```
-tx_spends:
-txid (base58 not null), z (u32 not null), version (u8 not null), first (base58 not null), last (base58 not null), fee (u64 not null)
+#### L2.2
 
-tx_seeds:
-txid (base58 not null), idx (u32 not null), amount (u64 not null), first (base58 not null)
+Hash reversals.
 
-tx_outputs:
-txid (base58 not null), idx (u32 not null), first (base58 not null), last (base58 not null), assets (u64 not null)
+- `name_to_lock`: PK (`first`), UNIQUE (`root`), `height`, `block_id`
+- `pkh_to_pk`: PK (`pkh`), UNIQUE (`pk`), `height`, `block_id`
 
-tx_signers:
-txid (base58 not null), z (u32 not null), pk (base58 pk not null)
-```
+#### L2.3
 
-### L3 (TODO)
+Spend condition retrieval.
 
-This layer tracks mapping between locks, signers, and notes.
+- `lock_tree`: PK (`root`), `height`, `axis`, `hash`
+- `spend_conditions`: PK (`hash`), UNIQUE (`txid`, `z`), `height`, `jam`
 
-Schema:
+### L3
 
-```
-lock_names:
-root (base58 not null), first (base58 not null)
+Double entry accounting ledger.
 
-locks:
-root (base58 not null), idx (u32 not null), hash (base58 not null), jam (bytes)
+- `credits`: PK (NULLABLE (`txid`), `first`, `height`), `block_id`, `amount`
+- `debits`: PK (NULLABLE (`txid`), NULLABLE (`first`), `height`), `block_id`, `amount`, `fee`
 
-lock_paths:
-root (base58 not null), axis (u32 not null), hash (base58 not null)
+_Null txid/first imply coinbase_
 
-lock_owners - observed owners of a particular lock root (including coinbase, v1):
-root (base58 not null), pkh (base58 not null)
+### L4
 
-name_owners - observed owners of a particular note name (including coinbase, v0, v1):
-first (base58 not null), pkh (base58 not null)
+Additional accounting information, more frequently recomputed.
 
-pk_to_pkh:
-pk (base58 pk not null), pkh (base58 not null)
-```
+- `credit_info`: PK (`txid`, `first`, `height`), `updated_height`, `recipient_type`, `recipient`
 
-### L4 (TODO)
+_Reset behavior is as follows: collect all rows where `updated_height >= next_block_height`, and set L4's `next_block_height` to the minimum of `height` in the row set._
 
-This layer builds a double-entry accounting ledger of transactions.
+_Update behavior is as follows: collect all new spend conditions within the range `[local_next_block_height, next_block_height)`, and for each related name (transitively through matching lock trees of SP), update the corresponding `credit_info` rows._
 
-Schema:
+## Recipients
 
-```
-debits:
-txid (base58 not null), pk (base58 pk not null), sole_owner (bool not null), amount (u64 not null), fee (u64 not null)
+- `pk`: resolved or v0 public key recipient
+- `pkh`: public key hash recipient
+- `lock`: unresolved or multi-owner lock-level recipient
+- `musig`: multi-sig recipient
 
-credits:
-txid (base58 not null), recipient_type (pk | pkh | lock | bridge lock), recipient (base58 not null), amount (u64 not null)
+## Address mapping model
+
+Observed mapping chain:
+
+```text
+pk -> pkh -> lock -> name(first)
 ```
 
-## Mappings
-
-There's one-way mapping from PKHs to note names, illustrated as follows:
-
-```
-pk -> pkh -> lock -> name
-```
-
-The system observes transactions and aims to rebuild backwards mapping from name to pk. If such mapping exists, this is represented in `name_owners`, `lock_names`, and `pk_to_pkh` tables. There is always a mapping from name to lock.
+For full schema details, joins, and query patterns, see [docs/SCHEMA.md](docs/SCHEMA.md).

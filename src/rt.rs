@@ -24,6 +24,8 @@ mod imp {
 
     pub trait RtBound: Send {}
     impl<T: ?Sized + Send> RtBound for T {}
+    pub trait RtSync: Sync {}
+    impl<T: ?Sized + Sync> RtSync for T {}
 
     pub type RtFuture<'a, T> = dyn Future<Output = T> + Send + 'a;
 
@@ -43,7 +45,6 @@ mod imp {
 #[cfg(feature = "wasm")]
 mod imp {
     use super::*;
-    use wasm_bindgen::convert::IntoWasmAbi;
     use wasm_bindgen_futures::*;
 
     pub async fn sleep(duration: std::time::Duration) {
@@ -69,10 +70,34 @@ mod imp {
 
     pub trait RtBound {}
     impl<T: ?Sized> RtBound for T {}
+    pub trait RtSync {}
+    impl<T: ?Sized> RtSync for T {}
 
     pub type RtFuture<'a, T> = dyn Future<Output = T> + 'a;
 
     pub async fn yield_now() {
         sleep(std::time::Duration::from_millis(1)).await;
     }
+}
+
+#[cfg(not(any(feature = "tokio", feature = "wasm")))]
+mod imp {
+    use super::*;
+
+    pub async fn sleep(_duration: std::time::Duration) {}
+
+    pub fn spawn<F: core::future::Future + RtBound + 'static>(_f: F) {}
+
+    pub async fn spawn_blocking<R, T: FnOnce() -> R + RtBound + 'static>(f: T) -> R {
+        f()
+    }
+
+    pub trait RtBound {}
+    impl<T: ?Sized> RtBound for T {}
+    pub trait RtSync {}
+    impl<T: ?Sized> RtSync for T {}
+
+    pub type RtFuture<'a, T> = dyn Future<Output = T> + 'a;
+
+    pub async fn yield_now() {}
 }

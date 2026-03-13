@@ -1,0 +1,8 @@
+DROP TABLE IF EXISTS spend_conditions;
+DROP TABLE IF EXISTS lock_tree;
+DROP TABLE IF EXISTS pkh_to_pk;
+DROP TABLE IF EXISTS name_to_lock;
+DROP TABLE IF EXISTS tx_signers;
+DROP TABLE IF EXISTS tx_outputs;
+DROP TABLE IF EXISTS tx_seeds;
+DROP TABLE IF EXISTS tx_spends;

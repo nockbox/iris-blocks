@@ -1,5 +1,5 @@
 use super::shared_schema;
-use crate::rt::RtBound;
+use crate::rt::{RtBound, RtSync};
 use core::future::Future;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -155,7 +155,7 @@ pub trait LayerImpl: Layer {
 
 #[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
 #[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
-pub trait LayerDependency: Layer + RtBound + Sync {
+pub trait LayerDependency: Layer + RtBound + RtSync {
     async fn expire_blocks(
         &self,
         conn: &mut crate::db::AsyncDbConnection,
@@ -170,7 +170,7 @@ pub trait LayerDependency: Layer + RtBound + Sync {
 
 #[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
 #[cfg_attr(not(feature = "wasm"), async_trait::async_trait)]
-impl<T: ?Sized + LayerImpl + RtBound + Sync> LayerDependency for T {
+impl<T: ?Sized + LayerImpl + RtBound + RtSync> LayerDependency for T {
     #[tracing::instrument(skip_all)]
     async fn expire_blocks(
         &self,

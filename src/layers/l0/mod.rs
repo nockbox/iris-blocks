@@ -11,7 +11,6 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt, StreamExt};
-use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;
 use iris_nockchain_types::BlockHeight;
 use iris_ztd::{jam, Digest, NounEncode};
 use log::*;
@@ -20,8 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::watch;
-#[cfg(feature = "tokio")]
-use tonic::transport::Channel;
 
 mod block_range_manager;
 use block_range_manager::BlockRangeManager;
@@ -32,6 +29,8 @@ pub struct L0Config {
     pub block_range_config: block_range_manager::BlockRangeConfig,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub store_pow: bool,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub verify_outputs: bool,
 }
 
 impl Default for L0Config {
@@ -39,6 +38,7 @@ impl Default for L0Config {
         Self {
             block_range_config: Default::default(),
             store_pow: false,
+            verify_outputs: true,
         }
     }
 }
@@ -103,6 +103,8 @@ pub enum L0Error {
     LayerError(#[from] LayerError),
     #[error("gRPC connection needed, but not provided")]
     GrpcNeeded,
+    #[error("numeric value out of range for {field}: {value}")]
+    ValueOutOfRange { field: &'static str, value: u64 },
 }
 
 impl From<ScryError> for L0Error {
@@ -116,6 +118,14 @@ impl From<ScryError> for L0Error {
 }
 
 impl<S: Scryable> L0Client<S> {
+    fn checked_u64_to_i64(value: u64, field: &'static str) -> Result<i64, L0Error> {
+        i64::try_from(value).map_err(|_| L0Error::ValueOutOfRange { field, value })
+    }
+
+    fn checked_u64_to_i32(value: u64, field: &'static str) -> Result<i32, L0Error> {
+        i32::try_from(value).map_err(|_| L0Error::ValueOutOfRange { field, value })
+    }
+
     pub fn new(
         conn: AsyncDbConnection,
         client: Option<S>,
@@ -316,27 +326,32 @@ impl<S: Scryable> L0Client<S> {
                 height: height as _,
                 version: block.version() as _,
                 parent: block.parent().into(),
-                timestamp: block.timestamp() as _,
+                timestamp: Self::checked_u64_to_i64(
+                    block.timestamp().as_unix_seconds().unwrap(),
+                    "blocks.timestamp",
+                )?,
                 msg: block.msg().try_into().ok(),
                 jam: jam(block.to_noun()),
             });
             for (txid, tx) in txs {
                 let rtx = tx.raw();
 
-                let mut chain_outputs = tx.outputs().notes();
-                chain_outputs.sort_by_key(|n| n.name());
-                let mut outputs = rtx.outputs(height, self.activations.tx_engine(height));
-                outputs.sort_by_key(|n| n.name());
+                if self.config.verify_outputs {
+                    let mut chain_outputs = tx.outputs().notes();
+                    chain_outputs.sort_by_key(|n| n.name());
+                    let mut outputs = rtx.outputs(height, self.activations.tx_engine(height));
+                    outputs.sort_by_key(|n| n.name());
 
-                // Verify that iris computes outputs correctly
-                if chain_outputs != outputs {
-                    trace!(
-                        "Transaction {} invalid.\nChain outputs: {:?}\nComputed outputs: {:?}",
-                        txid,
-                        chain_outputs,
-                        outputs
-                    );
-                    return Err(L0Error::TransactionInvalid(txid, height, bid));
+                    // Verify that iris computes outputs correctly
+                    if chain_outputs != outputs {
+                        trace!(
+                            "Transaction {} invalid.\nChain outputs: {:?}\nComputed outputs: {:?}",
+                            txid,
+                            chain_outputs,
+                            outputs
+                        );
+                        return Err(L0Error::TransactionInvalid(txid, height, bid));
+                    }
                 }
 
                 create_txs.push(Transaction {
@@ -344,9 +359,12 @@ impl<S: Scryable> L0Client<S> {
                     block_id: bid.into(),
                     height: height as _,
                     version: rtx.version() as _,
-                    fee: rtx.total_fees().0 as _,
-                    total_size: tx.total_size() as _,
-                    jam: jam(rtx.to_noun()),
+                    fee: Self::checked_u64_to_i64(rtx.total_fees().0, "transactions.fee")?,
+                    total_size: Self::checked_u64_to_i32(
+                        tx.total_size() as u64,
+                        "transactions.total_size",
+                    )?,
+                    jam: jam(tx.to_noun()),
                 });
 
                 crate::rt::yield_now().await;
@@ -437,7 +455,7 @@ impl<S: Scryable> L0Client<S> {
                         .await;
                 }
                 Err(e) => {
-                    error!("Error updating blocks: {e}");
+                    error!("Error updating blocks: {e:?}");
                     self.sleep_and_process_queries(std::time::Duration::from_secs(30))
                         .await;
                 }

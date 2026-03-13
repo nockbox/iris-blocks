@@ -14,9 +14,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use std::sync::OnceLock;
 
-use tracing_subscriber::{
-    layer::SubscriberExt, prelude::*, reload, util::SubscriberInitExt, EnvFilter,
-};
+use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
 
 static LOG_FILTER_HANDLE: OnceLock<reload::Handle<EnvFilter, tracing_subscriber::Registry>> =
     OnceLock::new();
@@ -75,6 +73,7 @@ impl BlockExporter {
         db_run_migrations: bool,
         private_grpc_connecct: Option<String>,
         scry_no_pow: bool,
+        verify_outputs: bool,
     ) -> Result<Self, JsValue> {
         Self::new_impl(
             layers,
@@ -82,6 +81,7 @@ impl BlockExporter {
             db_run_migrations,
             private_grpc_connecct,
             scry_no_pow,
+            verify_outputs,
         )
         .await
         .map_err(|e| JsValue::from(e.to_string()))
@@ -93,6 +93,7 @@ impl BlockExporter {
         db_run_migrations: bool,
         private_grpc_connecct: Option<String>,
         scry_no_pow: bool,
+        verify_outputs: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         log::info!("Starting block exporter");
 
@@ -142,6 +143,7 @@ impl BlockExporter {
         let mut cfg = L0Config::default();
         cfg.store_pow = false;
         cfg.block_range_config.block_range_scry_no_pow = scry_no_pow;
+        cfg.verify_outputs = verify_outputs;
         let (l0_client, query_tx) = L0Client::new(conn, scry, cfg, activations.clone(), l0_deps);
         let l0_stats = Some(l0_client.stats_handle());
 

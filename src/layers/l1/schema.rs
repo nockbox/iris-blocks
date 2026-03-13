@@ -2,7 +2,7 @@
 
 use crate::layers::{
     l0::schema::{Block, Transaction},
-    shared_schema::{BlockId, NoteName, TxId},
+    shared_schema::DbDigest,
 };
 use diesel::prelude::*;
 
@@ -37,17 +37,17 @@ diesel::table! {
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = notes, treat_none_as_default_value = false)]
 pub struct Note {
-    pub first: NoteName,
-    pub last: NoteName,
+    pub first: DbDigest,
+    pub last: DbDigest,
     pub version: i32,
     pub assets: i64,
     pub coinbase: bool,
-    pub created_txid: Option<TxId>,
-    pub spent_txid: Option<TxId>,
+    pub created_txid: Option<DbDigest>,
+    pub spent_txid: Option<DbDigest>,
     pub created_height: i32,
     pub spent_height: Option<i32>,
-    pub created_bid: BlockId,
-    pub spent_bid: Option<BlockId>,
+    pub created_bid: DbDigest,
+    pub spent_bid: Option<DbDigest>,
     pub jam: Vec<u8>,
 }
 
@@ -92,9 +92,9 @@ impl Note {
 #[derive(Debug, Clone, Queryable, Selectable, AsChangeset, Identifiable)]
 #[diesel(table_name = notes, primary_key(first, last), treat_none_as_default_value = false)]
 pub struct SpendNote {
-    pub first: NoteName,
-    pub last: NoteName,
+    pub first: DbDigest,
+    pub last: DbDigest,
     pub spent_height: i32,
-    pub spent_bid: BlockId,
-    pub spent_txid: TxId,
+    pub spent_bid: DbDigest,
+    pub spent_txid: DbDigest,
 }
