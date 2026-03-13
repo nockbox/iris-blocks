@@ -77,8 +77,8 @@ impl LayerImpl for L1Client {
             .filter(notes::spent_height.ge(metadata.next_block_height))
             .set((
                 notes::spent_height.eq(None::<i32>),
-                notes::spent_bid.eq(None::<BlockId>),
-                notes::spent_txid.eq(None::<TxId>),
+                notes::spent_bid.eq(None::<DbDigest>),
+                notes::spent_txid.eq(None::<DbDigest>),
             ))
             .execute(conn)
             .await?;
@@ -95,14 +95,8 @@ impl LayerImpl for L1Client {
         metadata: FixedLayerMetadata,
     ) -> Result<(), LayerErrorSource> {
         if metadata.next_block_height == 0 {
-            let dep_metadata = Self::layer_metadata(conn)
-                .await?
-                .unwrap_or(FixedLayerMetadata {
-                    layer: Self::LAYER,
-                    next_block_height: 0,
-                });
             for dep in &self.deps {
-                dep.update_blocks(conn, dep_metadata).await?;
+                dep.update_blocks(conn, metadata).await?;
             }
             return Ok(());
         }
@@ -115,12 +109,7 @@ impl LayerImpl for L1Client {
         let end_block_height = metadata.next_block_height as u32 - 1;
 
         if start_block_height > end_block_height {
-            let dep_metadata = Self::layer_metadata(conn)
-                .await?
-                .unwrap_or(FixedLayerMetadata {
-                    layer: Self::LAYER,
-                    next_block_height: 0,
-                });
+            let dep_metadata = cur_metadata.unwrap_or(metadata);
             for dep in &self.deps {
                 dep.update_blocks(conn, dep_metadata).await?;
             }
@@ -140,6 +129,10 @@ impl LayerImpl for L1Client {
         let constants = self.activations.constants();
 
         let step = 100u32;
+        let mut cur_metadata = FixedLayerMetadata {
+            layer: Self::LAYER,
+            next_block_height: start_block_height as i32,
+        };
 
         for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
             let block_range_span =
@@ -194,8 +187,8 @@ impl LayerImpl for L1Client {
                                 .iter()
                                 .map(|n| {
                                     notes::first
-                                        .eq(NoteName(n.first))
-                                        .and(notes::last.eq(NoteName(n.last)))
+                                        .eq(DbDigest(n.first))
+                                        .and(notes::last.eq(DbDigest(n.last)))
                                 })
                                 .collect::<Vec<_>>();
 
@@ -256,10 +249,11 @@ impl LayerImpl for L1Client {
                             crate::rt::yield_now().await;
                         }
 
-                        let metadata = FixedLayerMetadata {
+                        cur_metadata = FixedLayerMetadata {
                             layer: Self::LAYER,
                             next_block_height: block_height as i32 + 1,
                         };
+                        let metadata = cur_metadata;
 
                         conn.spawn_blocking(move |conn| {
                             use diesel::query_dsl::methods::ExecuteDsl;
@@ -308,14 +302,8 @@ impl LayerImpl for L1Client {
                 .await?;
         }
 
-        let dep_metadata = Self::layer_metadata(conn)
-            .await?
-            .unwrap_or(FixedLayerMetadata {
-                layer: Self::LAYER,
-                next_block_height: 0,
-            });
         for dep in &self.deps {
-            dep.update_blocks(conn, dep_metadata).await?;
+            dep.update_blocks(conn, cur_metadata).await?;
         }
 
         Ok(())

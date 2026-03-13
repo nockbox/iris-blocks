@@ -1,6 +1,6 @@
 //! L2 layer: transaction internals.
 
-use crate::layers::shared_schema::{NoteName, TxId};
+use crate::layers::shared_schema::{DbDigest, DbPublicKey};
 use diesel::prelude::*;
 
 diesel::table! {
@@ -47,12 +47,12 @@ diesel::table! {
 
 diesel::table! {
     use diesel::sql_types::*;
-    use crate::layers::shared_schema::sql_types::DigestSql;
+    use crate::layers::shared_schema::sql_types::{DigestSql, PublicKeySql};
 
     tx_signers (txid, z, pk) {
         txid -> DigestSql,
         z -> Integer,
-        pk -> Text,
+        pk -> PublicKeySql,
         height -> Integer,
     }
 }
@@ -62,11 +62,11 @@ diesel::allow_tables_to_appear_in_same_query!(tx_spends, tx_seeds, tx_outputs, t
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = tx_spends, treat_none_as_default_value = false)]
 pub struct TxSpend {
-    pub txid: TxId,
+    pub txid: DbDigest,
     pub z: i32,
     pub version: i32,
-    pub first: NoteName,
-    pub last: NoteName,
+    pub first: DbDigest,
+    pub last: DbDigest,
     pub fee: i64,
     pub height: i32,
 }
@@ -74,20 +74,20 @@ pub struct TxSpend {
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = tx_seeds, treat_none_as_default_value = false)]
 pub struct TxSeed {
-    pub txid: TxId,
+    pub txid: DbDigest,
     pub idx: i32,
     pub amount: i64,
-    pub first: NoteName,
+    pub first: DbDigest,
     pub height: i32,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = tx_outputs, treat_none_as_default_value = false)]
 pub struct TxOutput {
-    pub txid: TxId,
+    pub txid: DbDigest,
     pub idx: i32,
-    pub first: NoteName,
-    pub last: NoteName,
+    pub first: DbDigest,
+    pub last: DbDigest,
     pub assets: i64,
     pub height: i32,
 }
@@ -95,8 +95,8 @@ pub struct TxOutput {
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = tx_signers, treat_none_as_default_value = false)]
 pub struct TxSigner {
-    pub txid: TxId,
+    pub txid: DbDigest,
     pub z: i32,
-    pub pk: String,
+    pub pk: DbPublicKey,
     pub height: i32,
 }

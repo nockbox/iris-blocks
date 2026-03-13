@@ -5,7 +5,7 @@ use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use iris_nockchain_types::{v1::SpendV1, RawTx};
-use iris_ztd::{cue, jam, Hashable, NounDecode, NounEncode, ZMap};
+use iris_ztd::{cue, Hashable, NounDecode, ZMap};
 use log::*;
 use schema::*;
 use std::sync::Arc;
@@ -117,14 +117,8 @@ impl LayerImpl for L2Client {
         metadata: FixedLayerMetadata,
     ) -> Result<(), LayerErrorSource> {
         if metadata.next_block_height == 0 {
-            let dep_metadata = Self::layer_metadata(conn)
-                .await?
-                .unwrap_or(FixedLayerMetadata {
-                    layer: Self::LAYER,
-                    next_block_height: 0,
-                });
             for dep in &self.deps {
-                dep.update_blocks(conn, dep_metadata).await?;
+                dep.update_blocks(conn, metadata).await?;
             }
             return Ok(());
         }
@@ -137,12 +131,7 @@ impl LayerImpl for L2Client {
         let end_block_height = metadata.next_block_height as u32 - 1;
 
         if start_block_height > end_block_height {
-            let dep_metadata = Self::layer_metadata(conn)
-                .await?
-                .unwrap_or(FixedLayerMetadata {
-                    layer: Self::LAYER,
-                    next_block_height: 0,
-                });
+            let dep_metadata = cur_metadata.unwrap_or(metadata);
             for dep in &self.deps {
                 dep.update_blocks(conn, dep_metadata).await?;
             }
@@ -160,6 +149,10 @@ impl LayerImpl for L2Client {
 
         trace!("Syncing tx internals from {start_block_height} to {end_block_height}");
         let step = 100u32;
+        let mut cur_metadata = FixedLayerMetadata {
+            layer: Self::LAYER,
+            next_block_height: start_block_height as i32,
+        };
 
         for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
             let block_range_span =
@@ -215,12 +208,10 @@ impl LayerImpl for L2Client {
 
                                     if let Some(signature) = &input.spend.signature {
                                         for (pk, _) in signature.0.iter() {
-                                            let pk_b58 =
-                                                bs58::encode(jam(pk.to_noun())).into_string();
                                             block_signers.push(TxSigner {
                                                 txid: tx.id,
                                                 z: Self::checked_usize_to_i32(z, "tx_signers.z")?,
-                                                pk: pk_b58,
+                                                pk: pk.clone().into(),
                                                 height: tx.height,
                                             });
                                         }
@@ -272,15 +263,13 @@ impl LayerImpl for L2Client {
                                     match &spend {
                                         SpendV1::S0(legacy_spend) => {
                                             for (pk, _) in legacy_spend.signature.0.iter() {
-                                                let pk_b58 =
-                                                    bs58::encode(jam(pk.to_noun())).into_string();
                                                 block_signers.push(TxSigner {
                                                     txid: tx.id,
                                                     z: Self::checked_usize_to_i32(
                                                         z,
                                                         "tx_signers.z",
                                                     )?,
-                                                    pk: pk_b58,
+                                                    pk: pk.clone().into(),
                                                     height: tx.height,
                                                 });
                                             }
@@ -289,15 +278,13 @@ impl LayerImpl for L2Client {
                                             for (_, (pk, _)) in
                                                 witness_spend.witness.pkh_signature.0.iter()
                                             {
-                                                let pk_b58 =
-                                                    bs58::encode(jam(pk.to_noun())).into_string();
                                                 block_signers.push(TxSigner {
                                                     txid: tx.id,
                                                     z: Self::checked_usize_to_i32(
                                                         z,
                                                         "tx_signers.z",
                                                     )?,
-                                                    pk: pk_b58,
+                                                    pk: pk.clone().into(),
                                                     height: tx.height,
                                                 });
                                             }
@@ -344,10 +331,11 @@ impl LayerImpl for L2Client {
                         }
                     }
 
-                    let next_metadata = FixedLayerMetadata {
+                    cur_metadata = FixedLayerMetadata {
                         layer: Self::LAYER,
                         next_block_height: height as i32 + 1,
                     };
+                    let next_metadata = cur_metadata;
 
                     conn.spawn_blocking(move |conn| {
                         use diesel::query_dsl::methods::ExecuteDsl;
@@ -390,14 +378,8 @@ impl LayerImpl for L2Client {
             .await?;
         }
 
-        let dep_metadata = Self::layer_metadata(conn)
-            .await?
-            .unwrap_or(FixedLayerMetadata {
-                layer: Self::LAYER,
-                next_block_height: 0,
-            });
         for dep in &self.deps {
-            dep.update_blocks(conn, dep_metadata).await?;
+            dep.update_blocks(conn, cur_metadata).await?;
         }
 
         Ok(())
@@ -440,7 +422,7 @@ mod tests {
         let dst = temp_copy_path();
         std::fs::copy(src, &dst).ok()?;
 
-        let mut conn = crate::db::new_conn(dst.to_str().expect("db path"), 1)
+        let mut conn = crate::db::new_conn(dst.to_str().expect("db path"))
             .await
             .ok()?;
         crate::db::run_migrations(&mut conn).await;
@@ -751,7 +733,7 @@ mod tests {
             .await
             .expect("signer row");
 
-        let pk_bytes = bs58::decode(&signer.pk)
+        let pk_bytes = bs58::decode(signer.pk.to_string())
             .into_vec()
             .expect("decode signer pk base58");
         let pk_noun = cue(&pk_bytes).expect("cue signer pk");
@@ -761,7 +743,7 @@ mod tests {
         assert_ne!(pkh.to_string(), "");
 
         let back_b58 = bs58::encode(jam(pk.to_noun())).into_string();
-        assert_eq!(back_b58, signer.pk);
+        assert_eq!(back_b58, signer.pk.to_string());
 
         let _ = std::fs::remove_file(path);
     }

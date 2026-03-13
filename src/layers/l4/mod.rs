@@ -43,7 +43,7 @@ impl L4Client {
 
     async fn resolve_recipients(
         conn: &mut crate::db::AsyncDbConnection,
-        firsts: &[NoteName],
+        firsts: &[DbDigest],
     ) -> Result<HashMap<iris_ztd::Digest, ResolvedRecipient>, LayerErrorSource> {
         let mut uniq_firsts = vec![];
         let mut seen = HashSet::new();
@@ -69,11 +69,11 @@ impl L4Client {
                 .insert(*row.pkh);
         }
 
-        let single_pkhs: Vec<PkhDigest> = owners_by_first
+        let single_pkhs: Vec<DbDigest> = owners_by_first
             .iter()
             .filter_map(|(_, s)| {
                 if s.len() == 1 {
-                    s.iter().next().copied().map(PkhDigest::from)
+                    s.iter().next().copied().map(DbDigest::from)
                 } else {
                     None
                 }
@@ -87,12 +87,13 @@ impl L4Client {
                 .load::<PkToPkh>(conn)
                 .await?
         };
-        let mut pk_by_pkh: HashMap<iris_ztd::Digest, String> = HashMap::new();
+        let mut pk_by_pkh: HashMap<iris_ztd::Digest, iris_crypto::PublicKey> =
+            HashMap::new();
         for row in pk_rows {
-            pk_by_pkh.entry(*row.pkh).or_insert(row.pk);
+            pk_by_pkh.entry(*row.pkh).or_insert(*row.pk);
         }
 
-        let unresolved_firsts: Vec<NoteName> = uniq_firsts
+        let unresolved_firsts: Vec<DbDigest> = uniq_firsts
             .iter()
             .copied()
             .filter(|first| owners_by_first.get(&first.0).map(|s| s.len()).unwrap_or(0) != 1)
@@ -105,7 +106,7 @@ impl L4Client {
                 .load::<LockName>(conn)
                 .await?
         };
-        let mut root_by_first: HashMap<iris_ztd::Digest, LockRootDigest> = HashMap::new();
+        let mut root_by_first: HashMap<iris_ztd::Digest, DbDigest> = HashMap::new();
         for row in lock_rows {
             root_by_first.entry(*row.first).or_insert(row.root);
         }
@@ -118,7 +119,7 @@ impl L4Client {
                     if let Some(pk) = pk_by_pkh.get(&pkh) {
                         ResolvedRecipient {
                             recipient_type: "pk".to_string(),
-                            recipient: pk.clone(),
+                            recipient: DbPublicKey::from(pk.clone()).to_string(),
                         }
                     } else {
                         ResolvedRecipient {
@@ -217,14 +218,8 @@ impl LayerImpl for L4Client {
         let _ = &self.activations;
 
         if metadata.next_block_height == 0 {
-            let dep_metadata = Self::layer_metadata(conn)
-                .await?
-                .unwrap_or(FixedLayerMetadata {
-                    layer: Self::LAYER,
-                    next_block_height: 0,
-                });
             for dep in &self.deps {
-                dep.update_blocks(conn, dep_metadata).await?;
+                dep.update_blocks(conn, metadata).await?;
             }
             return Ok(());
         }
@@ -237,12 +232,7 @@ impl LayerImpl for L4Client {
         let end_block_height = metadata.next_block_height as u32 - 1;
 
         if start_block_height > end_block_height {
-            let dep_metadata = Self::layer_metadata(conn)
-                .await?
-                .unwrap_or(FixedLayerMetadata {
-                    layer: Self::LAYER,
-                    next_block_height: 0,
-                });
+            let dep_metadata = cur_metadata.unwrap_or(metadata);
             for dep in &self.deps {
                 dep.update_blocks(conn, dep_metadata).await?;
             }
@@ -260,6 +250,10 @@ impl LayerImpl for L4Client {
 
         trace!("Syncing accounting from {start_block_height} to {end_block_height}");
         let step = 100u32;
+        let mut cur_metadata = FixedLayerMetadata {
+            layer: Self::LAYER,
+            next_block_height: start_block_height as i32,
+        };
 
         for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
             let block_range_span =
@@ -295,8 +289,8 @@ impl LayerImpl for L4Client {
 
                     let mut debit_rows: Vec<Debit> = vec![];
                     if !spends.is_empty() && !signers.is_empty() {
-                        let mut firsts: Vec<NoteName> = vec![];
-                        let mut lasts: Vec<NoteName> = vec![];
+                        let mut firsts: Vec<DbDigest> = vec![];
+                        let mut lasts: Vec<DbDigest> = vec![];
                         let mut seen_note = HashSet::new();
                         for s in &spends {
                             if seen_note.insert((*s.first, *s.last)) {
@@ -321,12 +315,12 @@ impl LayerImpl for L4Client {
 
                         let mut signer_counts_by_txz: HashMap<(iris_ztd::Digest, i32), usize> =
                             HashMap::new();
-                        let mut signer_spends: HashMap<(iris_ztd::Digest, String), Vec<i32>> =
+                        let mut signer_spends: HashMap<(iris_ztd::Digest, DbPublicKey), Vec<i32>> =
                             HashMap::new();
                         for signer in &signers {
                             *signer_counts_by_txz.entry((*signer.txid, signer.z)).or_default() += 1;
                             signer_spends
-                                .entry((*signer.txid, signer.pk.clone()))
+                                .entry((*signer.txid, signer.pk))
                                 .or_default()
                                 .push(signer.z);
                         }
@@ -382,7 +376,7 @@ impl LayerImpl for L4Client {
                     let mut credit_rows: Vec<Credit> = vec![];
                     let mut coinbase_credit_rows: Vec<CoinbaseCredit> = vec![];
                     if !outputs.is_empty() {
-                        let output_firsts: Vec<NoteName> = outputs.iter().map(|o| o.first).collect();
+                        let output_firsts: Vec<DbDigest> = outputs.iter().map(|o| o.first).collect();
                         let resolved_by_first = Self::resolve_recipients(conn, &output_firsts).await?;
 
                         for output in outputs {
@@ -415,7 +409,7 @@ impl LayerImpl for L4Client {
                         .load::<L1Note>(conn)
                         .await?;
                     if !cb_notes.is_empty() {
-                        let cb_firsts: Vec<NoteName> = cb_notes.iter().map(|n| n.first).collect();
+                        let cb_firsts: Vec<DbDigest> = cb_notes.iter().map(|n| n.first).collect();
                         let resolved_by_first = Self::resolve_recipients(conn, &cb_firsts).await?;
 
                         for (idx, note) in cb_notes.into_iter().enumerate() {
@@ -443,10 +437,11 @@ impl LayerImpl for L4Client {
                         }
                     }
 
-                    let next_metadata = FixedLayerMetadata {
+                    cur_metadata = FixedLayerMetadata {
                         layer: Self::LAYER,
                         next_block_height: height as i32 + 1,
                     };
+                    let next_metadata = cur_metadata;
 
                     conn.spawn_blocking(move |conn| {
                         use diesel::query_dsl::methods::ExecuteDsl;
@@ -479,14 +474,8 @@ impl LayerImpl for L4Client {
             .await?;
         }
 
-        let dep_metadata = Self::layer_metadata(conn)
-            .await?
-            .unwrap_or(FixedLayerMetadata {
-                layer: Self::LAYER,
-                next_block_height: 0,
-            });
         for dep in &self.deps {
-            dep.update_blocks(conn, dep_metadata).await?;
+            dep.update_blocks(conn, cur_metadata).await?;
         }
 
         Ok(())
@@ -524,7 +513,7 @@ mod tests {
         let dst = temp_copy_path();
         std::fs::copy(src, &dst).ok()?;
 
-        let mut conn = crate::db::new_conn(dst.to_str().expect("db path"), 1)
+        let mut conn = crate::db::new_conn(dst.to_str().expect("db path"))
             .await
             .ok()?;
         crate::db::run_migrations(&mut conn).await;
@@ -792,7 +781,7 @@ mod tests {
         let fee_sum: i64 = selected_debits.iter().map(|d| d.fee).sum();
 
         let credit_amount_sum = credits::table
-            .filter(credits::txid.eq(TxId(selected_tx)))
+            .filter(credits::txid.eq(DbDigest(selected_tx)))
             .select(credits::amount)
             .load::<i64>(&mut conn)
             .await
@@ -895,13 +884,12 @@ mod tests {
 
         let candidate_pk = coinbase_credits::table
             .inner_join(debits::table.on(
-                coinbase_credits::recipient
-                    .eq(debits::pk)
+                diesel::dsl::sql::<diesel::sql_types::Bool>("coinbase_credits.recipient = debits.pk")
                     .and(coinbase_credits::recipient_type.eq_any(&pk_types))
                     .and(debits::sole_owner.eq(true)),
             ))
-            .select(coinbase_credits::recipient)
-            .first::<String>(&mut conn)
+            .select(debits::pk)
+            .first::<DbPublicKey>(&mut conn)
             .await;
 
         let Ok(pk) = candidate_pk else {
@@ -911,7 +899,7 @@ mod tests {
         };
 
         let tx_received = credits::table
-            .filter(credits::recipient_type.eq_any(&pk_types).and(credits::recipient.eq(&pk)))
+            .filter(credits::recipient_type.eq_any(&pk_types).and(credits::recipient.eq(pk.to_string())))
             .select(credits::amount)
             .load::<i64>(&mut conn)
             .await
@@ -922,7 +910,7 @@ mod tests {
             .filter(
                 coinbase_credits::recipient_type
                     .eq_any(&pk_types)
-                    .and(coinbase_credits::recipient.eq(&pk)),
+                    .and(coinbase_credits::recipient.eq(pk.to_string())),
             )
             .select(coinbase_credits::amount)
             .load::<i64>(&mut conn)
@@ -931,7 +919,7 @@ mod tests {
             .into_iter()
             .sum::<i64>();
         let spent_amount = debits::table
-            .filter(debits::pk.eq(&pk).and(debits::sole_owner.eq(true)))
+            .filter(debits::pk.eq(pk).and(debits::sole_owner.eq(true)))
             .load::<Debit>(&mut conn)
             .await
             .expect("load debits")

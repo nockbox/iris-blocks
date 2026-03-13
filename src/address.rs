@@ -64,19 +64,21 @@ pub async fn resolve_address(
     }
 
     // First try to treat the input as a DB-formatted PK.
-    if let Some(row) = pk_to_pkh::table
-        .filter(pk_to_pkh::pk.eq(normalized))
-        .first::<PkToPkh>(conn)
-        .await
-        .optional()?
-    {
-        return Ok(AddressInfo {
-            input: normalized.to_string(),
-            address_type: AddressType::DbPublicKey,
-            scope: VersionScope::All,
-            pkh: row.pkh.0.to_string(),
-            db_public_key: Some(row.pk),
-        });
+    if let Ok(db_pk) = crate::layers::shared_schema::DbPublicKey::try_from(normalized) {
+        if let Some(row) = pk_to_pkh::table
+            .filter(pk_to_pkh::pk.eq(db_pk))
+            .first::<PkToPkh>(conn)
+            .await
+            .optional()?
+        {
+            return Ok(AddressInfo {
+                input: normalized.to_string(),
+                address_type: AddressType::DbPublicKey,
+                scope: VersionScope::All,
+                pkh: row.pkh.to_string(),
+                db_public_key: Some(row.pk.to_string()),
+            });
+        }
     }
 
     // Next, treat input as PKH digest if possible.

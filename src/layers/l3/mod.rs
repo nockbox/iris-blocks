@@ -47,15 +47,15 @@ impl L3Client {
 
     fn collect_spend_condition_owners(
         sc: &SpendCondition,
-        root: LockRootDigest,
-        first: NoteName,
+        root: DbDigest,
+        first: DbDigest,
         height: i32,
         lock_owners_rows: &mut Vec<LockOwner>,
         name_owners_rows: &mut Vec<NameOwner>,
     ) {
         for pkh_group in sc.pkh() {
             for pkh in &pkh_group.hashes {
-                let pkh = PkhDigest(*pkh);
+                let pkh = DbDigest(*pkh);
                 lock_owners_rows.push(LockOwner { root, pkh, height });
                 name_owners_rows.push(NameOwner { first, pkh, height });
             }
@@ -64,15 +64,14 @@ impl L3Client {
 
     fn collect_pk_rows(
         pk: &PublicKey,
-        first: NoteName,
+        first: DbDigest,
         height: i32,
         pk_to_pkh_rows: &mut Vec<PkToPkh>,
         name_owners_rows: &mut Vec<NameOwner>,
     ) {
-        let pkh = PkhDigest(pk.hash());
-        let pk_b58 = bs58::encode(jam(pk.to_noun())).into_string();
+        let pkh = DbDigest(pk.hash());
         pk_to_pkh_rows.push(PkToPkh {
-            pk: pk_b58,
+            pk: pk.clone().into(),
             pkh,
             height,
         });
@@ -81,7 +80,7 @@ impl L3Client {
 
     fn collect_legacy_signature_rows(
         signature: &LegacySignature,
-        first: NoteName,
+        first: DbDigest,
         height: i32,
         pk_to_pkh_rows: &mut Vec<PkToPkh>,
         name_owners_rows: &mut Vec<NameOwner>,
@@ -199,14 +198,8 @@ impl LayerImpl for L3Client {
         metadata: FixedLayerMetadata,
     ) -> Result<(), LayerErrorSource> {
         if metadata.next_block_height == 0 {
-            let dep_metadata = Self::layer_metadata(conn)
-                .await?
-                .unwrap_or(FixedLayerMetadata {
-                    layer: Self::LAYER,
-                    next_block_height: 0,
-                });
             for dep in &self.deps {
-                dep.update_blocks(conn, dep_metadata).await?;
+                dep.update_blocks(conn, metadata).await?;
             }
             return Ok(());
         }
@@ -219,12 +212,7 @@ impl LayerImpl for L3Client {
         let end_block_height = metadata.next_block_height as u32 - 1;
 
         if start_block_height > end_block_height {
-            let dep_metadata = Self::layer_metadata(conn)
-                .await?
-                .unwrap_or(FixedLayerMetadata {
-                    layer: Self::LAYER,
-                    next_block_height: 0,
-                });
+            let dep_metadata = cur_metadata.unwrap_or(metadata);
             for dep in &self.deps {
                 dep.update_blocks(conn, dep_metadata).await?;
             }
@@ -243,6 +231,10 @@ impl LayerImpl for L3Client {
         trace!("Syncing lock/name mappings from {start_block_height} to {end_block_height}");
         let constants = self.activations.constants();
         let step = 100u32;
+        let mut cur_metadata = FixedLayerMetadata {
+            layer: Self::LAYER,
+            next_block_height: start_block_height as i32,
+        };
 
         for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
             let block_range_span =
@@ -360,9 +352,9 @@ impl LayerImpl for L3Client {
                                         }
                                         SpendV1::S1(witness_spend) => {
                                             let lock_proof = &witness_spend.witness.lock_merkle_proof;
-                                            let root = LockRootDigest(lock_proof.proof().root);
+                                            let root = DbDigest(lock_proof.proof().root);
                                             let sc = lock_proof.spend_condition();
-                                            let sc_hash: NoteName = sc.hash().into();
+                                            let sc_hash: DbDigest = sc.hash().into();
                                             let idx = lock_proof.axis().saturating_sub(1) as i32;
 
                                             block_lock_names.push(LockName {
@@ -406,10 +398,8 @@ impl LayerImpl for L3Client {
                                             for (pkh, (pk, _)) in
                                                 &witness_spend.witness.pkh_signature.0
                                             {
-                                                let pk_b58 =
-                                                    bs58::encode(jam(pk.to_noun())).into_string();
                                                 block_pk_to_pkh.push(PkToPkh {
-                                                    pk: pk_b58,
+                                                    pk: pk.clone().into(),
                                                     pkh: (*pkh).into(),
                                                     height: tx.height,
                                                 });
@@ -424,8 +414,8 @@ impl LayerImpl for L3Client {
 
                                     for seed in &spend.seeds().0 {
                                         let root_digest = seed.lock_root.hash();
-                                        let root: LockRootDigest = root_digest.into();
-                                        let first: NoteName = (true, root_digest).hash().into();
+                                        let root: DbDigest = root_digest.into();
+                                        let first: DbDigest = (true, root_digest).hash().into();
 
                                         block_lock_names.push(LockName {
                                             root,
@@ -467,10 +457,11 @@ impl LayerImpl for L3Client {
                         }
                     }
 
-                    let next_metadata = FixedLayerMetadata {
+                    cur_metadata = FixedLayerMetadata {
                         layer: Self::LAYER,
                         next_block_height: height as i32 + 1,
                     };
+                    let next_metadata = cur_metadata;
 
                     conn.spawn_blocking(move |conn| {
                         use diesel::query_dsl::methods::ExecuteDsl;
@@ -519,14 +510,8 @@ impl LayerImpl for L3Client {
             .await?;
         }
 
-        let dep_metadata = Self::layer_metadata(conn)
-            .await?
-            .unwrap_or(FixedLayerMetadata {
-                layer: Self::LAYER,
-                next_block_height: 0,
-            });
         for dep in &self.deps {
-            dep.update_blocks(conn, dep_metadata).await?;
+            dep.update_blocks(conn, cur_metadata).await?;
         }
 
         Ok(())
@@ -562,7 +547,7 @@ mod tests {
         let dst = temp_copy_path();
         std::fs::copy(src, &dst).ok()?;
 
-        let mut conn = crate::db::new_conn(dst.to_str().expect("db path"), 1)
+        let mut conn = crate::db::new_conn(dst.to_str().expect("db path"))
             .await
             .ok()?;
         crate::db::run_migrations(&mut conn).await;
@@ -753,7 +738,7 @@ mod tests {
             .expect("load pk_to_pkh");
 
         for row in rows {
-            let pk_bytes = bs58::decode(&row.pk).into_vec().expect("decode pk b58");
+            let pk_bytes = bs58::decode(row.pk.to_string()).into_vec().expect("decode pk b58");
             let pk_noun = cue(&pk_bytes).expect("cue pk");
             let pk = PublicKey::from_noun(&pk_noun).expect("decode pk");
             assert_eq!(pk.hash(), *row.pkh);
@@ -777,7 +762,7 @@ mod tests {
             .expect("load lock_names");
 
         for row in rows {
-            let expected: NoteName = (true, *row.root).hash().into();
+            let expected: DbDigest = (true, *row.root).hash().into();
             assert_eq!(row.first, expected);
         }
 

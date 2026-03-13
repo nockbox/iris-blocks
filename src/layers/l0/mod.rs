@@ -323,7 +323,7 @@ impl<S: Scryable> L0Client<S> {
                 height: height as _,
                 version: block.version() as _,
                 parent: block.parent().into(),
-                timestamp: Self::checked_u64_to_i64(block.timestamp(), "blocks.timestamp")?,
+                timestamp: Self::checked_u64_to_i64(block.timestamp().as_unix_seconds().unwrap(), "blocks.timestamp")?,
                 msg: block.msg().try_into().ok(),
                 jam: jam(block.to_noun()),
             });
@@ -444,7 +444,7 @@ impl<S: Scryable> L0Client<S> {
                         .await;
                 }
                 Err(e) => {
-                    error!("Error updating blocks: {e}");
+                    error!("Error updating blocks: {e:?}");
                     self.sleep_and_process_queries(std::time::Duration::from_secs(30))
                         .await;
                 }
