@@ -65,6 +65,7 @@ pub struct TxCreditDetail {
     pub amount_nicks: i64,
     pub block_height: i32,
     pub block_timestamp: i64,
+    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
 }
 
@@ -76,6 +77,7 @@ pub struct TxDebitDetail {
     pub fee_nicks: i64,
     pub block_height: i32,
     pub block_timestamp: i64,
+    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
 }
 
@@ -85,6 +87,7 @@ pub struct TransactionDetail {
     pub block_id: String,
     pub block_height: i32,
     pub block_timestamp: i64,
+    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
     pub version: i32,
     pub fee_nicks: i64,
@@ -104,6 +107,7 @@ pub struct CoinbaseCreditDetail {
     pub amount_nicks: i64,
     pub block_height: i32,
     pub block_timestamp: i64,
+    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
 }
 
@@ -122,6 +126,7 @@ pub struct BlockDetail {
     pub version: i32,
     pub parent: String,
     pub block_timestamp: i64,
+    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
     pub msg: Option<String>,
     pub transactions: Vec<BlockTransaction>,
@@ -150,6 +155,7 @@ pub struct SyncStatus {
 pub struct LedgerEntry {
     pub block_height: i32,
     pub block_timestamp: i64,
+    pub block_unix_timestamp: Option<i64>,
     pub block_time_utc: String,
     pub entry_type: String,
     pub txid: Option<String>,
@@ -167,6 +173,7 @@ pub struct WalletTxSummary {
     pub txid: String,
     pub first_block_height: i32,
     pub first_block_timestamp: i64,
+    pub first_block_unix_timestamp: Option<i64>,
     pub first_block_time_utc: String,
     pub direction: String,
     pub incoming_nicks: i64,
@@ -175,12 +182,22 @@ pub struct WalletTxSummary {
     pub net_nicks: i64,
 }
 
-fn format_chain_timestamp_utc(ts: i64) -> String {
-    // Chain timestamps are stored as signed i64 in DB but originate from u64.
-    // Reinterpret bits and remove the high-bit bias used by the chain clock.
+fn chain_timestamp_to_unix_seconds(ts: i64) -> Option<i64> {
+    // Chain timestamps are stored in a biased @da-like second format (u64).
+    // The bias/epoch is not 2^63 relative to unix; it is the @da unix offset.
+    // See urbit @da epoch constant: 0x8000000cce9e0d80.
+    const DA_UNIX_EPOCH_BIASED_SECONDS: i128 = 0x8000_000c_ce9e_0d80;
+
     let raw_u64 = ts as u64;
-    let chain_seconds = raw_u64.saturating_sub(1u64 << 63);
-    let dt_opt: Option<DateTime<Utc>> = Utc.timestamp_opt(chain_seconds as i64, 0).single();
+    let unix_seconds_i128 = raw_u64 as i128 - DA_UNIX_EPOCH_BIASED_SECONDS;
+    i64::try_from(unix_seconds_i128).ok()
+}
+
+fn format_chain_timestamp_utc(ts: i64) -> String {
+    let Some(unix_seconds) = chain_timestamp_to_unix_seconds(ts) else {
+        return format!("invalid({ts})");
+    };
+    let dt_opt: Option<DateTime<Utc>> = Utc.timestamp_opt(unix_seconds, 0).single();
     match dt_opt {
         Some(dt) => dt.to_rfc3339(),
         None => format!("invalid({ts})"),
@@ -654,6 +671,7 @@ pub async fn transaction_detail(
         amount_nicks: r.amount,
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
+        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
     })
     .collect();
@@ -676,6 +694,7 @@ pub async fn transaction_detail(
         fee_nicks: r.fee,
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
+        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
     })
     .collect();
@@ -685,6 +704,7 @@ pub async fn transaction_detail(
         block_id: base.block_id,
         block_height: base.height,
         block_timestamp: base.block_timestamp,
+        block_unix_timestamp: chain_timestamp_to_unix_seconds(base.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(base.block_timestamp),
         version: base.version,
         fee_nicks: base.fee,
@@ -768,6 +788,7 @@ pub async fn block_detail(
         amount_nicks: r.amount,
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
+        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
     })
     .collect();
@@ -778,6 +799,7 @@ pub async fn block_detail(
         version: base.version,
         parent: base.parent,
         block_timestamp: base.timestamp,
+        block_unix_timestamp: chain_timestamp_to_unix_seconds(base.timestamp),
         block_time_utc: format_chain_timestamp_utc(base.timestamp),
         msg: base.msg,
         transactions,
@@ -917,6 +939,7 @@ pub async fn audit_report(
     ledger.extend(credit_rows.into_iter().map(|r| LedgerEntry {
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
+        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
         entry_type: r.entry_type,
         txid: r.txid,
@@ -993,6 +1016,7 @@ pub async fn audit_report(
     ledger.extend(coinbase_rows.into_iter().map(|r| LedgerEntry {
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
+        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
         entry_type: r.entry_type,
         txid: r.txid,
@@ -1038,6 +1062,7 @@ pub async fn audit_report(
     ledger.extend(spent_rows.into_iter().map(|r| LedgerEntry {
         block_height: r.block_height,
         block_timestamp: r.block_timestamp,
+        block_unix_timestamp: chain_timestamp_to_unix_seconds(r.block_timestamp),
         block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
         entry_type: r.entry_type,
         txid: r.txid,
@@ -1078,6 +1103,7 @@ pub async fn audit_report(
             txid,
             first_block_height: entry.block_height,
             first_block_timestamp: entry.block_timestamp,
+            first_block_unix_timestamp: entry.block_unix_timestamp,
             first_block_time_utc: entry.block_time_utc.clone(),
             direction: "incoming".to_string(),
             incoming_nicks: 0,
@@ -1089,6 +1115,7 @@ pub async fn audit_report(
         if entry.block_height < summary.first_block_height {
             summary.first_block_height = entry.block_height;
             summary.first_block_timestamp = entry.block_timestamp;
+            summary.first_block_unix_timestamp = entry.block_unix_timestamp;
             summary.first_block_time_utc = entry.block_time_utc.clone();
         }
         match entry.entry_type.as_str() {

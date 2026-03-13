@@ -29,6 +29,24 @@ impl L2Client {
             stats_rx,
         }
     }
+
+    fn checked_u64_to_i64(value: u64, field: &'static str) -> Result<i64, LayerErrorSource> {
+        i64::try_from(value).map_err(|_| {
+            LayerErrorSource::OtherError(format!("numeric value out of range for {field}: {value}"))
+        })
+    }
+
+    fn checked_u32_to_i32(value: u32, field: &'static str) -> Result<i32, LayerErrorSource> {
+        i32::try_from(value).map_err(|_| {
+            LayerErrorSource::OtherError(format!("numeric value out of range for {field}: {value}"))
+        })
+    }
+
+    fn checked_usize_to_i32(value: usize, field: &'static str) -> Result<i32, LayerErrorSource> {
+        i32::try_from(value).map_err(|_| {
+            LayerErrorSource::OtherError(format!("numeric value out of range for {field}: {value}"))
+        })
+    }
 }
 
 impl LayerBase for L2Client {
@@ -164,13 +182,19 @@ impl LayerImpl for L2Client {
                     let mut block_signers = vec![];
 
                     for tx in txs {
-                        let tx_height = tx.height as u32;
+                        let tx_height = u32::try_from(tx.height).map_err(|_| {
+                            LayerErrorSource::OtherError(format!(
+                                "negative block height in transactions.height: {}",
+                                tx.height
+                            ))
+                        })?;
                         let raw = RawTx::from_noun(
                             &cue(&tx.jam).ok_or(LayerErrorSource::NounCue(tx_height, *tx.id))?,
                         )
                         .ok_or(LayerErrorSource::NounDecode(tx_height, *tx.id))?;
 
-                        let spend_version = u32::from(raw.version()) as i32;
+                        let spend_version =
+                            Self::checked_u32_to_i32(u32::from(raw.version()), "tx_spends.version")?;
                         let mut global_seed_idx = 0i32;
 
                         match &raw {
@@ -178,11 +202,14 @@ impl LayerImpl for L2Client {
                                 for (z, (name, input)) in raw_v0.inputs.0.iter().enumerate() {
                                     block_spends.push(TxSpend {
                                         txid: tx.id,
-                                        z: z as i32,
+                                        z: Self::checked_usize_to_i32(z, "tx_spends.z")?,
                                         version: spend_version,
                                         first: name.first.into(),
                                         last: name.last.into(),
-                                        fee: input.spend.fee.0 as i64,
+                                        fee: Self::checked_u64_to_i64(
+                                            input.spend.fee.0,
+                                            "tx_spends.fee",
+                                        )?,
                                         height: tx.height,
                                     });
 
@@ -192,7 +219,7 @@ impl LayerImpl for L2Client {
                                                 bs58::encode(jam(pk.to_noun())).into_string();
                                             block_signers.push(TxSigner {
                                                 txid: tx.id,
-                                                z: z as i32,
+                                                z: Self::checked_usize_to_i32(z, "tx_signers.z")?,
                                                 pk: pk_b58,
                                                 height: tx.height,
                                             });
@@ -203,11 +230,20 @@ impl LayerImpl for L2Client {
                                         block_seeds.push(TxSeed {
                                             txid: tx.id,
                                             idx: global_seed_idx,
-                                            amount: seed.gift.0 as i64,
+                                            amount: Self::checked_u64_to_i64(
+                                                seed.gift.0,
+                                                "tx_seeds.amount",
+                                            )?,
                                             first: seed.recipient.hash().into(),
                                             height: tx.height,
                                         });
-                                        global_seed_idx += 1;
+                                        global_seed_idx = global_seed_idx.checked_add(1).ok_or_else(
+                                            || {
+                                                LayerErrorSource::OtherError(
+                                                    "tx_seeds.idx overflow".to_string(),
+                                                )
+                                            },
+                                        )?;
                                     }
                                 }
                             }
@@ -222,11 +258,14 @@ impl LayerImpl for L2Client {
                                 for (z, (name, spend)) in spends_map.into_iter().enumerate() {
                                     block_spends.push(TxSpend {
                                         txid: tx.id,
-                                        z: z as i32,
+                                        z: Self::checked_usize_to_i32(z, "tx_spends.z")?,
                                         version: spend_version,
                                         first: name.first.into(),
                                         last: name.last.into(),
-                                        fee: spend.fee().0 as i64,
+                                        fee: Self::checked_u64_to_i64(
+                                            spend.fee().0,
+                                            "tx_spends.fee",
+                                        )?,
                                         height: tx.height,
                                     });
 
@@ -237,7 +276,10 @@ impl LayerImpl for L2Client {
                                                     bs58::encode(jam(pk.to_noun())).into_string();
                                                 block_signers.push(TxSigner {
                                                     txid: tx.id,
-                                                    z: z as i32,
+                                                    z: Self::checked_usize_to_i32(
+                                                        z,
+                                                        "tx_signers.z",
+                                                    )?,
                                                     pk: pk_b58,
                                                     height: tx.height,
                                                 });
@@ -251,7 +293,10 @@ impl LayerImpl for L2Client {
                                                     bs58::encode(jam(pk.to_noun())).into_string();
                                                 block_signers.push(TxSigner {
                                                     txid: tx.id,
-                                                    z: z as i32,
+                                                    z: Self::checked_usize_to_i32(
+                                                        z,
+                                                        "tx_signers.z",
+                                                    )?,
                                                     pk: pk_b58,
                                                     height: tx.height,
                                                 });
@@ -264,11 +309,20 @@ impl LayerImpl for L2Client {
                                         block_seeds.push(TxSeed {
                                             txid: tx.id,
                                             idx: global_seed_idx,
-                                            amount: seed.gift.0 as i64,
+                                            amount: Self::checked_u64_to_i64(
+                                                seed.gift.0,
+                                                "tx_seeds.amount",
+                                            )?,
                                             first: first.into(),
                                             height: tx.height,
                                         });
-                                        global_seed_idx += 1;
+                                        global_seed_idx = global_seed_idx.checked_add(1).ok_or_else(
+                                            || {
+                                                LayerErrorSource::OtherError(
+                                                    "tx_seeds.idx overflow".to_string(),
+                                                )
+                                            },
+                                        )?;
                                     }
                                 }
                             }
@@ -278,10 +332,13 @@ impl LayerImpl for L2Client {
                         for (idx, note) in outputs.into_iter().enumerate() {
                             block_outputs.push(TxOutput {
                                 txid: tx.id,
-                                idx: idx as i32,
+                                idx: Self::checked_usize_to_i32(idx, "tx_outputs.idx")?,
                                 first: note.name().first.into(),
                                 last: note.name().last.into(),
-                                assets: note.assets().0 as i64,
+                                assets: Self::checked_u64_to_i64(
+                                    note.assets().0,
+                                    "tx_outputs.assets",
+                                )?,
                                 height: tx.height,
                             });
                         }

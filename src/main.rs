@@ -83,6 +83,12 @@ fn print_tx_text(tx: &iris_blocks::query::TransactionDetail) {
     print_kv("block_id", &tx.block_id);
     print_kv("block_height", tx.block_height);
     print_kv("block_timestamp", tx.block_timestamp);
+    print_kv(
+        "block_unix_timestamp",
+        tx.block_unix_timestamp
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "invalid".to_string()),
+    );
     print_kv("block_time_utc", &tx.block_time_utc);
     print_kv("version", tx.version);
     print_kv("fee_nicks", tx.fee_nicks);
@@ -170,6 +176,13 @@ fn print_block_text(block: &iris_blocks::query::BlockDetail) {
     print_kv("version", block.version);
     print_kv("parent", &block.parent);
     print_kv("block_timestamp", block.block_timestamp);
+    print_kv(
+        "block_unix_timestamp",
+        block
+            .block_unix_timestamp
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "invalid".to_string()),
+    );
     print_kv("block_time_utc", &block.block_time_utc);
     print_kv("msg", block.msg.as_deref().unwrap_or(""));
 

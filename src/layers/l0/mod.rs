@@ -100,6 +100,8 @@ pub enum L0Error {
     LayerError(#[from] LayerError),
     #[error("gRPC connection needed, but not provided")]
     GrpcNeeded,
+    #[error("numeric value out of range for {field}: {value}")]
+    ValueOutOfRange { field: &'static str, value: u64 },
 }
 
 impl From<ScryError> for L0Error {
@@ -113,6 +115,14 @@ impl From<ScryError> for L0Error {
 }
 
 impl<S: Scryable> L0Client<S> {
+    fn checked_u64_to_i64(value: u64, field: &'static str) -> Result<i64, L0Error> {
+        i64::try_from(value).map_err(|_| L0Error::ValueOutOfRange { field, value })
+    }
+
+    fn checked_u64_to_i32(value: u64, field: &'static str) -> Result<i32, L0Error> {
+        i32::try_from(value).map_err(|_| L0Error::ValueOutOfRange { field, value })
+    }
+
     pub fn new(
         conn: AsyncDbConnection,
         client: Option<S>,
@@ -313,7 +323,7 @@ impl<S: Scryable> L0Client<S> {
                 height: height as _,
                 version: block.version() as _,
                 parent: block.parent().into(),
-                timestamp: block.timestamp() as _,
+                timestamp: Self::checked_u64_to_i64(block.timestamp(), "blocks.timestamp")?,
                 msg: block.msg().try_into().ok(),
                 jam: jam(block.to_noun()),
             });
@@ -341,8 +351,8 @@ impl<S: Scryable> L0Client<S> {
                     block_id: bid.into(),
                     height: height as _,
                     version: rtx.version() as _,
-                    fee: rtx.total_fees().0 as _,
-                    total_size: tx.total_size() as _,
+                    fee: Self::checked_u64_to_i64(rtx.total_fees().0, "transactions.fee")?,
+                    total_size: Self::checked_u64_to_i32(tx.total_size() as u64, "transactions.total_size")?,
                     jam: jam(rtx.to_noun()),
                 });
 

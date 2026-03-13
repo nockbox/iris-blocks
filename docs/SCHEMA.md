@@ -298,7 +298,8 @@ ORDER BY height, txid, idx;
 `audit --csv` writes one ledger row per entry with:
 
 - `block_height`
-- `block_timestamp` (raw chain timestamp from `blocks.timestamp`)
+- `block_timestamp` (raw chain timestamp from `blocks.timestamp`, biased `@da`-style seconds)
+- `block_unix_timestamp` (decoded unix timestamp seconds)
 - `block_time_utc` (human-readable UTC derived from `block_timestamp`)
 - `entry_type` (`credit`, `coinbase`, `debit`)
 - `txid`
