@@ -10,6 +10,20 @@ The database is built in layers (`l0` -> `l4`) where each layer depends on the p
 iris-blocks --help
 ```
 
+### From source (Cargo)
+
+The CLI binary target is feature-gated. Use `--features binary` when running from source:
+
+```bash
+# Show CLI help
+cargo +nightly run --features binary -- --help
+
+# Example query
+cargo +nightly run --features binary -- \
+  --db nockchain.sqlite \
+  balance <address>
+```
+
 Commands:
 
 - `sync`: connect to a node and update local DB state
@@ -49,6 +63,18 @@ You may build this as a wasm module with:
 
 ```
 wasm-pack build --features=wasm --target web --out-dir pkg --scope nockbox
+```
+
+If you run a direct wasm target check (`cargo +nightly check --features wasm --target wasm32-unknown-unknown`),
+`sqlite-wasm-rs` requires a wasm-capable clang toolchain (Apple clang alone is not enough).
+One working approach:
+
+```bash
+nix shell nixpkgs#llvmPackages_18.clang nixpkgs#llvmPackages_18.llvm -c sh -lc '
+  export CC_wasm32_unknown_unknown="$(command -v clang)"
+  export AR_wasm32_unknown_unknown="$(command -v llvm-ar)"
+  cargo +nightly check --features wasm --target wasm32-unknown-unknown
+'
 ```
 
 And then use it with:
