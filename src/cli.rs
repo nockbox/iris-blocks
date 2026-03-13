@@ -72,7 +72,7 @@ pub struct StatusArgs {
 #[derive(Debug, Parser, Clone)]
 pub struct AuditArgs {
     pub address: String,
-    #[arg(long)]
+    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "PATH_OR_DIR")]
     pub csv: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,

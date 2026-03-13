@@ -11,6 +11,7 @@ use iris_blocks::layers::{
     layer::{LayerDependency, LayerExt},
 };
 use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tonic::transport::{Channel, Uri};
 use tracing_subscriber::layer::SubscriberExt;
@@ -264,6 +265,52 @@ fn serialize_json<T: serde::Serialize>(value: &T) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+fn sanitize_for_filename(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn resolve_audit_csv_path(
+    csv_arg: &str,
+    address_input: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let file_name = format!(
+        "nockchain_transactions_{}.csv",
+        sanitize_for_filename(address_input)
+    );
+
+    if csv_arg.trim().is_empty() {
+        return Ok(std::env::current_dir()?.join(file_name));
+    }
+
+    let mut path = PathBuf::from(csv_arg);
+    let ends_with_sep = csv_arg.ends_with('/') || csv_arg.ends_with('\\');
+    let is_existing_dir = Path::new(csv_arg).is_dir();
+    if ends_with_sep || is_existing_dir {
+        path = path.join(&file_name);
+    }
+
+    if path.file_name().is_none() {
+        path = path.join(&file_name);
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    Ok(path)
+}
+
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = tracing_subscriber::EnvFilter::from_default_env();
@@ -372,12 +419,14 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut conn = iris_blocks::db::new_conn(&cli.db).await?;
             let address = iris_blocks::address::resolve_address(&mut conn, &args.address).await?;
             let report = iris_blocks::query::audit_report(&mut conn, address).await?;
-            if let Some(path) = args.csv {
-                let mut writer = csv::Writer::from_path(path)?;
+            if let Some(csv_arg) = args.csv.as_deref() {
+                let path = resolve_audit_csv_path(csv_arg, &report.balance.address.input)?;
+                let mut writer = csv::Writer::from_path(&path)?;
                 for row in report.ledger.iter().rev() {
                     writer.serialize(row)?;
                 }
                 writer.flush()?;
+                eprintln!("CSV written to {}", path.display());
             }
             match args.format {
                 OutputFormat::Text => print_audit_text(&report),

@@ -31,7 +31,7 @@ Commands:
 - `tx <txid>`: transaction drilldown (spends, outputs, signers, credits, debits)
 - `block <height-or-id>`: block metadata, tx list, coinbase credits
 - `status`: layer cursors + key table row counts
-- `audit <address>`: full wallet audit with ledger + transaction summaries, optional CSV export
+- `audit <address>`: full wallet audit with ledger + transaction summaries, optional CSV export via `--csv [PATH_OR_DIR]`
 
 ### Data sources
 
@@ -50,6 +50,13 @@ iris-blocks --db nockchain.sqlite sync --connect http://localhost:5555 --run-mig
 # Query by PKH or legacy V0 key
 iris-blocks --db nockchain.sqlite balance <address>
 iris-blocks --db nockchain.sqlite audit <address> --csv wallet_audit.csv
+
+# Auto-name CSV in current directory:
+# nockchain_transactions_<wallet-address>.csv
+iris-blocks --db nockchain.sqlite audit <address> --csv
+
+# Write auto-named CSV into a directory:
+iris-blocks --db nockchain.sqlite audit <address> --csv /Users/thomas/Downloads/
 ```
 
 ## Units
