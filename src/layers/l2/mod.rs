@@ -4,7 +4,7 @@ use super::{l0::schema::transactions, layer::*, shared_schema::*};
 use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use iris_nockchain_types::{v1::SpendV1, RawTx};
+use iris_nockchain_types::{v1::SpendV1, Tx};
 use iris_ztd::{cue, Hashable, NounDecode, ZMap};
 use log::*;
 use schema::*;
@@ -181,18 +181,18 @@ impl LayerImpl for L2Client {
                                 tx.height
                             ))
                         })?;
-                        let raw = RawTx::from_noun(
+                        let vtx = Tx::from_noun(
                             &cue(&tx.jam).ok_or(LayerErrorSource::NounCue(tx_height, *tx.id))?,
                         )
                         .ok_or(LayerErrorSource::NounDecode(tx_height, *tx.id))?;
 
                         let spend_version =
-                            Self::checked_u32_to_i32(u32::from(raw.version()), "tx_spends.version")?;
+                            Self::checked_u32_to_i32(u32::from(vtx.version()), "tx_spends.version")?;
                         let mut global_seed_idx = 0i32;
 
-                        match &raw {
-                            RawTx::V0(raw_v0) => {
-                                for (z, (name, input)) in raw_v0.inputs.0.iter().enumerate() {
+                        match &vtx {
+                            Tx::V0(v0) => {
+                                for (z, (name, input)) in v0.raw.inputs.0.iter().enumerate() {
                                     block_spends.push(TxSpend {
                                         txid: tx.id,
                                         z: Self::checked_usize_to_i32(z, "tx_spends.z")?,
@@ -238,9 +238,9 @@ impl LayerImpl for L2Client {
                                     }
                                 }
                             }
-                            RawTx::V1(raw_v1) => {
+                            Tx::V1(v1) => {
                                 let spends_map = ZMap::from_iter(
-                                    raw_v1
+                                    v1.raw
                                         .spends
                                         .0
                                         .iter()
@@ -315,7 +315,7 @@ impl LayerImpl for L2Client {
                             }
                         }
 
-                        let outputs = raw.outputs(tx_height, self.activations.tx_engine(tx_height));
+                        let outputs = vtx.outputs().notes();
                         for (idx, note) in outputs.into_iter().enumerate() {
                             block_outputs.push(TxOutput {
                                 txid: tx.id,

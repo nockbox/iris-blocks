@@ -1281,7 +1281,6 @@ dependencies = [
 [[package]]
 name = "iris-crypto"
 version = "0.2.0-alpha.6"
-source = "git+https://github.com/nockbox/iris-rs#7a48f63660ab0a715b2707240b98ae2f29382098"
 dependencies = [
  "argon2",
  "arrayvec",
@@ -1300,7 +1299,6 @@ dependencies = [
 [[package]]
 name = "iris-grpc-proto"
 version = "0.2.0-alpha.6"
-source = "git+https://github.com/nockbox/iris-rs#7a48f63660ab0a715b2707240b98ae2f29382098"
 dependencies = [
  "bip39",
  "glob",
@@ -1321,7 +1319,6 @@ dependencies = [
 [[package]]
 name = "iris-nockchain-types"
 version = "0.2.0-alpha.6"
-source = "git+https://github.com/nockbox/iris-rs#7a48f63660ab0a715b2707240b98ae2f29382098"
 dependencies = [
  "bip39",
  "bs58",
@@ -1337,7 +1334,6 @@ dependencies = [
 [[package]]
 name = "iris-ztd"
 version = "0.2.0-alpha.6"
-source = "git+https://github.com/nockbox/iris-rs#7a48f63660ab0a715b2707240b98ae2f29382098"
 dependencies = [
  "arrayref",
  "arrayvec",
@@ -1354,7 +1350,6 @@ dependencies = [
 [[package]]
 name = "iris-ztd-derive"
 version = "0.2.0-alpha.6"
-source = "git+https://github.com/nockbox/iris-rs#7a48f63660ab0a715b2707240b98ae2f29382098"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",

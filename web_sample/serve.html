@@ -61,7 +61,7 @@
 
                 // Instantiate exporter as per README
                 statusEl.textContent += "Creating BlockExporter...\n";
-                const exporter = await new BlockExporter(["l0", "l1"], ":memory:", true, "http://localhost:8080", true);
+                const exporter = await new BlockExporter(["l0", "l1"], ":memory:", true, "http://localhost:8080", true, false);
 
                 statusEl.textContent += "BlockExporter instance created successfully!\n";
                 console.log("BlockExporter instance:", exporter);

@@ -4,7 +4,7 @@ use super::{l0::schema::*, layer::*, shared_schema::*};
 use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use iris_nockchain_types::{Nicks, Page, RawTx};
+use iris_nockchain_types::{Nicks, Page, Tx};
 use iris_ztd::{cue, NounDecode};
 use log::*;
 use schema::*;
@@ -175,13 +175,13 @@ impl LayerImpl for L1Client {
                             .await?;
 
                         for tx in txs {
-                            let raw =
-                                RawTx::from_noun(&cue(&tx.jam).ok_or(LayerErrorSource::NounCue(block_height, *tx.id))?)
+                            let vtx =
+                                Tx::from_noun(&cue(&tx.jam).ok_or(LayerErrorSource::NounCue(block_height, *tx.id))?)
                                     .ok_or(LayerErrorSource::NounDecode(block_height, *tx.id))?;
-                            let outputs = raw.outputs(block_height, self.activations.tx_engine(block_height));
+                            let outputs = vtx.outputs().notes();
                             let fees = Nicks::from(tx.fee as u64);
 
-                            let names = raw.input_names();
+                            let names = vtx.input_names();
 
                             let names_cond = names
                                 .iter()

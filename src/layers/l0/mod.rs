@@ -29,6 +29,8 @@ pub struct L0Config {
     pub block_range_config: block_range_manager::BlockRangeConfig,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub store_pow: bool,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub verify_outputs: bool,
 }
 
 impl Default for L0Config {
@@ -36,6 +38,7 @@ impl Default for L0Config {
         Self {
             block_range_config: Default::default(),
             store_pow: false,
+            verify_outputs: true,
         }
     }
 }
@@ -323,27 +326,32 @@ impl<S: Scryable> L0Client<S> {
                 height: height as _,
                 version: block.version() as _,
                 parent: block.parent().into(),
-                timestamp: Self::checked_u64_to_i64(block.timestamp().as_unix_seconds().unwrap(), "blocks.timestamp")?,
+                timestamp: Self::checked_u64_to_i64(
+                    block.timestamp().as_unix_seconds().unwrap(),
+                    "blocks.timestamp",
+                )?,
                 msg: block.msg().try_into().ok(),
                 jam: jam(block.to_noun()),
             });
             for (txid, tx) in txs {
                 let rtx = tx.raw();
 
-                let mut chain_outputs = tx.outputs().notes();
-                chain_outputs.sort_by_key(|n| n.name());
-                let mut outputs = rtx.outputs(height, self.activations.tx_engine(height));
-                outputs.sort_by_key(|n| n.name());
+                if self.config.verify_outputs {
+                    let mut chain_outputs = tx.outputs().notes();
+                    chain_outputs.sort_by_key(|n| n.name());
+                    let mut outputs = rtx.outputs(height, self.activations.tx_engine(height));
+                    outputs.sort_by_key(|n| n.name());
 
-                // Verify that iris computes outputs correctly
-                if chain_outputs != outputs {
-                    trace!(
-                        "Transaction {} invalid.\nChain outputs: {:?}\nComputed outputs: {:?}",
-                        txid,
-                        chain_outputs,
-                        outputs
-                    );
-                    return Err(L0Error::TransactionInvalid(txid, height, bid));
+                    // Verify that iris computes outputs correctly
+                    if chain_outputs != outputs {
+                        trace!(
+                            "Transaction {} invalid.\nChain outputs: {:?}\nComputed outputs: {:?}",
+                            txid,
+                            chain_outputs,
+                            outputs
+                        );
+                        return Err(L0Error::TransactionInvalid(txid, height, bid));
+                    }
                 }
 
                 create_txs.push(Transaction {
@@ -352,8 +360,11 @@ impl<S: Scryable> L0Client<S> {
                     height: height as _,
                     version: rtx.version() as _,
                     fee: Self::checked_u64_to_i64(rtx.total_fees().0, "transactions.fee")?,
-                    total_size: Self::checked_u64_to_i32(tx.total_size() as u64, "transactions.total_size")?,
-                    jam: jam(rtx.to_noun()),
+                    total_size: Self::checked_u64_to_i32(
+                        tx.total_size() as u64,
+                        "transactions.total_size",
+                    )?,
+                    jam: jam(tx.to_noun()),
                 });
 
                 crate::rt::yield_now().await;

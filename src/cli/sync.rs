@@ -14,7 +14,7 @@ use crate::{
         l3::L3Client,
         l4::L4Client,
         layer::{LayerDependency, LayerExt},
-        shared_schema::{layer_metadata, FixedLayerMetadata},
+        shared_schema::layer_metadata,
     },
 };
 use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;

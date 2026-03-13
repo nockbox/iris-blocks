@@ -8,7 +8,7 @@ use iris_crypto::PublicKey;
 use iris_nockchain_types::{
     v0::LegacySignature,
     v1::{Lock, LockPrimitive, Pkh, SpendCondition, SpendV1},
-    Note, Page, RawTx,
+    Note, Page, Tx,
 };
 use iris_ztd::{cue, jam, Digest, Hashable, NounDecode, NounEncode, ZMap};
 use log::*;
@@ -290,14 +290,14 @@ impl LayerImpl for L3Client {
 
                     for tx in txs {
                         let tx_height = tx.height as u32;
-                        let raw = RawTx::from_noun(
+                        let vtx = Tx::from_noun(
                             &cue(&tx.jam).ok_or(LayerErrorSource::NounCue(tx_height, *tx.id))?,
                         )
                         .ok_or(LayerErrorSource::NounDecode(tx_height, *tx.id))?;
 
-                        match &raw {
-                            RawTx::V0(raw_v0) => {
-                                for (name, input) in &raw_v0.inputs.0 {
+                        match &vtx {
+                            Tx::V0(v0) => {
+                                for (name, input) in &v0.raw.inputs.0 {
                                     if let Some(signature) = &input.spend.signature {
                                         Self::collect_legacy_signature_rows(
                                             signature,
@@ -309,10 +309,7 @@ impl LayerImpl for L3Client {
                                     }
                                 }
 
-                                let outputs = raw.outputs(
-                                    tx_height,
-                                    self.activations.tx_engine(tx_height),
-                                );
+                                let outputs = vtx.outputs().notes();
                                 for note in outputs {
                                     if let Note::V0(v0_note) = note {
                                         let first = v0_note.name.first.into();
@@ -328,9 +325,9 @@ impl LayerImpl for L3Client {
                                     }
                                 }
                             }
-                            RawTx::V1(raw_v1) => {
+                            Tx::V1(v1) => {
                                 let spends = ZMap::from_iter(
-                                    raw_v1
+                                    v1.raw
                                         .spends
                                         .0
                                         .iter()
