@@ -22,14 +22,14 @@ path = "src/main.rs"
 required-features = ["binary"]
 
 [dependencies]
-iris-ztd = { path = "../iris-rs/crates/iris-ztd", features = ["alloc"] }
-iris-nockchain-types = { path = "../iris-rs/crates/iris-nockchain-types" }
-iris-grpc-proto = { path = "../iris-rs/crates/iris-grpc-proto", features = ["private-api"] }
-iris-crypto = { path = "../iris-rs/crates/iris-crypto" }
-# iris-ztd = { git = "https://github.com/nockbox/iris-rs/", features = ["alloc"] }
-# iris-nockchain-types = { git = "https://github.com/nockbox/iris-rs" }
-# iris-grpc-proto = { git = "https://github.com/nockbox/iris-rs/", features = ["private-api"] }
-# iris-crypto = { git = "https://github.com/nockbox/iris-rs" }
+# iris-ztd = { path = "../iris-rs/crates/iris-ztd", features = ["alloc"] }
+# iris-nockchain-types = { path = "../iris-rs/crates/iris-nockchain-types" }
+# iris-grpc-proto = { path = "../iris-rs/crates/iris-grpc-proto", features = ["private-api"] }
+# iris-crypto = { path = "../iris-rs/crates/iris-crypto" }
+iris-ztd = { git = "https://github.com/nockbox/iris-rs/", features = ["alloc"] }
+iris-nockchain-types = { git = "https://github.com/nockbox/iris-rs" }
+iris-grpc-proto = { git = "https://github.com/nockbox/iris-rs/", features = ["private-api"] }
+iris-crypto = { git = "https://github.com/nockbox/iris-rs" }
 tonic = { version = "0.12", default-features = false }
 bs58 = { version = "0.5", default-features = false }
 bitvec = { version = "1.0", default-features = false }

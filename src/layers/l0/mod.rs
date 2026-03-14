@@ -52,26 +52,48 @@ pub struct L0Client<S: Scryable> {
     config: L0Config,
     stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
-    query_rx: mpsc::UnboundedReceiver<DbQueryRequest>,
+    query_rx: mpsc::UnboundedReceiver<DbQueryRequest<S>>,
 }
 
-pub struct DbQueryRequest {
-    pub sql: String,
-    pub responder: oneshot::Sender<Result<Vec<serde_json::Value>, String>>,
+pub enum DbQueryRequest<S> {
+    Query {
+        sql: String,
+        responder: oneshot::Sender<Result<Vec<serde_json::Value>, String>>,
+    },
+    Export {
+        responder: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    UpdateRpc {
+        client: Option<S>,
+    },
 }
 
 #[derive(Clone)]
-pub struct DbQueryHandle {
-    tx: mpsc::UnboundedSender<DbQueryRequest>,
+pub struct DbQueryHandle<S> {
+    tx: mpsc::UnboundedSender<DbQueryRequest<S>>,
 }
 
-impl DbQueryHandle {
+impl<S: Scryable> DbQueryHandle<S> {
     pub async fn query(&self, sql: String) -> Result<Vec<serde_json::Value>, String> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .unbounded_send(DbQueryRequest { sql, responder: tx })
+            .unbounded_send(DbQueryRequest::Query { sql, responder: tx })
             .map_err(|e| e.to_string())?;
         rx.await.map_err(|e| e.to_string())?
+    }
+
+    pub async fn export(&self) -> Result<Vec<u8>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .unbounded_send(DbQueryRequest::Export { responder: tx })
+            .map_err(|e| e.to_string())?;
+        rx.await.map_err(|e| e.to_string())?
+    }
+
+    pub fn update_rpc(&self, client: Option<S>) -> Result<(), String> {
+        self.tx
+            .unbounded_send(DbQueryRequest::UpdateRpc { client })
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -84,7 +106,7 @@ pub enum L0Error {
     #[error("No new blocks and no genesis block stored")]
     NoNewBlocksNoGenesis,
     #[error("No new blocks")]
-    NoNewBlocks(FixedLayerMetadata, Digest, BlockHeight),
+    NoNewBlocks(FixedLayerMetadata, Digest, BlockHeight, bool),
     #[error("Unable to parse blocks range response")]
     UnableToParseBlocksRangeResponse,
     #[error("Block missing pow")]
@@ -132,7 +154,7 @@ impl<S: Scryable> L0Client<S> {
         config: L0Config,
         activations: ChainActivations,
         dependencies: Vec<Arc<dyn LayerDependency>>,
-    ) -> (Self, DbQueryHandle) {
+    ) -> (Self, DbQueryHandle<S>) {
         let (stats_tx, stats_rx) = Self::verify_dependencies(&dependencies).unwrap();
         let (query_tx, query_rx) = mpsc::unbounded();
         (
@@ -280,6 +302,7 @@ impl<S: Scryable> L0Client<S> {
                     mdata,
                     tail_block.id.into(),
                     tail_block.height as BlockHeight,
+                    false,
                 ));
             } else {
                 return Err(L0Error::GrpcNeeded);
@@ -296,6 +319,7 @@ impl<S: Scryable> L0Client<S> {
                     mdata,
                     tail_block.id.into(),
                     tail_block.height as BlockHeight,
+                    false,
                 ))
             }
             (Some((tail_block, _)), false) => {
@@ -413,16 +437,22 @@ impl<S: Scryable> L0Client<S> {
 
         let metadata = match self.update_blocks_impl().await {
             Ok(metadata) => metadata,
-            Err(L0Error::NoNewBlocks(metadata, a, b)) => {
-                res = Err(L0Error::NoNewBlocks(metadata, a, b));
+            Err(L0Error::NoNewBlocks(metadata, a, b, _)) => {
+                res = Err(L0Error::NoNewBlocks(metadata, a, b, false));
                 metadata
             }
             Err(e) => return Err(e),
         };
 
+        let mut deps_has_more = false;
         for dep in self.dependencies.iter() {
             trace!("Updating {}", dep.layer());
-            dep.update_blocks(&mut self.conn, metadata).await?;
+            deps_has_more |= dep.update_blocks(&mut self.conn, metadata).await?;
+        }
+
+        // If we had NoNewBlocks, propagate the deps_has_more flag
+        if let Err(L0Error::NoNewBlocks(m, a, b, _)) = res {
+            res = Err(L0Error::NoNewBlocks(m, a, b, deps_has_more));
         }
 
         res
@@ -437,10 +467,18 @@ impl<S: Scryable> L0Client<S> {
                 Err(L0Error::Reverted) => {
                     debug!("Chain reverted. Restarting...");
                 }
-                Err(L0Error::NoNewBlocks(_metadata, block, height)) => {
+                Err(L0Error::NoNewBlocks(metadata, block, height, deps_has_more)) => {
                     debug!("Chain up-to-date at block {block}, height {height}");
-                    self.sleep_and_process_queries(std::time::Duration::from_secs(30))
+                    if deps_has_more {
+                        self.deps_loop_and_process_queries(
+                            std::time::Duration::from_secs(30),
+                            metadata,
+                        )
                         .await;
+                    } else {
+                        self.sleep_and_process_queries(std::time::Duration::from_secs(30))
+                            .await;
+                    }
                 }
                 Err(e)
                     if matches!(
@@ -471,26 +509,54 @@ impl<S: Scryable> L0Client<S> {
         }
     }
 
-    async fn process_query(&mut self, req: DbQueryRequest) {
-        let sql = req.sql;
-        let res = self
-            .conn
-            .spawn_blocking(
-                move |conn| -> Result<Vec<serde_json::Value>, diesel::result::Error> {
-                    crate::sqlite_raw::raw_query_json(conn, &sql).map_err(|e| {
-                        diesel::result::Error::DatabaseError(
-                            diesel::result::DatabaseErrorKind::Unknown,
-                            Box::new(e),
-                        )
+    async fn process_query(&mut self, req: DbQueryRequest<S>) {
+        match req {
+            DbQueryRequest::Query { sql, responder } => {
+                let res = self
+                    .conn
+                    .spawn_blocking(
+                        move |conn| -> Result<Vec<serde_json::Value>, diesel::result::Error> {
+                            crate::sqlite_raw::raw_query_json(conn, &sql).map_err(|e| {
+                                diesel::result::Error::DatabaseError(
+                                    diesel::result::DatabaseErrorKind::Unknown,
+                                    Box::new(e),
+                                )
+                            })
+                        },
+                    )
+                    .await;
+                let res = match res {
+                    Ok(val) => Ok(val),
+                    Err(e) => Err(e.to_string()),
+                };
+                responder.send(res).ok();
+            }
+            DbQueryRequest::Export { responder } => {
+                let res = self
+                    .conn
+                    .spawn_blocking(move |conn| -> Result<Vec<u8>, diesel::result::Error> {
+                        crate::sqlite_raw::serialize_db(conn).map_err(|e| {
+                            diesel::result::Error::DatabaseError(
+                                diesel::result::DatabaseErrorKind::Unknown,
+                                Box::new(e),
+                            )
+                        })
                     })
-                },
-            )
-            .await;
-        let res = match res {
-            Ok(val) => Ok(val),
-            Err(e) => Err(e.to_string()),
-        };
-        req.responder.send(res).ok();
+                    .await;
+                let res = match res {
+                    Ok(val) => Ok(val),
+                    Err(e) => Err(e.to_string()),
+                };
+                responder.send(res).ok();
+            }
+            DbQueryRequest::UpdateRpc { client } => {
+                info!("Updating RPC client");
+                self.manager = client
+                    .as_ref()
+                    .map(|c| BlockRangeManager::new(c.clone(), self.config.block_range_config));
+                self.client = client;
+            }
+        }
     }
 
     async fn sleep_and_process_queries(&mut self, duration: std::time::Duration) {
@@ -500,10 +566,65 @@ impl<S: Scryable> L0Client<S> {
             futures::select! {
                 _ = sleep => break,
                 req = self.query_rx.next() => {
-                    let Some(req) = req else { break; };
+                    let Some(req) = req else {
+                        sleep.await;
+                        break;
+                    };
                     self.process_query(req).await;
                 }
             }
+        }
+    }
+
+    /// Like `sleep_and_process_queries`, but keeps calling deps while they
+    /// have more work. Stops when all deps return false or duration expires.
+    async fn deps_loop_and_process_queries(
+        &mut self,
+        duration: std::time::Duration,
+        metadata: FixedLayerMetadata,
+    ) {
+        let deadline = rt::sleep(duration).fuse();
+        let mut deadline = core::pin::pin!(deadline);
+
+        loop {
+            // Process any pending queries first
+            self.process_queries().await;
+
+            // Check if the deadline has expired
+            if (&mut deadline).now_or_never().is_some() {
+                break;
+            }
+
+            // Run deps
+            let mut has_more = false;
+            for dep in self.dependencies.iter() {
+                match dep.update_blocks(&mut self.conn, metadata).await {
+                    Ok(more) => has_more |= more,
+                    Err(e) => {
+                        error!("Error updating dependency {}: {e:?}", dep.layer());
+                        break;
+                    }
+                }
+            }
+
+            if !has_more {
+                // All deps caught up, now just sleep the rest of the duration
+                loop {
+                    futures::select! {
+                        _ = deadline => break,
+                        req = self.query_rx.next() => {
+                            let Some(req) = req else {
+                                deadline.await;
+                                break;
+                            };
+                            self.process_query(req).await;
+                        }
+                    }
+                }
+                break;
+            }
+
+            crate::rt::yield_now().await;
         }
     }
 }

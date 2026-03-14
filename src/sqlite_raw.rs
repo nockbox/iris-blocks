@@ -130,3 +130,69 @@ unsafe fn sqlite_err(db: *mut ffi::sqlite3) -> String {
         CStr::from_ptr(msg).to_string_lossy().into_owned()
     }
 }
+
+#[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
+pub fn serialize_db(conn: &mut SqliteConnection) -> Result<Vec<u8>, String> {
+    unsafe { conn.with_raw_connection(|db| serialize_db_impl(db)) }
+}
+
+#[cfg(not(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs")))]
+pub fn serialize_db(_conn: &mut SqliteConnection) -> Result<Vec<u8>, String> {
+    Err("serialize_db requires libsqlite3-sys or sqlite-wasm-rs feature".to_string())
+}
+
+#[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
+unsafe fn serialize_db_impl(db: *mut ffi::sqlite3) -> Result<Vec<u8>, String> {
+    let schema = CString::new("main").unwrap();
+    let mut size: ffi::sqlite3_int64 = 0;
+    let ptr = ffi::sqlite3_serialize(
+        db,
+        schema.as_ptr(),
+        &mut size,
+        0, // no flags — returns a malloc'd copy
+    );
+    if ptr.is_null() {
+        return Err("sqlite3_serialize returned NULL (out of memory or empty db)".to_string());
+    }
+    let bytes = std::slice::from_raw_parts(ptr as *const u8, size as usize).to_vec();
+    ffi::sqlite3_free(ptr as *mut _);
+    Ok(bytes)
+}
+
+#[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
+pub fn deserialize_db(conn: &mut SqliteConnection, bytes: &[u8]) -> Result<(), String> {
+    unsafe { conn.with_raw_connection(|db| deserialize_db_impl(db, bytes)) }
+}
+
+#[cfg(not(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs")))]
+pub fn deserialize_db(_conn: &mut SqliteConnection, _bytes: &[u8]) -> Result<(), String> {
+    Err("deserialize_db requires libsqlite3-sys or sqlite-wasm-rs feature".to_string())
+}
+
+#[cfg(any(feature = "libsqlite3-sys", feature = "sqlite-wasm-rs"))]
+unsafe fn deserialize_db_impl(db: *mut ffi::sqlite3, bytes: &[u8]) -> Result<(), String> {
+    let len = bytes.len() as ffi::sqlite3_int64;
+
+    // sqlite3_deserialize takes ownership of a sqlite3_malloc'd buffer
+    let buf = ffi::sqlite3_malloc64(len as u64) as *mut u8;
+    if buf.is_null() {
+        return Err("sqlite3_malloc64 failed (out of memory)".to_string());
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+
+    let schema = CString::new("main").unwrap();
+    let rc = ffi::sqlite3_deserialize(
+        db,
+        schema.as_ptr(),
+        buf,
+        len,
+        len,
+        ffi::SQLITE_DESERIALIZE_FREEONCLOSE | ffi::SQLITE_DESERIALIZE_RESIZEABLE,
+    );
+    if rc != ffi::SQLITE_OK {
+        // On error, SQLite did NOT take ownership, so we must free
+        ffi::sqlite3_free(buf as *mut _);
+        return Err(format!("sqlite3_deserialize failed: {}", sqlite_err(db)));
+    }
+    Ok(())
+}

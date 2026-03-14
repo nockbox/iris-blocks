@@ -16,6 +16,7 @@ use iris_nockchain_types::Page;
 use iris_ztd::{cue, Hashable, NounDecode};
 use log::*;
 use schema::*;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -24,7 +25,7 @@ use tracing::Instrument;
 pub struct L4Client {
     activations: ChainActivations,
     deps: Vec<Arc<dyn LayerDependency>>,
-    _stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
+    stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
@@ -34,7 +35,7 @@ impl L4Client {
         Self {
             activations,
             deps,
-            _stats_tx: stats_tx,
+            stats_tx,
             stats_rx,
         }
     }
@@ -151,7 +152,7 @@ impl L4Client {
 impl LayerBase for L4Client {
     const ACCEPT_LAYERS: &'static [&'static str] = &["l3"];
     const LAYER: &'static str = "l4";
-    type Stats = ();
+    type Stats = L4Stats;
     fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>> {
         self.stats_rx.clone()
     }
@@ -204,12 +205,13 @@ impl LayerImpl for L4Client {
         &'a self,
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: FixedLayerMetadata,
-    ) -> Result<(), LayerErrorSource> {
+    ) -> Result<bool, LayerErrorSource> {
         if metadata.next_block_height == 0 {
+            let mut has_more = false;
             for dep in &self.deps {
-                dep.update_blocks(conn, metadata).await?;
+                has_more |= dep.update_blocks(conn, metadata).await?;
             }
-            return Ok(());
+            return Ok(has_more);
         }
 
         let cur_metadata = Self::layer_metadata(conn).await?;
@@ -221,10 +223,11 @@ impl LayerImpl for L4Client {
 
         if start_block_height > end_block_height {
             let dep_metadata = cur_metadata.unwrap_or(metadata);
+            let mut has_more = false;
             for dep in &self.deps {
-                dep.update_blocks(conn, dep_metadata).await?;
+                has_more |= dep.update_blocks(conn, dep_metadata).await?;
             }
-            return Ok(());
+            return Ok(has_more);
         }
 
         self.expire_blocks_impl(
@@ -236,21 +239,24 @@ impl LayerImpl for L4Client {
         )
         .await?;
 
-        trace!("Syncing credit_info from {start_block_height} to {end_block_height}");
         let constants = self.activations.constants();
         let step = 100u32;
+        let last_block_height = core::cmp::min(start_block_height + step - 1, end_block_height);
+
+        trace!("Syncing credit_info from {start_block_height} to {last_block_height}");
         let mut cur_metadata = FixedLayerMetadata {
             layer: Self::LAYER,
             next_block_height: start_block_height as i32,
         };
 
-        for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
-            let block_range_span =
-                tracing::info_span!("l4_update_block_range", block_height, end_block_height);
-            let last_block_height = core::cmp::min(block_height + step - 1, end_block_height);
+        let block_range_span = tracing::info_span!(
+            "l4_update_block_range",
+            start_block_height,
+            last_block_height
+        );
 
-            async {
-                for height in block_height..=last_block_height {
+        async {
+            for height in start_block_height..=last_block_height {
                     let h = height as i32;
 
                     let mut block_info = vec![];
@@ -376,16 +382,32 @@ impl LayerImpl for L4Client {
                     crate::rt::yield_now().await;
                 }
 
-                Ok::<(), LayerErrorSource>(())
-            }
-            .instrument(block_range_span)
-            .await?;
+            Ok::<(), LayerErrorSource>(())
         }
+        .instrument(block_range_span)
+        .await?;
 
+        let ci_count = credit_info::table.count().get_result::<i64>(conn).await? as u64;
+
+        self.stats_tx
+            .send(Some(L4Stats {
+                credit_info: ci_count,
+            }))
+            .unwrap();
+
+        let self_has_more = last_block_height < end_block_height;
+        let mut has_more = self_has_more;
         for dep in &self.deps {
-            dep.update_blocks(conn, cur_metadata).await?;
+            has_more |= dep.update_blocks(conn, cur_metadata).await?;
         }
 
-        Ok(())
+        Ok(has_more)
     }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(from_wasm_abi, into_wasm_abi))]
+pub struct L4Stats {
+    pub credit_info: u64,
 }

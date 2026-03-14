@@ -31,6 +31,12 @@ pub struct SyncArgs {
     /// Reset next_block_height to 0 for the given layer (l1–l4) and exit.
     #[arg(long, value_name = "LAYER")]
     pub rederive_layer: Option<String>,
+    /// Remove a layer by reverting migrations from l4 down to the given layer,
+    /// then re-running up migrations. This drops and recreates tables.
+    #[arg(long, value_name = "LAYER")]
+    pub remove_layer: Option<String>,
+    #[arg(long, default_value = "false")]
+    pub disable_l4: bool,
     #[command(flatten)]
     pub l0: L0Config,
 }
@@ -45,6 +51,17 @@ impl SyncArgs {
             eprintln!("Migrations run.");
         }
 
+        if let Some(layer) = self.remove_layer {
+            db::remove_layers_down_to(&mut conn, &layer).await;
+            eprintln!("Reverted migrations down to {layer}.");
+            if !self.run_migrations {
+                return Ok(());
+            } else {
+                db::run_migrations(&mut conn).await;
+                eprintln!("Re-applied migrations.");
+            }
+        }
+
         if let Some(layer) = self.rederive_layer {
             diesel::update(layer_metadata::table)
                 .filter(layer_metadata::layer.eq(&layer))
@@ -56,8 +73,16 @@ impl SyncArgs {
         }
 
         let activations = ChainActivations::mainnet();
-        let l4_client = Arc::new(L4Client::new(activations.clone(), vec![]));
-        let l3_deps: Vec<Arc<dyn LayerDependency>> = vec![l4_client.clone()];
+        let l4_client = if self.disable_l4 {
+            None
+        } else {
+            Some(Arc::new(L4Client::new(activations.clone(), vec![])))
+        };
+        let l3_deps: Vec<Arc<dyn LayerDependency>> = if self.disable_l4 {
+            vec![]
+        } else {
+            vec![l4_client.clone().unwrap()]
+        };
         let l3_client = Arc::new(L3Client::new(activations.clone(), l3_deps));
         let l2_deps: Vec<Arc<dyn LayerDependency>> = vec![l3_client.clone()];
         let l2_client = Arc::new(L2Client::new(activations.clone(), l2_deps));
@@ -72,10 +97,13 @@ impl SyncArgs {
                     L0Client::<NockAppServiceClient<Channel>>::layer_metadata(&mut conn)
                         .await?
                         .unwrap();
-                l1_client
+                while l1_client
                     .update_blocks(&mut conn, l0_metadata)
                     .await
-                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
+                {
+                    log::trace!("More blocks available, looping");
+                }
                 return Ok(());
             }
         };

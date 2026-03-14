@@ -1,3 +1,4 @@
+DELETE from layer_metadata where layer = 'l2';
 DROP TABLE IF EXISTS spend_conditions;
 DROP TABLE IF EXISTS lock_tree;
 DROP TABLE IF EXISTS pkh_to_pk;

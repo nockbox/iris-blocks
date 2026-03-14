@@ -13,3 +13,5 @@ CREATE TABLE credit_info (
 CREATE INDEX idx_credit_info_height ON credit_info(height);
 CREATE INDEX idx_credit_info_updated_height ON credit_info(updated_height);
 CREATE INDEX idx_credit_info_recipient ON credit_info(recipient);
+-- l4 does a whole lot of lookups with this as the index
+CREATE INDEX idx_credit_info_height_updated_height ON credit_info(height, updated_height);

@@ -6,6 +6,7 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use log::*;
 use schema::*;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::Instrument;
@@ -14,7 +15,7 @@ pub struct L3Client {
     #[allow(dead_code)]
     activations: ChainActivations,
     deps: Vec<Arc<dyn LayerDependency>>,
-    _stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
+    stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
@@ -24,7 +25,7 @@ impl L3Client {
         Self {
             activations,
             deps,
-            _stats_tx: stats_tx,
+            stats_tx,
             stats_rx,
         }
     }
@@ -33,7 +34,7 @@ impl L3Client {
 impl LayerBase for L3Client {
     const ACCEPT_LAYERS: &'static [&'static str] = &["l2"];
     const LAYER: &'static str = "l3";
-    type Stats = ();
+    type Stats = L3Stats;
     fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>> {
         self.stats_rx.clone()
     }
@@ -83,12 +84,13 @@ impl LayerImpl for L3Client {
         &'a self,
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: FixedLayerMetadata,
-    ) -> Result<(), LayerErrorSource> {
+    ) -> Result<bool, LayerErrorSource> {
         if metadata.next_block_height == 0 {
+            let mut has_more = false;
             for dep in &self.deps {
-                dep.update_blocks(conn, metadata).await?;
+                has_more |= dep.update_blocks(conn, metadata).await?;
             }
-            return Ok(());
+            return Ok(has_more);
         }
 
         let cur_metadata = Self::layer_metadata(conn).await?;
@@ -100,10 +102,11 @@ impl LayerImpl for L3Client {
 
         if start_block_height > end_block_height {
             let dep_metadata = cur_metadata.unwrap_or(metadata);
+            let mut has_more = false;
             for dep in &self.deps {
-                dep.update_blocks(conn, dep_metadata).await?;
+                has_more |= dep.update_blocks(conn, dep_metadata).await?;
             }
-            return Ok(());
+            return Ok(has_more);
         }
 
         self.expire_blocks_impl(
@@ -115,146 +118,184 @@ impl LayerImpl for L3Client {
         )
         .await?;
 
-        trace!("Syncing credits/debits from {start_block_height} to {end_block_height}");
         let step = 100u32;
+        let last_block_height = core::cmp::min(start_block_height + step - 1, end_block_height);
+
+        trace!("Syncing credits/debits from {start_block_height} to {last_block_height}");
         let mut cur_metadata = FixedLayerMetadata {
             layer: Self::LAYER,
             next_block_height: start_block_height as i32,
         };
 
-        for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
-            let block_range_span =
-                tracing::info_span!("l3_update_block_range", block_height, end_block_height);
-            let last_block_height = core::cmp::min(block_height + step - 1, end_block_height);
+        let block_range_span = tracing::info_span!(
+            "l3_update_block_range",
+            start_block_height,
+            last_block_height
+        );
 
-            async {
-                for height in block_height..=last_block_height {
-                    let h = height as i32;
+        async {
+            for height in start_block_height..=last_block_height {
+                let h = height as i32;
 
-                    // Get block_id
-                    let block_id: DbDigest = blocks::table
-                        .filter(blocks::height.eq(h))
-                        .select(blocks::id)
-                        .first::<DbDigest>(conn)
-                        .await
-                        .unwrap_or(DbDigest(iris_ztd::Digest::from_bytes(&[0; 32])));
+                // Get block_id
+                let block_id: DbDigest = blocks::table
+                    .filter(blocks::height.eq(h))
+                    .select(blocks::id)
+                    .first::<DbDigest>(conn)
+                    .await
+                    .unwrap_or(DbDigest(iris_ztd::Digest::from_bytes(&[0; 32])));
 
-                    let mut block_credits = vec![];
-                    let mut block_debits = vec![];
+                let mut block_credits = vec![];
+                let mut block_debits = vec![];
 
-                    // Credits from notes created at this height.
-                    // Group by (txid, first) since multiple notes can share
-                    // the same `first`. One credit per unique (txid, first).
-                    let created_notes = notes::table
-                        .filter(notes::created_height.eq(h))
-                        .select((notes::first, notes::created_txid, notes::assets))
-                        .load::<(DbDigest, Option<DbDigest>, i64)>(conn)
-                        .await?;
-
-                    let mut credit_map: std::collections::BTreeMap<
-                        (Option<DbDigest>, DbDigest),
-                        i64,
-                    > = std::collections::BTreeMap::new();
-                    for (first, created_txid, assets) in created_notes {
-                        *credit_map.entry((created_txid, first)).or_insert(0) += assets;
-                    }
-                    for ((created_txid, first), amount) in credit_map {
-                        block_credits.push(Credit {
-                            txid: created_txid,
-                            first,
-                            height: h,
-                            block_id,
-                            amount,
-                        });
-                    }
-
-                    // Debits from notes spent at this height.
-                    // Group by (txid, first) since multiple notes can share
-                    // the same `first` (lock-derived name). One debit per
-                    // unique (txid, first) with summed amounts.
-                    let spent_notes = notes::table
-                        .filter(notes::spent_height.eq(h))
-                        .select((notes::first, notes::spent_txid, notes::assets))
-                        .load::<(DbDigest, Option<DbDigest>, i64)>(conn)
-                        .await?;
-
-                    // Accumulate (txid, first) → total_amount
-                    let mut debit_map: std::collections::BTreeMap<
-                        (Option<DbDigest>, DbDigest),
-                        i64,
-                    > = std::collections::BTreeMap::new();
-                    for (first, spent_txid, assets) in spent_notes {
-                        *debit_map.entry((spent_txid, first)).or_insert(0) += assets;
-                    }
-
-                    // Fee per (txid, first) from L2 tx_spends
-                    for ((spent_txid, first), amount) in debit_map {
-                        use super::l2::schema::tx_spends;
-                        let fee = if let Some(ref txid) = spent_txid {
-                            tx_spends::table
-                                .filter(tx_spends::txid.eq(*txid).and(tx_spends::first.eq(first)))
-                                .select(tx_spends::fee)
-                                .first::<i64>(conn)
-                                .await
-                                .unwrap_or(0)
-                        } else {
-                            0
-                        };
-
-                        block_debits.push(Debit {
-                            txid: spent_txid,
-                            first: Some(first),
-                            height: h,
-                            block_id,
-                            amount,
-                            fee,
-                        });
-                    }
-
-                    cur_metadata = FixedLayerMetadata {
-                        layer: Self::LAYER,
-                        next_block_height: h + 1,
-                    };
-                    let next_metadata = cur_metadata;
-
-                    conn.spawn_blocking(move |conn| {
-                        use diesel::query_dsl::methods::ExecuteDsl;
-                        conn.transaction(move |conn| {
-                            if !block_credits.is_empty() {
-                                ExecuteDsl::execute(
-                                    diesel::insert_into(credits::table).values(&block_credits),
-                                    conn,
-                                )?;
-                            }
-                            if !block_debits.is_empty() {
-                                //for block_debit in block_debits {
-                                //log::trace!("New debit: {block_debit:?}");
-                                ExecuteDsl::execute(
-                                    diesel::insert_into(debits::table).values(&block_debits),
-                                    conn,
-                                )?;
-                                //}
-                            }
-                            ExecuteDsl::execute(Self::update_layer_metadata(&next_metadata), conn)?;
-                            Ok(())
-                        })
-                    })
-                    .instrument(tracing::info_span!("l3_commit_block", height))
+                // Credits from notes created at this height.
+                // Group by (txid, first) since multiple notes can share
+                // the same `first`. One credit per unique (txid, first).
+                let created_notes = notes::table
+                    .filter(notes::created_height.eq(h))
+                    .select((notes::first, notes::created_txid, notes::assets))
+                    .load::<(DbDigest, Option<DbDigest>, i64)>(conn)
                     .await?;
 
-                    crate::rt::yield_now().await;
+                let mut credit_map: std::collections::BTreeMap<(Option<DbDigest>, DbDigest), i64> =
+                    std::collections::BTreeMap::new();
+                for (first, created_txid, assets) in created_notes {
+                    *credit_map.entry((created_txid, first)).or_insert(0) += assets;
+                }
+                for ((created_txid, first), amount) in credit_map {
+                    block_credits.push(Credit {
+                        txid: created_txid,
+                        first,
+                        height: h,
+                        block_id,
+                        amount,
+                    });
                 }
 
-                Ok::<(), LayerErrorSource>(())
+                // Debits from notes spent at this height.
+                // Group by (txid, first) since multiple notes can share
+                // the same `first` (lock-derived name). One debit per
+                // unique (txid, first) with summed amounts.
+                let spent_notes = notes::table
+                    .filter(notes::spent_height.eq(h))
+                    .select((notes::first, notes::spent_txid, notes::assets))
+                    .load::<(DbDigest, Option<DbDigest>, i64)>(conn)
+                    .await?;
+
+                // Accumulate (txid, first) → total_amount
+                let mut debit_map: std::collections::BTreeMap<(Option<DbDigest>, DbDigest), i64> =
+                    std::collections::BTreeMap::new();
+                for (first, spent_txid, assets) in spent_notes {
+                    *debit_map.entry((spent_txid, first)).or_insert(0) += assets;
+                }
+
+                // Fee per (txid, first) from L2 tx_spends
+                for ((spent_txid, first), amount) in debit_map {
+                    use super::l2::schema::tx_spends;
+                    let fee = if let Some(ref txid) = spent_txid {
+                        tx_spends::table
+                            .filter(tx_spends::txid.eq(*txid).and(tx_spends::first.eq(first)))
+                            .select(tx_spends::fee)
+                            .first::<i64>(conn)
+                            .await
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                    block_debits.push(Debit {
+                        txid: spent_txid,
+                        first: Some(first),
+                        height: h,
+                        block_id,
+                        amount,
+                        fee,
+                    });
+                }
+
+                // Filter out refunds: remove credit/debit pairs that share
+                // the same (txid, first), meaning assets sent back to the
+                // same identity within the same transaction.
+                let debit_keys: std::collections::BTreeSet<(Option<DbDigest>, DbDigest)> =
+                    block_debits
+                        .iter()
+                        .filter_map(|d| d.first.map(|first| (d.txid, first)))
+                        .collect();
+                let credit_keys: std::collections::BTreeSet<(Option<DbDigest>, DbDigest)> =
+                    block_credits.iter().map(|c| (c.txid, c.first)).collect();
+                let refund_keys: std::collections::BTreeSet<_> =
+                    credit_keys.intersection(&debit_keys).cloned().collect();
+                if !refund_keys.is_empty() {
+                    block_credits.retain(|c| !refund_keys.contains(&(c.txid, c.first)));
+                    block_debits.retain(|d| {
+                        d.first
+                            .map_or(true, |first| !refund_keys.contains(&(d.txid, first)))
+                    });
+                }
+
+                cur_metadata = FixedLayerMetadata {
+                    layer: Self::LAYER,
+                    next_block_height: h + 1,
+                };
+                let next_metadata = cur_metadata;
+
+                conn.spawn_blocking(move |conn| {
+                    use diesel::query_dsl::methods::ExecuteDsl;
+                    conn.transaction(move |conn| {
+                        if !block_credits.is_empty() {
+                            ExecuteDsl::execute(
+                                diesel::insert_into(credits::table).values(&block_credits),
+                                conn,
+                            )?;
+                        }
+                        if !block_debits.is_empty() {
+                            //for block_debit in block_debits {
+                            //log::trace!("New debit: {block_debit:?}");
+                            ExecuteDsl::execute(
+                                diesel::insert_into(debits::table).values(&block_debits),
+                                conn,
+                            )?;
+                            //}
+                        }
+                        ExecuteDsl::execute(Self::update_layer_metadata(&next_metadata), conn)?;
+                        Ok(())
+                    })
+                })
+                .instrument(tracing::info_span!("l3_commit_block", height))
+                .await?;
+
+                crate::rt::yield_now().await;
             }
-            .instrument(block_range_span)
-            .await?;
-        }
 
+            Ok::<(), LayerErrorSource>(())
+        }
+        .instrument(block_range_span)
+        .await?;
+
+        let credit_count = credits::table.count().get_result::<i64>(conn).await? as u64;
+        let debit_count = debits::table.count().get_result::<i64>(conn).await? as u64;
+
+        self.stats_tx
+            .send(Some(L3Stats {
+                credits: credit_count,
+                debits: debit_count,
+            }))
+            .unwrap();
+
+        let self_has_more = last_block_height < end_block_height;
+        let mut has_more = self_has_more;
         for dep in &self.deps {
-            dep.update_blocks(conn, cur_metadata).await?;
+            has_more |= dep.update_blocks(conn, cur_metadata).await?;
         }
 
-        Ok(())
+        Ok(has_more)
     }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(from_wasm_abi, into_wasm_abi))]
+pub struct L3Stats {
+    pub credits: u64,
+    pub debits: u64,
 }

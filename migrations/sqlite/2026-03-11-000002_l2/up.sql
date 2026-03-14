@@ -24,7 +24,7 @@ CREATE TABLE tx_seeds (
     first  TEXT    NOT NULL,
     height INTEGER NOT NULL,
     PRIMARY KEY (txid, z, idx),
-    FOREIGN KEY (txid) REFERENCES transactions(id)
+    FOREIGN KEY (txid, z) REFERENCES tx_spends(txid, z)
 );
 CREATE INDEX idx_tx_seeds_height ON tx_seeds(height);
 CREATE INDEX idx_tx_seeds_first ON tx_seeds(first);
@@ -38,6 +38,7 @@ CREATE TABLE tx_outputs (
     height INTEGER NOT NULL,
     PRIMARY KEY (txid, idx),
     UNIQUE (first, last),
+    -- no FK on spends, because id is not unique key
     FOREIGN KEY (txid) REFERENCES transactions(id)
 );
 CREATE INDEX idx_tx_outputs_height ON tx_outputs(height);
@@ -48,7 +49,7 @@ CREATE TABLE tx_signers (
     pk     TEXT    NOT NULL,
     height INTEGER NOT NULL,
     PRIMARY KEY (txid, z, pk),
-    FOREIGN KEY (txid) REFERENCES transactions(id)
+    FOREIGN KEY (txid, z) REFERENCES tx_spends(txid, z)
 );
 CREATE INDEX idx_tx_signers_height ON tx_signers(height);
 
@@ -75,12 +76,16 @@ CREATE INDEX idx_pkh_to_pk_height ON pkh_to_pk(height);
 -- L2.3: Spend condition retrieval
 
 CREATE TABLE lock_tree (
-    root   TEXT    NOT NULL PRIMARY KEY,
+    root   TEXT    NOT NULL,
     height INTEGER NOT NULL,
     axis   INTEGER NOT NULL,
-    hash   TEXT    NOT NULL
+    hash   TEXT    NOT NULL,
+    PRIMARY KEY (root, axis),
+    FOREIGN KEY (root) REFERENCES name_to_lock(root)
 );
 CREATE INDEX idx_lock_tree_height ON lock_tree(height);
+CREATE INDEX idx_lock_tree_root ON lock_tree(root);
+CREATE INDEX idx_lock_tree_hash ON lock_tree(hash);
 
 CREATE TABLE spend_conditions (
     hash   TEXT    NOT NULL PRIMARY KEY,

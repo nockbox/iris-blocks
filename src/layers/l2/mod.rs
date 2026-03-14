@@ -5,9 +5,10 @@ use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use iris_nockchain_types::{v1::SpendV1, Tx};
-use iris_ztd::{cue, jam, Digest, Hashable, NounDecode, NounEncode};
+use iris_ztd::{cue, jam, Hashable, NounDecode, NounEncode};
 use log::*;
 use schema::*;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::Instrument;
@@ -16,7 +17,7 @@ pub struct L2Client {
     #[allow(dead_code)]
     activations: ChainActivations,
     deps: Vec<Arc<dyn LayerDependency>>,
-    _stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
+    stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
@@ -56,7 +57,7 @@ impl L2Client {
         Self {
             activations,
             deps,
-            _stats_tx: stats_tx,
+            stats_tx,
             stats_rx,
         }
     }
@@ -77,21 +78,6 @@ impl L2Client {
         i32::try_from(value).map_err(|_| {
             LayerErrorSource::OtherError(format!("numeric value out of range for {field}: {value}"))
         })
-    }
-
-    fn merkle_proof_siblings(axis: u64, path: &[Digest]) -> Vec<(i32, Digest)> {
-        let mut out = vec![];
-        let mut cur_axis = axis;
-        for sibling_hash in path {
-            let sibling_axis = if cur_axis % 2 == 0 {
-                cur_axis + 1
-            } else {
-                cur_axis - 1
-            };
-            out.push((sibling_axis as i32, *sibling_hash));
-            cur_axis /= 2;
-        }
-        out
     }
 
     /// L2.1: Collect transaction internals (spends, seeds, outputs, signers).
@@ -285,8 +271,8 @@ impl L2Client {
         vtx: &Tx,
         block_id: DbDigest,
         bufs: &mut L2BlockBuffers,
-    ) {
-        let Tx::V1(v1) = vtx else { return };
+    ) -> Result<(), LayerErrorSource> {
+        let Tx::V1(v1) = vtx else { return Ok(()) };
 
         for (z, (name, spend)) in v1.raw.spends.0.iter().enumerate() {
             let SpendV1::S1(witness_spend) = spend else {
@@ -307,22 +293,18 @@ impl L2Client {
                 block_id,
             });
 
-            // lock_tree: root node
-            bufs.lock_trees.push(LockTree {
-                root,
-                height: tx.height,
-                axis: 1,
-                hash: root.0.into(),
-            });
-
-            // lock_tree: merkle proof siblings
-            for (axis, digest) in
-                Self::merkle_proof_siblings(lock_proof.axis(), &lock_proof.proof().path)
+            // lock_tree: merkle proof branches
+            for (axis, digest) in lock_proof
+                .proof()
+                .visible_hashes(lock_proof.axis(), &*sc_hash)
+                .ok_or_else(|| {
+                    LayerErrorSource::OtherError(format!("invalid merkle proof on root {root}"))
+                })?
             {
                 bufs.lock_trees.push(LockTree {
                     root,
                     height: tx.height,
-                    axis,
+                    axis: axis as i32,
                     hash: digest.into(),
                 });
             }
@@ -336,13 +318,14 @@ impl L2Client {
                 jam: jam(sc.to_noun()),
             });
         }
+        Ok(())
     }
 }
 
 impl LayerBase for L2Client {
     const ACCEPT_LAYERS: &'static [&'static str] = &["l1"];
     const LAYER: &'static str = "l2";
-    type Stats = ();
+    type Stats = L2Stats;
     fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>> {
         self.stats_rx.clone()
     }
@@ -427,12 +410,13 @@ impl LayerImpl for L2Client {
         &'a self,
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: FixedLayerMetadata,
-    ) -> Result<(), LayerErrorSource> {
+    ) -> Result<bool, LayerErrorSource> {
         if metadata.next_block_height == 0 {
+            let mut has_more = false;
             for dep in &self.deps {
-                dep.update_blocks(conn, metadata).await?;
+                has_more |= dep.update_blocks(conn, metadata).await?;
             }
-            return Ok(());
+            return Ok(has_more);
         }
 
         let cur_metadata = Self::layer_metadata(conn).await?;
@@ -444,10 +428,11 @@ impl LayerImpl for L2Client {
 
         if start_block_height > end_block_height {
             let dep_metadata = cur_metadata.unwrap_or(metadata);
+            let mut has_more = false;
             for dep in &self.deps {
-                dep.update_blocks(conn, dep_metadata).await?;
+                has_more |= dep.update_blocks(conn, dep_metadata).await?;
             }
-            return Ok(());
+            return Ok(has_more);
         }
 
         self.expire_blocks_impl(
@@ -459,154 +444,183 @@ impl LayerImpl for L2Client {
         )
         .await?;
 
-        trace!("Syncing L2 from {start_block_height} to {end_block_height}");
         let step = 100u32;
+        let last_block_height = core::cmp::min(start_block_height + step - 1, end_block_height);
+
+        trace!("Syncing L2 from {start_block_height} to {last_block_height}");
         let mut cur_metadata = FixedLayerMetadata {
             layer: Self::LAYER,
             next_block_height: start_block_height as i32,
         };
 
-        for block_height in (start_block_height..=end_block_height).step_by(step as usize) {
-            let block_range_span =
-                tracing::info_span!("l2_update_block_range", block_height, end_block_height);
-            let last_block_height = core::cmp::min(block_height + step - 1, end_block_height);
+        let block_range_span = tracing::info_span!(
+            "l2_update_block_range",
+            start_block_height,
+            last_block_height
+        );
 
-            async {
-                for height in block_height..=last_block_height {
-                    let get_txs_span = tracing::info_span!("l2_db_get_txs", height);
-                    let txs = transactions::table
-                        .filter(transactions::height.eq(height as i32))
-                        .order_by(transactions::id)
-                        .load::<super::l0::schema::Transaction>(conn)
-                        .instrument(get_txs_span)
-                        .await?;
-
-                    // Get block_id for L2.2/L2.3
-                    let block_id: DbDigest = if !txs.is_empty() {
-                        txs[0].block_id
-                    } else {
-                        use super::l0::schema::blocks;
-                        blocks::table
-                            .filter(blocks::height.eq(height as i32))
-                            .select(blocks::id)
-                            .first::<DbDigest>(conn)
-                            .await
-                            .unwrap_or(DbDigest(iris_ztd::Digest::from_bytes(&[0; 32])))
-                    };
-
-                    let mut bufs = L2BlockBuffers::new();
-
-                    for tx in txs {
-                        let tx_height = u32::try_from(tx.height).map_err(|_| {
-                            LayerErrorSource::OtherError(format!(
-                                "negative block height in transactions.height: {}",
-                                tx.height
-                            ))
-                        })?;
-                        let vtx = Tx::from_noun(
-                            &cue(&tx.jam).ok_or(LayerErrorSource::NounCue(tx_height, *tx.id))?,
-                        )
-                        .ok_or(LayerErrorSource::NounDecode(tx_height, *tx.id))?;
-                        let spend_version = Self::checked_u32_to_i32(
-                            u32::from(vtx.version()),
-                            "tx_spends.version",
-                        )?;
-
-                        // L2.1: transaction internals
-                        Self::collect_tx_internals(&tx, &vtx, spend_version, &mut bufs)?;
-                        // L2.2: hash reversals
-                        Self::collect_hash_reversals(&tx, &vtx, block_id, &mut bufs);
-                        // L2.3: spend conditions
-                        Self::collect_spend_conditions(&tx, &vtx, block_id, &mut bufs);
-
-                        crate::rt::yield_now().await;
-                    }
-
-                    cur_metadata = FixedLayerMetadata {
-                        layer: Self::LAYER,
-                        next_block_height: height as i32 + 1,
-                    };
-                    let next_metadata = cur_metadata;
-
-                    conn.spawn_blocking(move |conn| {
-                        use diesel::query_dsl::methods::ExecuteDsl;
-                        conn.transaction(move |conn| {
-                            // L2.1
-                            if !bufs.spends.is_empty() {
-                                ExecuteDsl::execute(
-                                    diesel::insert_into(tx_spends::table).values(&bufs.spends),
-                                    conn,
-                                )?;
-                            }
-                            if !bufs.seeds.is_empty() {
-                                ExecuteDsl::execute(
-                                    diesel::insert_into(tx_seeds::table).values(&bufs.seeds),
-                                    conn,
-                                )?;
-                            }
-                            if !bufs.outputs.is_empty() {
-                                ExecuteDsl::execute(
-                                    diesel::insert_into(tx_outputs::table).values(&bufs.outputs),
-                                    conn,
-                                )?;
-                            }
-                            if !bufs.signers.is_empty() {
-                                ExecuteDsl::execute(
-                                    diesel::insert_into(tx_signers::table).values(&bufs.signers),
-                                    conn,
-                                )?;
-                            }
-                            // L2.2
-                            if !bufs.name_to_lock.is_empty() {
-                                ExecuteDsl::execute(
-                                    diesel::insert_or_ignore_into(name_to_lock::table)
-                                        .values(&bufs.name_to_lock),
-                                    conn,
-                                )?;
-                            }
-                            if !bufs.pkh_to_pk.is_empty() {
-                                ExecuteDsl::execute(
-                                    diesel::insert_or_ignore_into(pkh_to_pk::table)
-                                        .values(&bufs.pkh_to_pk),
-                                    conn,
-                                )?;
-                            }
-                            // L2.3
-                            if !bufs.lock_trees.is_empty() {
-                                ExecuteDsl::execute(
-                                    diesel::insert_or_ignore_into(lock_tree::table)
-                                        .values(&bufs.lock_trees),
-                                    conn,
-                                )?;
-                            }
-                            if !bufs.spend_conditions.is_empty() {
-                                ExecuteDsl::execute(
-                                    diesel::insert_or_ignore_into(spend_conditions::table)
-                                        .values(&bufs.spend_conditions),
-                                    conn,
-                                )?;
-                            }
-
-                            ExecuteDsl::execute(Self::update_layer_metadata(&next_metadata), conn)?;
-                            Ok(())
-                        })
-                    })
-                    .instrument(tracing::info_span!("l2_commit_block", height))
+        async {
+            for height in start_block_height..=last_block_height {
+                let get_txs_span = tracing::info_span!("l2_db_get_txs", height);
+                let txs = transactions::table
+                    .filter(transactions::height.eq(height as i32))
+                    .order_by(transactions::id)
+                    .load::<super::l0::schema::Transaction>(conn)
+                    .instrument(get_txs_span)
                     .await?;
+
+                // Get block_id for L2.2/L2.3
+                let block_id: DbDigest = if !txs.is_empty() {
+                    txs[0].block_id
+                } else {
+                    use super::l0::schema::blocks;
+                    blocks::table
+                        .filter(blocks::height.eq(height as i32))
+                        .select(blocks::id)
+                        .first::<DbDigest>(conn)
+                        .await
+                        .unwrap_or(DbDigest(iris_ztd::Digest::from_bytes(&[0; 32])))
+                };
+
+                let mut bufs = L2BlockBuffers::new();
+
+                for tx in txs {
+                    let tx_height = u32::try_from(tx.height).map_err(|_| {
+                        LayerErrorSource::OtherError(format!(
+                            "negative block height in transactions.height: {}",
+                            tx.height
+                        ))
+                    })?;
+                    let vtx = Tx::from_noun(
+                        &cue(&tx.jam).ok_or(LayerErrorSource::NounCue(tx_height, *tx.id))?,
+                    )
+                    .ok_or(LayerErrorSource::NounDecode(tx_height, *tx.id))?;
+                    let spend_version =
+                        Self::checked_u32_to_i32(u32::from(vtx.version()), "tx_spends.version")?;
+
+                    // L2.1: transaction internals
+                    Self::collect_tx_internals(&tx, &vtx, spend_version, &mut bufs)?;
+                    // L2.2: hash reversals
+                    Self::collect_hash_reversals(&tx, &vtx, block_id, &mut bufs);
+                    // L2.3: spend conditions
+                    Self::collect_spend_conditions(&tx, &vtx, block_id, &mut bufs)?;
+
+                    crate::rt::yield_now().await;
                 }
 
-                Ok::<(), LayerErrorSource>(())
+                cur_metadata = FixedLayerMetadata {
+                    layer: Self::LAYER,
+                    next_block_height: height as i32 + 1,
+                };
+                let next_metadata = cur_metadata;
+
+                conn.spawn_blocking(move |conn| {
+                    use diesel::query_dsl::methods::ExecuteDsl;
+                    conn.transaction(move |conn| {
+                        // L2.1
+                        if !bufs.spends.is_empty() {
+                            ExecuteDsl::execute(
+                                diesel::insert_into(tx_spends::table).values(&bufs.spends),
+                                conn,
+                            )?;
+                        }
+                        if !bufs.seeds.is_empty() {
+                            ExecuteDsl::execute(
+                                diesel::insert_into(tx_seeds::table).values(&bufs.seeds),
+                                conn,
+                            )?;
+                        }
+                        if !bufs.outputs.is_empty() {
+                            ExecuteDsl::execute(
+                                diesel::insert_into(tx_outputs::table).values(&bufs.outputs),
+                                conn,
+                            )?;
+                        }
+                        if !bufs.signers.is_empty() {
+                            ExecuteDsl::execute(
+                                diesel::insert_into(tx_signers::table).values(&bufs.signers),
+                                conn,
+                            )?;
+                        }
+                        // L2.2
+                        if !bufs.name_to_lock.is_empty() {
+                            ExecuteDsl::execute(
+                                diesel::insert_or_ignore_into(name_to_lock::table)
+                                    .values(&bufs.name_to_lock),
+                                conn,
+                            )?;
+                        }
+                        if !bufs.pkh_to_pk.is_empty() {
+                            ExecuteDsl::execute(
+                                diesel::insert_or_ignore_into(pkh_to_pk::table)
+                                    .values(&bufs.pkh_to_pk),
+                                conn,
+                            )?;
+                        }
+                        // L2.3
+                        if !bufs.lock_trees.is_empty() {
+                            ExecuteDsl::execute(
+                                diesel::insert_or_ignore_into(lock_tree::table)
+                                    .values(&bufs.lock_trees),
+                                conn,
+                            )?;
+                        }
+                        if !bufs.spend_conditions.is_empty() {
+                            ExecuteDsl::execute(
+                                diesel::insert_or_ignore_into(spend_conditions::table)
+                                    .values(&bufs.spend_conditions),
+                                conn,
+                            )?;
+                        }
+
+                        ExecuteDsl::execute(Self::update_layer_metadata(&next_metadata), conn)?;
+                        Ok(())
+                    })
+                })
+                .instrument(tracing::info_span!("l2_commit_block", height))
+                .await?;
             }
-            .instrument(block_range_span)
-            .await?;
-        }
 
+            Ok::<(), LayerErrorSource>(())
+        }
+        .instrument(block_range_span)
+        .await?;
+
+        let mapped_names = name_to_lock::table.count().get_result::<i64>(conn).await? as u64;
+        let mapped_pkhs = pkh_to_pk::table.count().get_result::<i64>(conn).await? as u64;
+        let spend_conds = spend_conditions::table
+            .count()
+            .get_result::<i64>(conn)
+            .await? as u64;
+        let lock_nodes = lock_tree::table.count().get_result::<i64>(conn).await? as u64;
+
+        self.stats_tx
+            .send(Some(L2Stats {
+                mapped_names,
+                mapped_pkhs,
+                spend_conditions: spend_conds,
+                lock_nodes,
+            }))
+            .unwrap();
+
+        let self_has_more = last_block_height < end_block_height;
+        let mut has_more = self_has_more;
         for dep in &self.deps {
-            dep.update_blocks(conn, cur_metadata).await?;
+            has_more |= dep.update_blocks(conn, cur_metadata).await?;
         }
 
-        Ok(())
+        Ok(has_more)
     }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
+#[cfg_attr(feature = "wasm", tsify(from_wasm_abi, into_wasm_abi))]
+pub struct L2Stats {
+    pub mapped_names: u64,
+    pub mapped_pkhs: u64,
+    pub spend_conditions: u64,
+    pub lock_nodes: u64,
 }
 
 #[cfg(test)]

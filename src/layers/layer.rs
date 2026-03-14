@@ -150,7 +150,7 @@ pub trait LayerImpl: Layer {
         &'a self,
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
-    ) -> impl Future<Output = Result<(), LayerErrorSource>> + RtBound + 'a;
+    ) -> impl Future<Output = Result<bool, LayerErrorSource>> + RtBound + 'a;
 }
 
 #[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
@@ -165,7 +165,7 @@ pub trait LayerDependency: Layer + RtBound + RtSync {
         &self,
         conn: &mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
-    ) -> Result<(), LayerError>;
+    ) -> Result<bool, LayerError>;
 }
 
 #[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
@@ -189,7 +189,7 @@ impl<T: ?Sized + LayerImpl + RtBound + RtSync> LayerDependency for T {
         &self,
         conn: &mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
-    ) -> Result<(), LayerError> {
+    ) -> Result<bool, LayerError> {
         self.update_blocks_impl(conn, metadata)
             .await
             .map_err(|e| LayerError {

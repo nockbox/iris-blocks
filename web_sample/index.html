@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Iris Blocks WASM Test</title>
+<style>
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            padding: 1.5rem;
+            background: #1e1e1e;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+        }
+
+        h1 {
+            margin: 0 0 0.75rem 0;
+            flex-shrink: 0;
+        }
+
+        .status {
+            padding: 0.75rem 1rem;
+            background: #2d2d2d;
+            border-radius: 4px;
+            font-family: monospace;
+            white-space: pre-wrap;
+            font-size: 0.85rem;
+            flex-shrink: 0;
+            max-height: 5rem;
+            overflow-y: auto;
+        }
+
+        .config-panel {
+            display: flex;
+            gap: 0.75rem;
+            margin-top: 0.75rem;
+            flex-shrink: 0;
+            align-items: stretch;
+            flex-wrap: wrap;
+        }
+
+        .config-group {
+            background: #2d2d2d;
+            border-radius: 4px;
+            padding: 0.6rem 0.8rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+        }
+
+        .config-group label {
+            font-size: 0.65rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .config-group input[type="text"] {
+            background: #161616;
+            border: 1px solid #444;
+            border-radius: 3px;
+            color: #fff;
+            font-family: monospace;
+            font-size: 0.85rem;
+            padding: 0.3rem 0.5rem;
+            outline: none;
+            min-width: 200px;
+        }
+
+        .config-group input[type="text"]:focus {
+            border-color: #51afef;
+        }
+
+        .layer-checks {
+            display: flex;
+            gap: 0.6rem;
+            flex-wrap: wrap;
+        }
+
+        .layer-checks label {
+            font-size: 0.8rem;
+            color: #ccc;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        .file-drop {
+            border: 2px dashed #444;
+            border-radius: 4px;
+            padding: 0.5rem 0.8rem;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.15s;
+            font-size: 0.8rem;
+            color: #888;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 160px;
+        }
+
+        .file-drop.has-file {
+            border-color: #98be65;
+            color: #98be65;
+        }
+
+        .file-drop.drag-over {
+            border-color: #51afef;
+            background: rgba(81, 175, 239, 0.05);
+        }
+
+        .config-actions {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        .btn {
+            padding: 0.45rem 1rem;
+            border: none;
+            border-radius: 4px;
+            font-family: system-ui, -apple-system, sans-serif;
+            font-size: 0.85rem;
+            cursor: pointer;
+            font-weight: 500;
+            transition: opacity 0.15s;
+        }
+
+        .btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .btn-start {
+            background: #98be65;
+            color: #1e1e1e;
+        }
+
+        .btn-export {
+            background: #51afef;
+            color: #1e1e1e;
+        }
+
+        .btn-stop {
+            background: #ff6c6b;
+            color: #1e1e1e;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 0.5rem;
+            margin-top: 0.75rem;
+            flex-shrink: 0;
+        }
+
+        .stat-card {
+            padding: 0.5rem 0.75rem;
+            background: #2d2d2d;
+            border-radius: 4px;
+            border-left: 3px solid #51afef;
+        }
+
+        .stat-card .label {
+            font-size: 0.65rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .stat-card .value {
+            font-size: 1.1rem;
+            font-family: monospace;
+            color: #98be65;
+            margin-top: 1px;
+        }
+
+        .stat-card.l0 {
+            border-left-color: #51afef;
+        }
+
+        .stat-card.l1 {
+            border-left-color: #c678dd;
+        }
+
+        .stat-card.l2 {
+            border-left-color: #da8548;
+        }
+
+        .stat-card.l3 {
+            border-left-color: #98be65;
+        }
+
+        .stat-card.l4 {
+            border-left-color: #ecbe7b;
+        }
+
+        #terminal-container {
+            margin-top: 0.75rem;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 120px;
+        }
+
+        #terminal-output {
+            flex: 1;
+            overflow-y: auto;
+            background: #161616;
+            border: 1px solid #333;
+            border-bottom: none;
+            border-radius: 4px 4px 0 0;
+            padding: 0.75rem 1rem;
+            font-family: monospace;
+            font-size: 0.9rem;
+            white-space: pre-wrap;
+        }
+
+        #terminal-input-bar {
+            display: flex;
+            background: #161616;
+            padding: 0.5rem;
+            border-radius: 0 0 4px 4px;
+            border: 1px solid #333;
+            align-items: center;
+            flex-shrink: 0;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Iris Blocks WASM Test</h1>
+
+    <div class="config-panel">
+        <div class="config-group">
+            <label>RPC Endpoint</label>
+            <input type="text" id="rpc-endpoint" value="http://localhost:8080">
+        </div>
+        <div class="config-group">
+            <label>Layers</label>
+            <div class="layer-checks">
+                <label><input type="checkbox" value="l0" checked disabled> L0</label>
+                <label><input type="checkbox" value="l1" checked> L1</label>
+                <label><input type="checkbox" value="l2" checked> L2</label>
+                <label><input type="checkbox" value="l3" checked> L3</label>
+                <label><input type="checkbox" value="l4" checked> L4</label>
+            </div>
+        </div>
+        <div class="config-group">
+            <label>Rederive From</label>
+            <select id="rederive-layer" style="background:#161616;border:1px solid #444;border-radius:3px;color:#fff;font-family:monospace;font-size:0.85rem;padding:0.3rem 0.5rem;outline:none;">
+                <option value="">None</option>
+                <option value="l1">L1 (drops L1–L4)</option>
+                <option value="l2">L2 (drops L2–L4)</option>
+                <option value="l3">L3 (drops L3–L4)</option>
+                <option value="l4">L4 (drops L4)</option>
+            </select>
+        </div>
+        <div class="config-group" style="justify-content: center;">
+            <div class="file-drop" id="file-drop">
+                Drop .sqlite or click
+                <input type="file" id="file-input" accept=".sqlite,.db,.sqlite3" hidden>
+            </div>
+        </div>
+        <div class="config-actions">
+            <button class="btn btn-start" id="btn-start">Start</button>
+            <button class="btn btn-stop" id="btn-stop" disabled>Stop</button>
+            <button class="btn btn-export" id="btn-export" disabled>Export DB</button>
+        </div>
+    </div>
+
+    <div class="status" id="status" style="margin-top: 0.75rem;"></div>
+
+    <div class="stats-grid" id="stats-grid"></div>
+
+    <div id="terminal-container">
+        <div id="terminal-output"></div>
+        <div id="terminal-input-bar">
+            <span
+                style="color: #51afef; margin-right: 0.5rem; font-family: monospace; font-weight: bold; font-size: 0.9rem;">nocksql&gt;</span>
+            <input type="text" id="terminal-input"
+                style="flex: 1; background: transparent; border: none; color: #fff; font-family: monospace; outline: none; font-size: 0.9rem;"
+                spellcheck="false" autocomplete="off">
+        </div>
+    </div>
+
+    <script>
+        const statusEl = document.getElementById('status');
+        const statsGrid = document.getElementById('stats-grid');
+        const terminalOutput = document.getElementById('terminal-output');
+        const terminalInput = document.getElementById('terminal-input');
+        const btnStart = document.getElementById('btn-start');
+        const btnStop = document.getElementById('btn-stop');
+        const btnExport = document.getElementById('btn-export');
+        const rpcEndpoint = document.getElementById('rpc-endpoint');
+        const fileDrop = document.getElementById('file-drop');
+        const fileInput = document.getElementById('file-input');
+
+        let uploadedDbBytes = null;
+        let running = false;
+
+        // --- File drop / select ---
+        fileDrop.addEventListener('click', () => fileInput.click());
+        fileDrop.addEventListener('dragover', (e) => { e.preventDefault(); fileDrop.classList.add('drag-over'); });
+        fileDrop.addEventListener('dragleave', () => fileDrop.classList.remove('drag-over'));
+        fileDrop.addEventListener('drop', (e) => {
+            e.preventDefault();
+            fileDrop.classList.remove('drag-over');
+            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+        });
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length) handleFile(fileInput.files[0]);
+        });
+
+        function handleFile(file) {
+            const reader = new FileReader();
+            reader.onload = () => {
+                uploadedDbBytes = new Uint8Array(reader.result);
+                fileDrop.textContent = file.name;
+                fileDrop.classList.add('has-file');
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        // --- Stats rendering ---
+        const allStats = {};
+        const statDefs = {
+            l0: [
+                { key: 'next_block_height', label: 'Blocks', transform: v => v - 1 },
+                { key: 'total_txs', label: 'Transactions' },
+            ],
+            l1: [
+                { key: 'total_notes', label: 'Notes' },
+                { key: 'spent_notes', label: 'Spent' },
+                { key: '_unspent', label: 'Unspent', compute: s => s.total_notes - s.spent_notes },
+            ],
+            l2: [
+                { key: 'mapped_names', label: 'Mapped Names' },
+                { key: 'mapped_pkhs', label: 'Mapped PKHs' },
+                { key: 'spend_conditions', label: 'Spend Conditions' },
+                { key: 'lock_nodes', label: 'Lock Nodes' },
+            ],
+            l3: [
+                { key: 'credits', label: 'Credits' },
+                { key: 'debits', label: 'Debits' },
+            ],
+            l4: [
+                { key: 'credit_info', label: 'Credit Info' },
+            ],
+        };
+
+        function renderStats() {
+            statsGrid.innerHTML = '';
+            for (const [layer, defs] of Object.entries(statDefs)) {
+                const stats = allStats[layer];
+                if (!stats) continue;
+                for (const def of defs) {
+                    const card = document.createElement('div');
+                    card.className = `stat-card ${layer}`;
+                    const value = def.compute ? def.compute(stats) : (def.transform ? def.transform(stats[def.key]) : stats[def.key]);
+                    card.innerHTML = `<div class="label">${layer.toUpperCase()} · ${def.label}</div><div class="value">${value.toLocaleString()}</div>`;
+                    statsGrid.appendChild(card);
+                }
+            }
+        }
+
+        // --- Worker setup ---
+        let worker = null;
+        let queryId = 0;
+        const pendingQueries = new Map();
+
+        function setupWorker() {
+            worker = new Worker('./worker.js', { type: 'module' });
+            worker.onmessage = (e) => {
+                const { type, ...data } = e.data;
+                switch (type) {
+                    case 'status':
+                        statusEl.textContent += data.message + '\n';
+                        break;
+                    case 'ready':
+                        appendOutput("Minimal SQLite terminal ready. Type your queries and press Enter.", "#c678dd");
+                        break;
+                    case 'stats':
+                        allStats[data.layer] = data.stats;
+                        renderStats();
+                        break;
+                    case 'queryResult': {
+                        const pending = pendingQueries.get(data.id);
+                        if (pending) {
+                            pendingQueries.delete(data.id);
+                            if (data.error) {
+                                pending.reject(data.error);
+                            } else {
+                                pending.resolve(data.result);
+                            }
+                        }
+                        break;
+                    }
+                    case 'stopped':
+                        running = false;
+                        btnStart.disabled = false;
+                        btnStop.disabled = true;
+                        btnExport.disabled = true;
+                        statusEl.textContent += 'Stopped.\n';
+                        worker = null;
+                        break;
+                    case 'exportResult':
+                        if (data.error) {
+                            statusEl.textContent += `Export error: ${data.error}\n`;
+                        } else {
+                            const blob = new Blob([data.data], { type: 'application/x-sqlite3' });
+                            const a = document.createElement('a');
+                            a.href = URL.createObjectURL(blob);
+                            a.download = 'iris-blocks.sqlite';
+                            a.click();
+                            URL.revokeObjectURL(a.href);
+                            statusEl.textContent += 'Database exported.\n';
+                        }
+                        btnExport.disabled = false;
+                        break;
+                    case 'error':
+                        statusEl.textContent += `Error: ${data.message}\n`;
+                        break;
+                }
+            };
+        }
+
+        function sendQuery(sql) {
+            return new Promise((resolve, reject) => {
+                if (!worker) return reject('Not running');
+                const id = queryId++;
+                pendingQueries.set(id, { resolve, reject });
+                worker.postMessage({ type: 'query', id, sql });
+            });
+        }
+
+        // --- Start / Stop ---
+        btnStart.addEventListener('click', () => {
+            if (running) return;
+            running = true;
+            btnStart.disabled = true;
+            btnStop.disabled = false;
+            btnExport.disabled = false;
+            statusEl.textContent = '';
+
+            // Clear previous stats
+            for (const k of Object.keys(allStats)) delete allStats[k];
+            statsGrid.innerHTML = '';
+
+            // Gather selected layers
+            const layers = ['l0'];
+            document.querySelectorAll('.layer-checks input:checked:not(:disabled)').forEach(cb => {
+                layers.push(cb.value);
+            });
+
+            setupWorker();
+
+            const rederiveVal = document.getElementById('rederive-layer').value;
+            const config = {
+                    layers,
+                    db_connect: ':memory:',
+                    db_run_migrations: true,
+                    remove_layer: rederiveVal || null,
+                    private_grpc_connect: rpcEndpoint.value || null,
+                    scry_no_pow: true,
+                    verify_outputs: false,
+            };
+
+            const msg = {
+                type: 'init',
+                config,
+                dbBytes: uploadedDbBytes || null,
+            };
+
+            // Transfer the ArrayBuffer to the worker (zero-copy)
+            const transferables = uploadedDbBytes ? [uploadedDbBytes.buffer] : [];
+            worker.postMessage(msg, transferables);
+            if (uploadedDbBytes) uploadedDbBytes = null; // buffer is now neutered
+        });
+
+        btnStop.addEventListener('click', () => {
+            if (!running || !worker) return;
+            btnStop.disabled = true;
+            btnExport.disabled = true;
+            statusEl.textContent += 'Stopping...\n';
+            worker.postMessage({ type: 'stop' });
+        });
+
+        rpcEndpoint.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && running && worker) {
+                const url = rpcEndpoint.value.trim();
+                worker.postMessage({ type: 'updateRpc', url: url || null });
+            }
+        });
+
+        btnExport.addEventListener('click', () => {
+            if (!running || !worker) return;
+            btnExport.disabled = true;
+            statusEl.textContent += 'Exporting database...\n';
+            worker.postMessage({ type: 'export' });
+        });
+
+        // --- Terminal logic ---
+        let history = [];
+        let historyIndex = -1;
+        let queryBuffer = [];
+        const promptEl = document.querySelector('#terminal-input-bar span');
+        const PRIMARY_PROMPT = 'nocksql>';
+        const CONTINUATION_PROMPT = '   ...>';
+
+        function setPrompt(text) {
+            promptEl.textContent = text;
+        }
+
+        function appendOutput(text, color = '#abb2bf') {
+            const div = document.createElement('div');
+            div.className = 'output-line';
+            div.style.color = color;
+            div.style.marginBottom = '2px';
+            div.style.whiteSpace = 'pre';
+            div.textContent = text;
+            terminalOutput.appendChild(div);
+            terminalOutput.scrollTop = terminalOutput.scrollHeight;
+        }
+
+        function renderTable(jsonStr) {
+            try {
+                const data = JSON.parse(jsonStr);
+                if (!Array.isArray(data) || data.length === 0) {
+                    return "0 rows found";
+                }
+
+                const keys = Object.keys(data[0]);
+                const colWidths = {};
+
+                keys.forEach(k => colWidths[k] = k.length);
+
+                data.forEach(row => {
+                    keys.forEach(k => {
+                        const val = String(row[k] ?? 'NULL');
+                        if (val.length > colWidths[k]) colWidths[k] = val.length;
+                    });
+                });
+
+                let header = keys.map(k => k.padEnd(colWidths[k])).join(' | ');
+                let separator = keys.map(k => '-'.repeat(colWidths[k])).join('-+-');
+
+                let table = header + '\n' + separator + '\n';
+
+                data.forEach(row => {
+                    table += keys.map(k => String(row[k] ?? 'NULL').padEnd(colWidths[k])).join(' | ') + '\n';
+                });
+
+                return table.trimEnd();
+            } catch (e) {
+                return "Error formatting table: " + e.message + "\nRaw: " + jsonStr;
+            }
+        }
+
+        terminalInput.addEventListener('keydown', async (e) => {
+            if (e.key === 'Enter') {
+                const line = terminalInput.value;
+                if (!line.trim() && queryBuffer.length === 0) return;
+
+                const prompt = queryBuffer.length === 0 ? PRIMARY_PROMPT : CONTINUATION_PROMPT;
+                appendOutput(`${prompt} ${line}`, '#51afef');
+                terminalInput.value = '';
+
+                queryBuffer.push(line);
+                const full = queryBuffer.join('\n').trim();
+
+                if (full.endsWith(';')) {
+                    // Complete query — execute
+                    queryBuffer = [];
+                    setPrompt(PRIMARY_PROMPT);
+
+                    if (history[history.length - 1] !== full) {
+                        history.push(full);
+                    }
+                    historyIndex = history.length;
+
+                    try {
+                        const result = await sendQuery(full);
+                        appendOutput(renderTable(result), '#98be65');
+                    } catch (err) {
+                        appendOutput(`Error: ${err}`, '#ff6c6b');
+                    }
+                } else {
+                    // Incomplete — show continuation prompt
+                    setPrompt(CONTINUATION_PROMPT);
+                }
+            } else if (e.key === 'ArrowUp') {
+                if (queryBuffer.length === 0 && historyIndex > 0) {
+                    historyIndex--;
+                    terminalInput.value = history[historyIndex];
+                }
+                e.preventDefault();
+            } else if (e.key === 'ArrowDown') {
+                if (queryBuffer.length === 0) {
+                    if (historyIndex < history.length - 1) {
+                        historyIndex++;
+                        terminalInput.value = history[historyIndex];
+                    } else {
+                        historyIndex = history.length;
+                        terminalInput.value = '';
+                    }
+                }
+                e.preventDefault();
+            } else if (e.key === 'Escape' || (e.key === 'c' && e.ctrlKey)) {
+                // Cancel multi-line buffer
+                if (queryBuffer.length > 0) {
+                    e.preventDefault();
+                    queryBuffer = [];
+                    setPrompt(PRIMARY_PROMPT);
+                    terminalInput.value = '';
+                    appendOutput('(query cancelled)', '#888');
+                }
+            }
+        });
+
+        terminalInput.addEventListener('paste', (e) => {
+            e.preventDefault();
+            const pasted = (e.clipboardData || window.clipboardData).getData('text');
+            const lines = pasted.split('\n');
+
+            // If there's existing text in the input, prepend it to the first pasted line
+            if (terminalInput.value) {
+                lines[0] = terminalInput.value + lines[0];
+            }
+
+            // Feed all lines except the last into the buffer (as if Enter was pressed)
+            for (let i = 0; i < lines.length - 1; i++) {
+                const prompt = queryBuffer.length === 0 ? PRIMARY_PROMPT : CONTINUATION_PROMPT;
+                appendOutput(`${prompt} ${lines[i]}`, '#51afef');
+                queryBuffer.push(lines[i]);
+            }
+
+            // Put the last line into the input field
+            const lastLine = lines[lines.length - 1];
+            terminalInput.value = lastLine;
+
+            // Update prompt if we buffered lines
+            if (queryBuffer.length > 0) {
+                setPrompt(CONTINUATION_PROMPT);
+            }
+        });
+    </script>
+</body>
+
+</html>

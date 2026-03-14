@@ -89,11 +89,16 @@ impl Note {
     }
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, AsChangeset, Identifiable)]
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
 #[diesel(table_name = notes, primary_key(first, last), treat_none_as_default_value = false)]
-pub struct SpendNote {
+pub struct NoteName {
     pub first: DbDigest,
     pub last: DbDigest,
+}
+
+#[derive(Debug, Clone, Queryable, AsChangeset)]
+#[diesel(table_name = notes, primary_key(first, last), treat_none_as_default_value = false)]
+pub struct SpendNote {
     pub spent_height: i32,
     pub spent_bid: DbDigest,
     pub spent_txid: DbDigest,

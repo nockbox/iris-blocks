@@ -92,7 +92,7 @@ diesel::table! {
     use diesel::sql_types::*;
     use crate::layers::shared_schema::sql_types::DigestSql;
 
-    lock_tree (root) {
+    lock_tree (root, axis) {
         root -> DigestSql,
         height -> Integer,
         axis -> Integer,
