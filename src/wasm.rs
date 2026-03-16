@@ -156,11 +156,11 @@ impl BlockExporter {
         }
 
         if let Some(ref layer) = config.remove_layer {
-            db::remove_layers_down_to(&mut conn, layer).await;
+            db::remove_layers_down_to(&mut conn, layer).await?;
         }
 
         if config.db_run_migrations {
-            db::run_migrations(&mut conn).await;
+            db::run_migrations(&mut conn).await?;
         }
 
         let activations = ChainActivations::mainnet();

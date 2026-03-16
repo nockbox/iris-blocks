@@ -1,2 +1,2 @@
-DELETE from layer_metadata where layer = 'l4';
-DROP TABLE IF EXISTS credit_info;
+DELETE FROM layer_metadata WHERE layer = 'l4';
+DROP TABLE IF EXISTS name_info;

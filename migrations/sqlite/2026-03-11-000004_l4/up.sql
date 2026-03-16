@@ -1,17 +1,13 @@
--- L4: credit info enrichment (SQLite)
+-- L4: name info enrichment (SQLite)
 
-CREATE TABLE credit_info (
-    txid           TEXT,
-    first          TEXT    NOT NULL,
-    height         INTEGER NOT NULL,
-    updated_height INTEGER NOT NULL,
-    recipient_type TEXT    NOT NULL,
-    recipient      TEXT    NOT NULL,
-    PRIMARY KEY (txid, first, height),
-    FOREIGN KEY (txid, first, height) REFERENCES credits(txid, first, height)
+CREATE TABLE name_info (
+    first      TEXT    NOT NULL,
+    height     INTEGER NOT NULL,
+    version    INTEGER NOT NULL,
+    owner_type TEXT    NOT NULL,
+    owner      TEXT    NOT NULL,
+    PRIMARY KEY (first, height)
 );
-CREATE INDEX idx_credit_info_height ON credit_info(height);
-CREATE INDEX idx_credit_info_updated_height ON credit_info(updated_height);
-CREATE INDEX idx_credit_info_recipient ON credit_info(recipient);
--- l4 does a whole lot of lookups with this as the index
-CREATE INDEX idx_credit_info_height_updated_height ON credit_info(height, updated_height);
+
+CREATE INDEX idx_name_info_owner_type ON name_info(owner_type);
+CREATE INDEX idx_name_info_owner ON name_info(owner);

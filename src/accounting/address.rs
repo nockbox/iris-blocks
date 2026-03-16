@@ -49,7 +49,6 @@ pub async fn resolve_address(
     // First try to treat the input as a DB-formatted PK.
     if let Ok(pk) = PublicKey::try_from(normalized) {
         let db_pk = DbPublicKey::from(pk);
-        println!("db_pk: {}", db_pk);
         if let Some(row) = pkh_to_pk::table
             .filter(pkh_to_pk::pk.eq(db_pk))
             .first::<PkhToPk>(conn)

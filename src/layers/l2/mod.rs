@@ -659,7 +659,7 @@ mod tests {
         let mut conn = crate::db::new_conn(dst.to_str().expect("db path"))
             .await
             .ok()?;
-        crate::db::run_migrations(&mut conn).await;
+        crate::db::run_migrations(&mut conn).await.ok()?;
         let client = L2Client::new(ChainActivations::mainnet(), vec![]);
         Some((conn, client, dst))
     }

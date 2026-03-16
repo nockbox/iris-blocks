@@ -1,10 +1,8 @@
 pub mod schema;
 
 use super::{
-    l0::schema::blocks,
     l1::schema::notes,
-    l2::schema::{name_to_lock, spend_conditions},
-    l3::schema::credits,
+    l2::schema::{lock_tree, name_to_lock, spend_conditions, SpendConditionRow},
     layer::*,
     shared_schema::*,
 };
@@ -12,13 +10,13 @@ use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use iris_nockchain_types::v1::SpendCondition;
-use iris_nockchain_types::Page;
 use iris_ztd::{cue, Hashable, NounDecode};
 use log::*;
 use schema::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::watch;
 use tracing::Instrument;
 
@@ -40,8 +38,8 @@ impl L4Client {
         }
     }
 
-    /// Determine recipient_type and recipient from a V1 spend condition.
-    fn resolve_recipient(sc: &SpendCondition) -> (String, String) {
+    /// Determine owner_type and owner from a spend condition.
+    fn resolve_owner_from_spend_condition(sc: &SpendCondition) -> (String, String) {
         let pkhs: Vec<_> = sc.pkh().collect();
         if pkhs.len() == 1 && pkhs[0].hashes.len() == 1 {
             if let Some(pkh) = pkhs[0].hashes.iter().next() {
@@ -56,8 +54,8 @@ impl L4Client {
         }
     }
 
-    /// Resolve a V0 note's recipient by decoding its JAM and extracting the sig pubkeys.
-    fn resolve_v0_recipient(note_jam: &[u8]) -> Result<(String, String), LayerErrorSource> {
+    /// Resolve a V0 note's owner by decoding its JAM and extracting signature keys.
+    fn resolve_v0_owner(note_jam: &[u8]) -> Result<(String, String), LayerErrorSource> {
         let noun = cue(note_jam)
             .ok_or_else(|| LayerErrorSource::OtherError("failed to cue v0 note".to_string()))?;
         let note = iris_nockchain_types::v0::NoteV0::from_noun(&noun)
@@ -76,30 +74,22 @@ impl L4Client {
         }
     }
 
-    /// Resolve a V1 credit recipient via name_to_lock → spend_conditions.
-    async fn resolve_v1_recipient(
+    /// Resolve owner for a lock root by decoding a revealed spend condition.
+    /// Single-row lock trees should resolve to pkh/musig per the CTO spec.
+    async fn resolve_owner_from_root_spend_condition(
         conn: &mut crate::db::AsyncDbConnection,
-        first: DbDigest,
+        root: DbDigest,
     ) -> Result<(String, String), LayerErrorSource> {
-        let root: DbDigest = name_to_lock::table
-            .filter(name_to_lock::first.eq(first))
-            .select(name_to_lock::root)
-            .first::<DbDigest>(conn)
-            .await
-            .map_err(|_| {
-                LayerErrorSource::OtherError(format!(
-                    "missing name_to_lock entry for first={first}"
-                ))
-            })?;
-
         let sc_row = spend_conditions::table
             .filter(spend_conditions::hash.eq(root))
-            .first::<super::l2::schema::SpendConditionRow>(conn)
+            .first::<SpendConditionRow>(conn)
             .await
             .optional()?;
 
         let Some(sc_row) = sc_row else {
-            return Ok(("lock".to_string(), root.to_string()));
+            return Err(LayerErrorSource::OtherError(format!(
+                "missing revealed spend_condition for root={root}"
+            )));
         };
 
         let sc = SpendCondition::from_noun(&cue(&sc_row.jam).ok_or_else(|| {
@@ -111,41 +101,13 @@ impl L4Client {
             ))
         })?;
 
-        Ok(Self::resolve_recipient(&sc))
-    }
-
-    /// Build a map from coinbase note `first` → (recipient_type, recipient).
-    /// For V0: sig contains public keys → recipient is the pk itself.
-    /// For V1: the CoinbaseSplit key IS the PKH directly.
-    fn coinbase_recipients(
-        page: &Page,
-        constants: iris_nockchain_types::BlockchainConstants,
-    ) -> BTreeMap<DbDigest, (String, String)> {
-        let notes = page.coinbase(constants);
-        let mut map = BTreeMap::new();
-        match page {
-            Page::V0(p) => {
-                for (note, (sig, _)) in notes.iter().zip(p.coinbase.0.iter()) {
-                    let first = DbDigest(note.name().first);
-                    let pk = sig
-                        .pubkeys
-                        .iter()
-                        .next()
-                        .expect("v0 coinbase sig must have at least one pubkey");
-                    map.insert(
-                        first,
-                        ("pk".to_string(), DbPublicKey::from(*pk).to_string()),
-                    );
-                }
-            }
-            Page::V1(p) => {
-                for (note, (pkh, _)) in notes.iter().zip(p.coinbase.0.iter()) {
-                    let first = DbDigest(note.name().first);
-                    map.insert(first, ("pkh".to_string(), pkh.to_string()));
-                }
-            }
+        let (owner_type, owner) = Self::resolve_owner_from_spend_condition(&sc);
+        if owner_type == "lock" {
+            return Err(LayerErrorSource::OtherError(format!(
+                "single lock_tree row for root={root} resolved as lock, expected pkh/musig"
+            )));
         }
-        map
+        Ok((owner_type, owner))
     }
 }
 
@@ -182,19 +144,10 @@ impl LayerImpl for L4Client {
 
         metadata.layer = Self::LAYER;
 
-        let min_height: Option<i32> = credit_info::table
-            .filter(credit_info::updated_height.ge(metadata.next_block_height))
-            .select(diesel::dsl::min(credit_info::height))
-            .first::<Option<i32>>(conn)
+        diesel::delete(name_info::table)
+            .filter(name_info::height.ge(metadata.next_block_height))
+            .execute(conn)
             .await?;
-
-        if let Some(min_h) = min_height {
-            diesel::delete(credit_info::table)
-                .filter(credit_info::height.ge(min_h))
-                .execute(conn)
-                .await?;
-            metadata.next_block_height = min_h;
-        }
 
         Self::update_layer_metadata(&metadata).execute(conn).await?;
         Ok(())
@@ -239,11 +192,11 @@ impl LayerImpl for L4Client {
         )
         .await?;
 
-        let constants = self.activations.constants();
+        let _constants = self.activations.constants();
         let step = 100u32;
         let last_block_height = core::cmp::min(start_block_height + step - 1, end_block_height);
 
-        trace!("Syncing credit_info from {start_block_height} to {last_block_height}");
+        trace!("Syncing name_info from {start_block_height} to {last_block_height}");
         let mut cur_metadata = FixedLayerMetadata {
             layer: Self::LAYER,
             next_block_height: start_block_height as i32,
@@ -257,141 +210,192 @@ impl LayerImpl for L4Client {
 
         async {
             for height in start_block_height..=last_block_height {
-                    let h = height as i32;
+                let h = height as i32;
+                let block_started = Instant::now();
+                let mut block_name_info = vec![];
+                let mut inserted_firsts: HashSet<DbDigest> = HashSet::new();
 
-                    let mut block_info = vec![];
+                // Phase 1: process newly revealed spend conditions at this height.
+                let revealed_sc_hashes = spend_conditions::table
+                    .filter(spend_conditions::height.eq(h))
+                    .select(spend_conditions::hash)
+                    .load::<DbDigest>(conn)
+                    .await?;
 
-                    // ── Non-coinbase credits (txid IS NOT NULL) ──
-                    let tx_credits = credits::table
-                        .filter(credits::height.eq(h))
-                        .filter(credits::txid.is_not_null())
-                        .select((credits::txid, credits::first))
-                        .load::<(Option<DbDigest>, DbDigest)>(conn)
+                let mut revealed_root_count = 0usize;
+                for sc_hash in revealed_sc_hashes {
+                    let sc_roots = lock_tree::table
+                        .filter(lock_tree::height.eq(h))
+                        .filter(lock_tree::hash.eq(sc_hash))
+                        .select(lock_tree::root)
+                        .load::<DbDigest>(conn)
                         .await?;
+                    let roots = sc_roots.into_iter().collect::<HashSet<_>>();
 
-                    for (txid_opt, first) in tx_credits {
-                        let txid = txid_opt.expect("txid IS NOT NULL but got None");
+                    for root in roots {
+                        let root_lock_row_count = lock_tree::table
+                            .filter(lock_tree::root.eq(root))
+                            .count()
+                            .get_result::<i64>(conn)
+                            .await?;
 
-                        // Determine note version to branch V0 vs V1
-                        let note_version: i32 = notes::table
-                            .filter(notes::first.eq(first))
-                            .select(notes::version)
-                            .first::<i32>(conn)
+                        let (owner_type, owner) = if root_lock_row_count > 1 {
+                            ("lock".to_string(), root.to_string())
+                        } else {
+                            Self::resolve_owner_from_root_spend_condition(conn, root).await?
+                        };
+
+                        let firsts = name_to_lock::table
+                            .filter(name_to_lock::root.eq(root))
+                            .select(name_to_lock::first)
+                            .load::<DbDigest>(conn)
+                            .await?
+                            .into_iter()
+                            .collect::<HashSet<_>>();
+
+                        for first in firsts {
+                            if inserted_firsts.insert(first) {
+                                block_name_info.push(NameInfo {
+                                    first,
+                                    height: h,
+                                    version: 1,
+                                    owner_type: owner_type.clone(),
+                                    owner: owner.clone(),
+                                });
+                                revealed_root_count += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Phase 2: process notes created at this height with missing name_info.
+                let new_firsts = notes::table
+                    .filter(notes::created_height.eq(h))
+                    .select(notes::first)
+                    .distinct()
+                    .load::<DbDigest>(conn)
+                    .await?;
+                let mut created_note_count = 0usize;
+
+                for first in new_firsts {
+                    if inserted_firsts.contains(&first) {
+                        continue;
+                    }
+
+                    let has_name_info = name_info::table
+                        .filter(name_info::first.eq(first))
+                        .select(name_info::height)
+                        .first::<i32>(conn)
+                        .await
+                        .optional()?
+                        .is_some();
+                    if has_name_info {
+                        continue;
+                    }
+
+                    let (version, note_jam) = notes::table
+                        .filter(notes::first.eq(first))
+                        .order(notes::created_height.asc())
+                        .then_order_by(notes::last.asc())
+                        .select((notes::version, notes::jam))
+                        .first::<(i32, Vec<u8>)>(conn)
+                        .await
+                        .map_err(|_| {
+                            LayerErrorSource::OtherError(format!(
+                                "missing note jam for first={first} at height={h}"
+                            ))
+                        })?;
+
+                    let (owner_type, owner) = if version == 0 {
+                        Self::resolve_v0_owner(&note_jam)?
+                    } else {
+                        let root = name_to_lock::table
+                            .filter(name_to_lock::first.eq(first))
+                            .order(name_to_lock::height.asc())
+                            .select(name_to_lock::root)
+                            .first::<DbDigest>(conn)
                             .await
                             .map_err(|_| {
                                 LayerErrorSource::OtherError(format!(
-                                    "missing note for first={first} txid={txid}"
+                                    "missing name_to_lock root for v1 first={first}"
                                 ))
                             })?;
 
-                        let (recipient_type, recipient) = if note_version == 0 {
-                            // V0: decode note JAM to extract sig pubkeys
-                            let note_jam: Vec<u8> = notes::table
-                                .filter(notes::first.eq(first))
-                                .select(notes::jam)
-                                .first::<Vec<u8>>(conn)
-                                .await?;
-                            Self::resolve_v0_recipient(&note_jam)?
-                        } else {
-                            // V1: name_to_lock → spend_conditions
-                            Self::resolve_v1_recipient(conn, first).await?
-                        };
+                        let has_revealed_sc = spend_conditions::table
+                            .filter(spend_conditions::hash.eq(root))
+                            .select(spend_conditions::hash)
+                            .first::<DbDigest>(conn)
+                            .await
+                            .optional()?
+                            .is_some();
+                        if has_revealed_sc {
+                            return Err(LayerErrorSource::OtherError(format!(
+                                "v1 first={first} has revealed spend_condition for root={root} during note processing"
+                            )));
+                        }
 
-                        block_info.push(CreditInfo {
-                            txid: Some(txid),
+                        ("lock".to_string(), root.to_string())
+                    };
+
+                    if inserted_firsts.insert(first) {
+                        block_name_info.push(NameInfo {
                             first,
                             height: h,
-                            updated_height: h,
-                            recipient_type,
-                            recipient,
+                            version,
+                            owner_type,
+                            owner,
                         });
+                        created_note_count += 1;
                     }
+                }
 
-                    // ── Coinbase credits (txid IS NULL) ──
-                    let coinbase_credits = credits::table
-                        .filter(credits::height.eq(h))
-                        .filter(credits::txid.is_null())
-                        .select(credits::first)
-                        .load::<DbDigest>(conn)
-                        .await?;
+                cur_metadata = FixedLayerMetadata {
+                    layer: Self::LAYER,
+                    next_block_height: h + 1,
+                };
+                let next_metadata = cur_metadata;
+                let inserted_name_info_rows = block_name_info.len();
 
-                    if !coinbase_credits.is_empty() {
-                        let block_jam: Vec<u8> = blocks::table
-                            .filter(blocks::height.eq(h))
-                            .select(blocks::jam)
-                            .first::<Vec<u8>>(conn)
-                            .await?;
-
-                        let page = Page::from_noun(
-                            &cue(&block_jam).ok_or(LayerErrorSource::OtherError(
-                                format!("failed to cue block at height {h}"),
-                            ))?,
-                        )
-                        .ok_or(LayerErrorSource::OtherError(
-                            format!("failed to decode block page at height {h}"),
-                        ))?;
-
-                        let cb_recipients = Self::coinbase_recipients(&page, constants);
-
-                        for first in coinbase_credits {
-                            let (recipient_type, recipient) = cb_recipients
-                                .get(&first)
-                                .ok_or_else(|| {
-                                    LayerErrorSource::OtherError(format!(
-                                        "coinbase credit first={first} not found in block page at height {h}"
-                                    ))
-                                })?
-                                .clone();
-
-                            block_info.push(CreditInfo {
-                                txid: None,
-                                first,
-                                height: h,
-                                updated_height: h,
-                                recipient_type,
-                                recipient,
-                            });
-                        }
-                    }
-
-                    cur_metadata = FixedLayerMetadata {
-                        layer: Self::LAYER,
-                        next_block_height: h + 1,
-                    };
-                    let next_metadata = cur_metadata;
-
-                    conn.spawn_blocking(move |conn| {
-                        use diesel::query_dsl::methods::ExecuteDsl;
-                        conn.transaction(move |conn| {
-                            if !block_info.is_empty() {
-                                ExecuteDsl::execute(
-                                    diesel::insert_into(credit_info::table).values(&block_info),
-                                    conn,
-                                )?;
-                            }
+                conn.spawn_blocking(move |conn| {
+                    use diesel::query_dsl::methods::ExecuteDsl;
+                    conn.transaction(move |conn| {
+                        if !block_name_info.is_empty() {
                             ExecuteDsl::execute(
-                                Self::update_layer_metadata(&next_metadata),
+                                diesel::insert_into(name_info::table)
+                                    .values(&block_name_info)
+                                    .on_conflict_do_nothing(),
                                 conn,
                             )?;
-                            Ok(())
-                        })
+                        }
+                        ExecuteDsl::execute(Self::update_layer_metadata(&next_metadata), conn)?;
+                        Ok(())
                     })
-                    .instrument(tracing::info_span!("l4_commit_block", height))
-                    .await?;
+                })
+                .instrument(tracing::info_span!("l4_commit_block", height))
+                .await?;
 
-                    crate::rt::yield_now().await;
-                }
+                tracing::debug!(
+                    block_height = h,
+                    revealed_root_count,
+                    created_note_count,
+                    inserted_name_info_rows,
+                    elapsed_ms = block_started.elapsed().as_millis() as u64,
+                    "l4 block derivation profile"
+                );
+
+                crate::rt::yield_now().await;
+            }
 
             Ok::<(), LayerErrorSource>(())
         }
         .instrument(block_range_span)
         .await?;
 
-        let ci_count = credit_info::table.count().get_result::<i64>(conn).await? as u64;
+        let ni_count = name_info::table.count().get_result::<i64>(conn).await? as u64;
 
         self.stats_tx
             .send(Some(L4Stats {
-                credit_info: ci_count,
+                credit_info: ni_count,
             }))
             .unwrap();
 
@@ -410,4 +414,124 @@ impl LayerImpl for L4Client {
 #[cfg_attr(feature = "wasm", tsify(from_wasm_abi, into_wasm_abi))]
 pub struct L4Stats {
     pub credit_info: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::sql_query;
+    use diesel::sql_types::{BigInt, Text};
+    use diesel_async::RunQueryDsl;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(diesel::QueryableByName)]
+    struct RecipientTypeRow {
+        #[diesel(sql_type = Text)]
+        owner_type: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+
+    fn test_db_path() -> Option<PathBuf> {
+        std::env::var("TEST_DB_PATH").ok().map(PathBuf::from)
+    }
+
+    fn temp_copy_path() -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("iris-blocks-l4-test-{ts}.sqlite"))
+    }
+
+    async fn setup_conn_and_client() -> Option<(crate::db::AsyncDbConnection, L4Client, PathBuf)> {
+        let src = test_db_path()?;
+        if !src.exists() {
+            return None;
+        }
+
+        let dst = temp_copy_path();
+        std::fs::copy(src, &dst).ok()?;
+        let mut conn = crate::db::new_conn(dst.to_str().expect("db path"))
+            .await
+            .ok()?;
+        crate::db::run_migrations(&mut conn).await.ok()?;
+        let client = L4Client::new(ChainActivations::mainnet(), vec![]);
+        Some((conn, client, dst))
+    }
+
+    async fn run_l4_range(client: &L4Client, conn: &mut crate::db::AsyncDbConnection, end: i32) {
+        client
+            .update_blocks(
+                conn,
+                FixedLayerMetadata {
+                    layer: "l3",
+                    next_block_height: end + 1,
+                },
+            )
+            .await
+            .expect("l4 update");
+    }
+
+    #[tokio::test]
+    async fn recipient_types_are_in_expected_domain() {
+        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
+            eprintln!("Skipping recipient_types_are_in_expected_domain: TEST_DB_PATH not set");
+            return;
+        };
+        run_l4_range(&client, &mut conn, 5650).await;
+
+        let rows = sql_query("SELECT DISTINCT owner_type FROM name_info")
+            .load::<RecipientTypeRow>(&mut conn)
+            .await
+            .expect("recipient types");
+        let got = rows
+            .into_iter()
+            .map(|r| r.owner_type)
+            .collect::<HashSet<_>>();
+        let allowed = ["pkh", "pk", "musig", "lock"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        assert!(
+            got.is_subset(&allowed),
+            "unexpected recipient_type values: {got:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn lock_rows_are_only_for_unresolved_v1_recipients() {
+        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
+            eprintln!(
+                "Skipping lock_rows_are_only_for_unresolved_v1_recipients: TEST_DB_PATH not set"
+            );
+            return;
+        };
+        run_l4_range(&client, &mut conn, 5650).await;
+
+        let row = sql_query(
+            "SELECT COUNT(*) AS count
+             FROM name_info ni
+             JOIN notes n ON n.first = ni.first
+             JOIN name_to_lock ntl ON ntl.first = ni.first
+             LEFT JOIN spend_conditions sc ON sc.hash = ntl.root
+             WHERE ni.owner_type = 'lock'
+               AND n.version >= 1
+               AND sc.hash IS NOT NULL",
+        )
+        .get_result::<CountRow>(&mut conn)
+        .await
+        .expect("lock unresolved check");
+        assert_eq!(row.count, 0, "resolved V1 rows should not be typed as lock");
+
+        let _ = std::fs::remove_file(path);
+    }
 }

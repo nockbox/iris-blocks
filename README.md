@@ -161,11 +161,26 @@ _Null txid/first imply coinbase_
 
 Additional accounting information, more frequently recomputed.
 
-- `credit_info`: PK (`txid`, `first`, `height`), `updated_height`, `recipient_type`, `recipient`
+- `name_info`: PK (`first`, `height`), `version`, `owner_type`, `owner`
 
-_Reset behavior is as follows: collect all rows where `updated_height >= next_block_height`, and set L4's `next_block_height` to the minimum of `height` in the row set._
+_Reset behavior is height-based: delete `name_info` rows with `height >= next_block_height`._
 
-_Update behavior is as follows: collect all new spend conditions within the range `[local_next_block_height, next_block_height)`, and for each related name (transitively through matching lock trees of SP), update the corresponding `credit_info` rows._
+_Update behavior is two-phase per block:_
+- _process newly revealed `spend_conditions` + `lock_tree` roots (resolve as `lock` or decode to `pkh`/`musig`), then insert `version=1` name rows;_
+- _process newly created notes missing name metadata (V0 decode to `pk`/`musig`, V1 unresolved as `lock`) and insert versioned rows._
+
+_Reporting/query behavior uses the latest `name_info` row per `first` (`ORDER BY height DESC LIMIT 1`)._
+
+### Upgrading existing databases
+
+If your SQLite DB was created before `name_info` replaced `credit_info`, run:
+
+```bash
+iris-blocks --db <path-to-db.sqlite> sync --remove-layer l4
+iris-blocks --db <path-to-db.sqlite> sync --run-migrations
+```
+
+This recreates only L4 with the new schema and avoids `no such table: name_info` runtime errors.
 
 ## Recipients
 

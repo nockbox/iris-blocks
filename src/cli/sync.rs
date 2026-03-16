@@ -1,6 +1,7 @@
 use clap::Parser;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use std::io;
 use std::net::SocketAddr;
 use tonic::transport::{Channel, Uri};
 
@@ -19,6 +20,18 @@ use crate::{
 };
 use iris_grpc_proto::pb::private::v1::nock_app_service_client::NockAppServiceClient;
 use std::sync::Arc;
+
+const DERIVABLE_LAYERS: &[&str] = &["l1", "l2", "l3", "l4"];
+
+fn validate_layer_name(layer: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if DERIVABLE_LAYERS.iter().any(|valid| *valid == layer) {
+        return Ok(());
+    }
+    Err(Box::new(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid layer '{layer}', expected one of: l1, l2, l3, l4"),
+    )))
+}
 
 #[derive(Debug, Parser, Clone)]
 pub struct SyncArgs {
@@ -47,22 +60,24 @@ impl SyncArgs {
         let mut conn = db::new_conn(db_path).await?;
 
         if self.run_migrations {
-            db::run_migrations(&mut conn).await;
+            db::run_migrations(&mut conn).await?;
             eprintln!("Migrations run.");
         }
 
         if let Some(layer) = self.remove_layer {
-            db::remove_layers_down_to(&mut conn, &layer).await;
+            validate_layer_name(&layer)?;
+            db::remove_layers_down_to(&mut conn, &layer).await?;
             eprintln!("Reverted migrations down to {layer}.");
             if !self.run_migrations {
                 return Ok(());
             } else {
-                db::run_migrations(&mut conn).await;
+                db::run_migrations(&mut conn).await?;
                 eprintln!("Re-applied migrations.");
             }
         }
 
         if let Some(layer) = self.rederive_layer {
+            validate_layer_name(&layer)?;
             diesel::update(layer_metadata::table)
                 .filter(layer_metadata::layer.eq(&layer))
                 .set(layer_metadata::next_block_height.eq(0))
@@ -78,11 +93,10 @@ impl SyncArgs {
         } else {
             Some(Arc::new(L4Client::new(activations.clone(), vec![])))
         };
-        let l3_deps: Vec<Arc<dyn LayerDependency>> = if self.disable_l4 {
-            vec![]
-        } else {
-            vec![l4_client.clone().unwrap()]
-        };
+        let l3_deps: Vec<Arc<dyn LayerDependency>> = l4_client
+            .as_ref()
+            .map(|c| vec![c.clone() as Arc<dyn LayerDependency>])
+            .unwrap_or_default();
         let l3_client = Arc::new(L3Client::new(activations.clone(), l3_deps));
         let l2_deps: Vec<Arc<dyn LayerDependency>> = vec![l3_client.clone()];
         let l2_client = Arc::new(L2Client::new(activations.clone(), l2_deps));
@@ -96,7 +110,12 @@ impl SyncArgs {
                 let l0_metadata =
                     L0Client::<NockAppServiceClient<Channel>>::layer_metadata(&mut conn)
                         .await?
-                        .unwrap();
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "missing l0 layer metadata; run sync with a connection first",
+                            )
+                        })?;
                 while l1_client
                     .update_blocks(&mut conn, l0_metadata)
                     .await
@@ -115,5 +134,23 @@ impl SyncArgs {
         client.run().await;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_layer_name;
+
+    #[test]
+    fn validate_layer_accepts_known_layers() {
+        for layer in ["l1", "l2", "l3", "l4"] {
+            validate_layer_name(layer).expect("valid layer");
+        }
+    }
+
+    #[test]
+    fn validate_layer_rejects_unknown_layers() {
+        assert!(validate_layer_name("l0").is_err());
+        assert!(validate_layer_name("foo").is_err());
     }
 }

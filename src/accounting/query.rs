@@ -14,6 +14,8 @@ pub enum QueryError {
     Diesel(#[from] diesel::result::Error),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("accounting invariant violated: {0}")]
+    InvariantViolation(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -189,16 +191,82 @@ pub struct AuditFlowRow {
 }
 
 fn format_chain_timestamp_utc(ts: i64) -> String {
-    let dt_opt: Option<DateTime<Utc>> = Utc.timestamp_opt(ts, 0).single();
+    // Preferred path: L0 currently stores plain unix seconds.
+    if let Some(dt) = Utc.timestamp_opt(ts, 0).single() {
+        return dt.to_rfc3339();
+    }
+
+    // Compatibility path: older snapshots may store @da-biased seconds.
+    const DA_UNIX_EPOCH_BIASED_SECONDS: u64 = 0x8000_000c_ce9e_0d80;
+    let raw_u64 = ts as u64;
+    if raw_u64 < DA_UNIX_EPOCH_BIASED_SECONDS {
+        return format!("invalid({ts})");
+    }
+    let unix_seconds_u64 = raw_u64 - DA_UNIX_EPOCH_BIASED_SECONDS;
+    let Ok(unix_seconds) = i64::try_from(unix_seconds_u64) else {
+        return format!("invalid({ts})");
+    };
+    let dt_opt: Option<DateTime<Utc>> = Utc.timestamp_opt(unix_seconds, 0).single();
     match dt_opt {
         Some(dt) => dt.to_rfc3339(),
         None => format!("invalid({ts})"),
     }
 }
 
+fn wallet_owner_match_clause(owner_type_col: &str, owner_col: &str) -> String {
+    format!(
+        "(
+            ({owner_type_col} = 'pkh' AND {owner_col} = ?1)
+            OR (
+                {owner_type_col} = 'pk'
+                AND (
+                    {owner_col} IN (SELECT pk FROM pkh_to_pk WHERE pkh = ?1)
+                    OR (?2 IS NOT NULL AND {owner_col} = ?2)
+                )
+            )
+        )"
+    )
+}
+
+fn wallet_name_info_filter(alias: &str) -> String {
+    wallet_owner_match_clause(&format!("{alias}.owner_type"), &format!("{alias}.owner"))
+}
+
+fn latest_name_info_subquery(alias: &str) -> String {
+    format!(
+        "SELECT {alias}.first FROM name_info {alias}
+         WHERE {alias}.height = (
+             SELECT MAX(ni2.height) FROM name_info ni2 WHERE ni2.first = {alias}.first
+         )"
+    )
+}
+
+fn validate_balance_invariant(balance_nicks: i64, accounting_nicks: i64) -> Result<(), QueryError> {
+    if balance_nicks == accounting_nicks {
+        return Ok(());
+    }
+    #[cfg(test)]
+    {
+        return Err(QueryError::InvariantViolation(format!(
+            "received-spent={} but unspent balance={}",
+            accounting_nicks, balance_nicks
+        )));
+    }
+    #[cfg(not(test))]
+    {
+        tracing::warn!(
+            balance_nicks,
+            accounting_nicks,
+            "accounting mismatch: received - spent != unspent notes"
+        );
+        Ok(())
+    }
+}
+
 fn recipient_matches_wallet(
     _scope: VersionScope,
     pkh: &str,
+    wallet_db_pk: Option<&str>,
     wallet_pks: &HashSet<String>,
     recipient_type: Option<&str>,
     recipient: Option<&str>,
@@ -210,7 +278,10 @@ fn recipient_matches_wallet(
         return false;
     };
     match recipient_type {
-        "pk" => wallet_pks.contains(recipient),
+        "pk" => {
+            wallet_pks.contains(recipient)
+                || wallet_db_pk.map(|pk| pk == recipient).unwrap_or(false)
+        }
         "pkh" => recipient == pkh,
         _ => false,
     }
@@ -427,67 +498,47 @@ pub async fn wallet_balance(
     address: AddressInfo,
 ) -> Result<WalletBalance, QueryError> {
     let pkh = address.pkh.clone();
+    let db_public_key = address.db_public_key.clone();
     let scope = address.scope.clone();
     let note_version_filter = match scope {
         VersionScope::All => "",
         VersionScope::V0Only => " AND n.version = 0",
         VersionScope::V1Only => " AND n.version >= 1",
     };
+    let wallet_ni_filter = wallet_name_info_filter("ni");
+    let wallet_name_info_latest = latest_name_info_subquery("ni");
 
-    // Unspent notes owned by this wallet (via credit_info recipient resolution)
+    // Unspent notes owned by this wallet (via name_info owner resolution)
     let unspent_query = format!(
         "SELECT COALESCE(SUM(n.assets), 0) AS sum_nicks, COUNT(*) AS note_count
          FROM notes n
          WHERE n.spent_txid IS NULL{note_version_filter}
-           AND (
-             n.first IN (
-               SELECT ci.first FROM credit_info ci
-               WHERE ci.recipient_type = 'pkh' AND ci.recipient = ?1
-             )
-             OR n.first IN (
-               SELECT ci.first FROM credit_info ci
-               WHERE ci.recipient_type = 'pk' AND ci.recipient IN (
-                 SELECT pk FROM pkh_to_pk WHERE pkh = ?1
-               )
-             )
-             OR (n.coinbase = 1 AND n.first IN (
-               SELECT c.first FROM credits c
-               WHERE c.txid IS NULL AND c.first IN (
-                 SELECT ntl.first FROM name_to_lock ntl
-                 WHERE ntl.first IN (
-                   SELECT ci2.first FROM credit_info ci2
-                   WHERE ci2.recipient_type = 'pkh' AND ci2.recipient = ?1
-                 )
-               )
-             ))
+           AND n.first IN (
+             {wallet_name_info_latest}
+             AND {wallet_ni_filter}
            )"
     );
     let unspent = sql_query(unspent_query)
         .bind::<Text, _>(pkh.clone())
+        .bind::<Nullable<Text>, _>(db_public_key.clone())
         .get_result::<SumCountRow>(conn)
         .await?;
 
-    let by_version = sql_query(
+    let by_version_sql = format!(
         "SELECT n.version AS version, COALESCE(SUM(n.assets), 0) AS sum_nicks
          FROM notes n
          WHERE n.spent_txid IS NULL
-           AND (
-             n.first IN (
-               SELECT ci.first FROM credit_info ci
-               WHERE ci.recipient_type = 'pkh' AND ci.recipient = ?1
-             )
-             OR n.first IN (
-               SELECT ci.first FROM credit_info ci
-               WHERE ci.recipient_type = 'pk' AND ci.recipient IN (
-                 SELECT pk FROM pkh_to_pk WHERE pkh = ?1
-               )
-             )
+           AND n.first IN (
+             {wallet_name_info_latest}
+             AND {wallet_ni_filter}
            )
-         GROUP BY n.version",
-    )
-    .bind::<Text, _>(pkh.clone())
-    .load::<VersionSumRow>(conn)
-    .await?;
+         GROUP BY n.version"
+    );
+    let by_version = sql_query(by_version_sql)
+        .bind::<Text, _>(pkh.clone())
+        .bind::<Nullable<Text>, _>(db_public_key.clone())
+        .load::<VersionSumRow>(conn)
+        .await?;
 
     let (unspent_v0_nicks, unspent_v1_nicks) = if scope == VersionScope::All {
         let mut v0 = 0i64;
@@ -505,45 +556,43 @@ pub async fn wallet_balance(
     };
 
     // TX credits (non-coinbase) for this wallet
-    let tx_credits_sql = "SELECT COALESCE(SUM(c.amount), 0) AS sum_nicks
+    let tx_credits_sql = format!(
+        "SELECT COALESCE(SUM(c.amount), 0) AS sum_nicks
          FROM credits c
          WHERE c.txid IS NOT NULL
-           AND (
-             c.first IN (
-               SELECT ci.first FROM credit_info ci
-               WHERE ci.recipient_type = 'pkh' AND ci.recipient = ?1
-             )
-             OR c.first IN (
-               SELECT ci.first FROM credit_info ci
-               WHERE ci.recipient_type = 'pk' AND ci.recipient IN (
-                 SELECT pk FROM pkh_to_pk WHERE pkh = ?1
-               )
-             )
-           )";
+           AND EXISTS (
+             SELECT 1 FROM notes n
+             WHERE n.first = c.first{note_version_filter}
+           )
+           AND c.first IN (
+             {wallet_name_info_latest}
+             AND {wallet_ni_filter}
+           )"
+    );
     let tx_credits_nicks = sql_query(tx_credits_sql)
         .bind::<Text, _>(pkh.clone())
+        .bind::<Nullable<Text>, _>(db_public_key.clone())
         .get_result::<SumRow>(conn)
         .await?
         .sum_nicks;
 
     // Coinbase credits (txid IS NULL) for this wallet
-    let coinbase_sql = "SELECT COALESCE(SUM(c.amount), 0) AS sum_nicks
+    let coinbase_sql = format!(
+        "SELECT COALESCE(SUM(c.amount), 0) AS sum_nicks
          FROM credits c
          WHERE c.txid IS NULL
-           AND (
-             c.first IN (
-               SELECT ci.first FROM credit_info ci
-               WHERE ci.recipient_type = 'pkh' AND ci.recipient = ?1
-             )
-             OR c.first IN (
-               SELECT ci.first FROM credit_info ci
-               WHERE ci.recipient_type = 'pk' AND ci.recipient IN (
-                 SELECT pk FROM pkh_to_pk WHERE pkh = ?1
-               )
-             )
-           )";
+           AND EXISTS (
+             SELECT 1 FROM notes n
+             WHERE n.first = c.first{note_version_filter}
+           )
+           AND c.first IN (
+             {wallet_name_info_latest}
+             AND {wallet_ni_filter}
+           )"
+    );
     let coinbase_credits_nicks = sql_query(coinbase_sql)
         .bind::<Text, _>(pkh.clone())
+        .bind::<Nullable<Text>, _>(db_public_key.clone())
         .get_result::<SumRow>(conn)
         .await?
         .sum_nicks;
@@ -553,31 +602,37 @@ pub async fn wallet_balance(
         "SELECT COALESCE(SUM(d.amount), 0) AS sum_nicks
          FROM debits d
          WHERE d.first IN (
-             SELECT ci.first FROM credit_info ci
-             WHERE (ci.recipient_type = 'pkh' AND ci.recipient = ?1)
-                OR (ci.recipient_type = 'pk' AND ci.recipient IN (
-                     SELECT pk FROM pkh_to_pk WHERE pkh = ?1
-                   ))
+             SELECT n.first FROM notes n
+             WHERE n.first = d.first{note_version_filter}
+         )
+           AND d.first IN (
+             {wallet_name_info_latest}
+             AND {wallet_ni_filter}
          )"
     );
     let spent_nicks = sql_query(spent_query)
         .bind::<Text, _>(pkh.clone())
+        .bind::<Nullable<Text>, _>(db_public_key.clone())
         .get_result::<SumRow>(conn)
         .await?
         .sum_nicks;
 
     // Fees
-    let fees_sql = "SELECT COALESCE(SUM(d.fee), 0) AS sum_nicks
+    let fees_sql = format!(
+        "SELECT COALESCE(SUM(d.fee), 0) AS sum_nicks
          FROM debits d
          WHERE d.first IN (
-             SELECT ci.first FROM credit_info ci
-             WHERE (ci.recipient_type = 'pkh' AND ci.recipient = ?1)
-                OR (ci.recipient_type = 'pk' AND ci.recipient IN (
-                     SELECT pk FROM pkh_to_pk WHERE pkh = ?1
-                   ))
-         )";
+             SELECT n.first FROM notes n
+             WHERE n.first = d.first{note_version_filter}
+         )
+           AND d.first IN (
+             {wallet_name_info_latest}
+             AND {wallet_ni_filter}
+         )"
+    );
     let fees_nicks = sql_query(fees_sql)
         .bind::<Text, _>(pkh.clone())
+        .bind::<Nullable<Text>, _>(db_public_key)
         .get_result::<SumRow>(conn)
         .await?
         .sum_nicks;
@@ -585,13 +640,7 @@ pub async fn wallet_balance(
     let balance_nicks = unspent.sum_nicks;
     let received_nicks = tx_credits_nicks + coinbase_credits_nicks;
     let accounting_nicks = received_nicks - spent_nicks;
-    if balance_nicks != accounting_nicks {
-        tracing::warn!(
-            balance_nicks,
-            accounting_nicks,
-            "accounting mismatch: received - spent != unspent notes"
-        );
-    }
+    validate_balance_invariant(balance_nicks, accounting_nicks)?;
 
     Ok(WalletBalance {
         address,
@@ -669,9 +718,15 @@ pub async fn transaction_detail(
     .collect();
 
     let outputs = sql_query(
-        "SELECT o.idx, o.first, o.last, o.assets, ci.recipient_type, ci.recipient
+        "SELECT o.idx, o.first, o.last, o.assets,
+                ni.owner_type AS recipient_type,
+                ni.owner AS recipient
          FROM tx_outputs o
-         LEFT JOIN credit_info ci ON ci.txid = o.txid AND ci.first = o.first
+         LEFT JOIN name_info ni
+           ON ni.first = o.first
+          AND ni.height = (
+              SELECT MAX(ni2.height) FROM name_info ni2 WHERE ni2.first = o.first
+          )
          WHERE o.txid = ?1
          ORDER BY o.idx",
     )
@@ -691,9 +746,18 @@ pub async fn transaction_detail(
 
     // Credits from L3
     let credits = sql_query(
-        "SELECT c.first, ci.recipient_type, ci.recipient, c.amount, c.height AS block_height, COALESCE(b.timestamp, 0) AS block_timestamp
+        "SELECT c.first,
+                ni.owner_type AS recipient_type,
+                ni.owner AS recipient,
+                c.amount,
+                c.height AS block_height,
+                COALESCE(b.timestamp, 0) AS block_timestamp
          FROM credits c
-         LEFT JOIN credit_info ci ON ci.txid = c.txid AND ci.first = c.first AND ci.height = c.height
+         LEFT JOIN name_info ni
+           ON ni.first = c.first
+          AND ni.height = (
+              SELECT MAX(ni2.height) FROM name_info ni2 WHERE ni2.first = c.first
+          )
          LEFT JOIN blocks b ON b.height = c.height
          WHERE c.txid = ?1
          ORDER BY c.first",
@@ -869,7 +933,7 @@ pub async fn sync_status(
         "spend_conditions",
         "credits",
         "debits",
-        "credit_info",
+        "name_info",
     ];
 
     let mut table_counts = Vec::with_capacity(tables.len());
@@ -894,12 +958,17 @@ pub async fn audit_report(
 ) -> Result<AuditReport, QueryError> {
     let balance = wallet_balance(conn, address.clone()).await?;
     let pkh = address.pkh.clone();
+    let db_public_key = address.db_public_key.clone();
     let scope = address.scope.clone();
     let note_version_filter = match scope {
         VersionScope::All => "",
         VersionScope::V0Only => " AND n.version = 0",
         VersionScope::V1Only => " AND n.version >= 1",
     };
+    let wallet_ni_filter = wallet_name_info_filter("ni");
+    let wallet_ni3_filter = wallet_name_info_filter("ni3");
+    let wallet_name_info_latest = latest_name_info_subquery("ni");
+    let wallet_name_info_latest_ni3 = latest_name_info_subquery("ni3");
 
     let wallet_pks = sql_query("SELECT pk FROM pkh_to_pk WHERE pkh = ?1")
         .bind::<Text, _>(pkh.clone())
@@ -912,31 +981,35 @@ pub async fn audit_report(
     let mut ledger = Vec::new();
 
     // Credits for this wallet (non-coinbase)
-    let credit_sql =
+    let credit_sql = format!(
         "SELECT c.height AS block_height,
                 COALESCE(b.timestamp, 0) AS block_timestamp,
                 'credit' AS entry_type,
                 c.txid AS txid,
                 t.block_id AS block_id,
-                ci.recipient_type AS recipient_type,
-                ci.recipient AS recipient,
+                ni.owner_type AS recipient_type,
+                ni.owner AS recipient,
                 c.amount AS amount_nicks,
                 0 AS fee_nicks,
                 (SELECT GROUP_CONCAT(DISTINCT s.pk) FROM tx_signers s WHERE s.txid = c.txid) AS counterparties
          FROM credits c
          LEFT JOIN transactions t ON t.id = c.txid
          LEFT JOIN blocks b ON b.height = c.height
-         LEFT JOIN credit_info ci ON ci.txid = c.txid AND ci.first = c.first AND ci.height = c.height
+         LEFT JOIN name_info ni
+           ON ni.first = c.first
+          AND ni.height = (
+              SELECT MAX(ni2.height) FROM name_info ni2 WHERE ni2.first = c.first
+          )
          WHERE c.txid IS NOT NULL
-           AND (
-             (ci.recipient_type = 'pkh' AND ci.recipient = ?1)
-             OR (ci.recipient_type = 'pk' AND ci.recipient IN (
-                   SELECT pk FROM pkh_to_pk WHERE pkh = ?1
-                 ))
+           AND c.first IN (
+             {wallet_name_info_latest}
+             AND {wallet_ni_filter}
            )
-         ORDER BY c.height, c.txid, c.first";
+         ORDER BY c.height, c.txid, c.first"
+    );
     let credit_rows = sql_query(credit_sql)
         .bind::<Text, _>(pkh.clone())
+        .bind::<Nullable<Text>, _>(db_public_key.clone())
         .load::<LedgerRow>(conn)
         .await?;
     ledger.extend(credit_rows.into_iter().map(|r| LedgerEntry {
@@ -955,30 +1028,34 @@ pub async fn audit_report(
     }));
 
     // Coinbase credits for this wallet
-    let coinbase_sql =
+    let coinbase_sql = format!(
         "SELECT c.height AS block_height,
                 COALESCE(b.timestamp, 0) AS block_timestamp,
                 'coinbase' AS entry_type,
                 NULL AS txid,
                 c.block_id AS block_id,
-                ci.recipient_type AS recipient_type,
-                ci.recipient AS recipient,
+                ni.owner_type AS recipient_type,
+                ni.owner AS recipient,
                 c.amount AS amount_nicks,
                 0 AS fee_nicks,
                 NULL AS counterparties
          FROM credits c
          LEFT JOIN blocks b ON b.height = c.height
-         LEFT JOIN credit_info ci ON ci.txid = c.txid AND ci.first = c.first AND ci.height = c.height
+         LEFT JOIN name_info ni
+           ON ni.first = c.first
+          AND ni.height = (
+              SELECT MAX(ni2.height) FROM name_info ni2 WHERE ni2.first = c.first
+          )
          WHERE c.txid IS NULL
-           AND (
-             (ci.recipient_type = 'pkh' AND ci.recipient = ?1)
-             OR (ci.recipient_type = 'pk' AND ci.recipient IN (
-                   SELECT pk FROM pkh_to_pk WHERE pkh = ?1
-                 ))
+           AND c.first IN (
+             {wallet_name_info_latest}
+             AND {wallet_ni_filter}
            )
-         ORDER BY c.height, c.first";
+         ORDER BY c.height, c.first"
+    );
     let coinbase_rows = sql_query(coinbase_sql)
         .bind::<Text, _>(pkh.clone())
+        .bind::<Nullable<Text>, _>(db_public_key.clone())
         .load::<LedgerRow>(conn)
         .await?;
     ledger.extend(coinbase_rows.into_iter().map(|r| LedgerEntry {
@@ -1013,24 +1090,30 @@ pub async fn audit_report(
                     ) = 1 THEN COALESCE(t.fee, 0)
                     ELSE 0
                 END AS fee_nicks,
-                (SELECT GROUP_CONCAT(DISTINCT ci2.recipient) FROM credit_info ci2 WHERE ci2.txid = n.spent_txid) AS counterparties
+                (SELECT GROUP_CONCAT(DISTINCT ni2.owner)
+                 FROM credits c2
+                 INNER JOIN name_info ni2 ON ni2.first = c2.first
+                 WHERE c2.txid = n.spent_txid
+                   AND ni2.height = (
+                       SELECT MAX(ni2max.height)
+                       FROM name_info ni2max
+                       WHERE ni2max.first = c2.first
+                   )) AS counterparties
          FROM notes n
          LEFT JOIN transactions t ON t.id = n.spent_txid
          LEFT JOIN blocks b ON b.height = n.spent_height
          WHERE n.spent_txid IS NOT NULL{note_version_filter}
            AND (
              n.first IN (
-               SELECT ci.first FROM credit_info ci
-               WHERE (ci.recipient_type = 'pkh' AND ci.recipient = ?1)
-                  OR (ci.recipient_type = 'pk' AND ci.recipient IN (
-                       SELECT pk FROM pkh_to_pk WHERE pkh = ?1
-                     ))
+              {wallet_name_info_latest}
+              AND {wallet_ni_filter}
              )
            )
          ORDER BY n.spent_height, n.spent_txid, n.first, n.last"
     );
     let spent_rows = sql_query(spent_sql)
         .bind::<Text, _>(pkh.clone())
+        .bind::<Nullable<Text>, _>(db_public_key.clone())
         .load::<LedgerRow>(conn)
         .await?;
 
@@ -1144,43 +1227,46 @@ pub async fn audit_report(
 
     // Outgoing rows: recipient-level credits from wallet-spend txs excluding wallet recipients.
     let outgoing_sql = format!(
-        "SELECT ci.height AS block_height,
+        "SELECT ni.height AS block_height,
                 COALESCE(b.timestamp, 0) AS block_timestamp,
                 'outgoing' AS entry_type,
-                ci.txid AS txid,
+                c.txid AS txid,
                 t.block_id AS block_id,
-                ci.recipient_type AS recipient_type,
-                ci.recipient AS recipient,
+                ni.owner_type AS recipient_type,
+                ni.owner AS recipient,
                 c.amount AS amount_nicks,
                 0 AS fee_nicks,
                 NULL AS counterparties
-         FROM credit_info ci
-         INNER JOIN credits c ON c.txid = ci.txid AND c.first = ci.first AND c.height = ci.height
-         INNER JOIN transactions t ON t.id = ci.txid
-         LEFT JOIN blocks b ON b.height = ci.height
-         WHERE EXISTS (
+         FROM name_info ni
+         INNER JOIN credits c ON c.first = ni.first
+         INNER JOIN transactions t ON t.id = c.txid
+         LEFT JOIN blocks b ON b.height = c.height
+         WHERE ni.height = (
+             SELECT MAX(ni2.height) FROM name_info ni2 WHERE ni2.first = ni.first
+         )
+           AND c.txid IS NOT NULL
+           AND EXISTS (
              SELECT 1
              FROM notes n
-             WHERE n.spent_txid = ci.txid
+             WHERE n.spent_txid = c.txid
                AND n.spent_txid IS NOT NULL{note_version_filter}
                AND n.first IN (
-                 SELECT ci3.first FROM credit_info ci3
-                 WHERE (ci3.recipient_type = 'pkh' AND ci3.recipient = ?1)
-                    OR (ci3.recipient_type = 'pk' AND ci3.recipient IN (
-                         SELECT pk FROM pkh_to_pk WHERE pkh = ?1
-                       ))
+                 {wallet_name_info_latest_ni3}
+                 AND {wallet_ni3_filter}
                )
          )
-         ORDER BY ci.height, ci.txid, ci.first"
+         ORDER BY c.height, c.txid, c.first"
     );
     let outgoing_rows = sql_query(outgoing_sql)
         .bind::<Text, _>(pkh.clone())
+        .bind::<Nullable<Text>, _>(db_public_key.clone())
         .load::<LedgerRow>(conn)
         .await?;
     for row in outgoing_rows {
         if recipient_matches_wallet(
             scope.clone(),
             &pkh,
+            db_public_key.as_deref(),
             &wallet_pks,
             row.recipient_type.as_deref(),
             row.recipient.as_deref(),
@@ -1262,4 +1348,268 @@ pub async fn wallet_ledger(
     address: AddressInfo,
 ) -> Result<Vec<LedgerEntry>, QueryError> {
     Ok(audit_report(conn, address).await?.ledger)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accounting::address::{AddressType, VersionScope};
+    use diesel::sql_query;
+    use diesel_async::RunQueryDsl;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const DA_UNIX_EPOCH_BIASED_SECONDS: u64 = 0x8000_000c_ce9e_0d80;
+
+    fn test_db_path(prefix: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("iris-blocks-{prefix}-{ts}.sqlite"))
+    }
+
+    fn da_biased(unix_seconds: i64) -> i64 {
+        (unix_seconds as u64).wrapping_add(DA_UNIX_EPOCH_BIASED_SECONDS) as i64
+    }
+
+    #[test]
+    fn format_chain_timestamp_utc_supports_plain_unix_seconds() {
+        let unix_seconds = 1_741_557_600i64;
+        let expected = Utc
+            .timestamp_opt(unix_seconds, 0)
+            .single()
+            .expect("valid unix timestamp")
+            .to_rfc3339();
+        assert_eq!(format_chain_timestamp_utc(unix_seconds), expected);
+    }
+
+    #[test]
+    fn format_chain_timestamp_utc_supports_legacy_da_biased_seconds() {
+        let unix_seconds = 1_741_557_600i64;
+        let biased = da_biased(unix_seconds);
+        let expected = Utc
+            .timestamp_opt(unix_seconds, 0)
+            .single()
+            .expect("valid unix timestamp")
+            .to_rfc3339();
+        assert_eq!(format_chain_timestamp_utc(biased), expected);
+    }
+
+    async fn setup_conn() -> (crate::db::AsyncDbConnection, PathBuf) {
+        let path = test_db_path("accounting-query");
+        let mut conn = crate::db::new_conn(path.to_str().expect("db path"))
+            .await
+            .expect("open sqlite");
+        crate::db::run_migrations(&mut conn)
+            .await
+            .expect("run migrations");
+        (conn, path)
+    }
+
+    async fn seed_balance_fixture(conn: &mut crate::db::AsyncDbConnection) {
+        let b1_ts = da_biased(1_741_557_600);
+        let b2_ts = da_biased(1_741_557_800);
+
+        sql_query(
+            "INSERT INTO blocks (id, height, version, parent, timestamp, msg, jam)
+             VALUES ('b1', 1, 1, 'p0', ?1, NULL, x'00'),
+                    ('b2', 2, 1, 'b1', ?2, NULL, x'00')",
+        )
+        .bind::<BigInt, _>(b1_ts)
+        .bind::<BigInt, _>(b2_ts)
+        .execute(conn)
+        .await
+        .expect("insert blocks");
+
+        sql_query(
+            "INSERT INTO transactions (id, block_id, height, version, fee, total_size, jam)
+             VALUES ('tx1', 'b2', 2, 1, 5, 200, x'00')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert tx");
+
+        sql_query(
+            "INSERT INTO notes (
+                 first, last, version, assets, coinbase,
+                 created_txid, spent_txid, created_height, spent_height,
+                 created_bid, spent_bid, jam
+             ) VALUES
+             ('ncb', 'l1', 0, 50, 1, NULL, 'tx1', 1, 2, 'b1', 'b2', x'00'),
+             ('nout_ext', 'l2', 1, 20, 0, 'tx1', NULL, 2, NULL, 'b2', NULL, x'00'),
+             ('nout_self', 'l3', 1, 25, 0, 'tx1', NULL, 2, NULL, 'b2', NULL, x'00')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert notes");
+
+        sql_query(
+            "INSERT INTO credits (txid, first, height, block_id, amount) VALUES
+             (NULL, 'ncb', 1, 'b1', 50),
+             ('tx1', 'nout_ext', 2, 'b2', 20),
+             ('tx1', 'nout_self', 2, 'b2', 25)",
+        )
+        .execute(conn)
+        .await
+        .expect("insert credits");
+
+        sql_query(
+            "INSERT INTO debits (txid, first, height, block_id, amount, fee)
+             VALUES ('tx1', 'ncb', 2, 'b2', 50, 5)",
+        )
+        .execute(conn)
+        .await
+        .expect("insert debits");
+
+        sql_query(
+            "INSERT INTO name_info (first, height, version, owner_type, owner) VALUES
+             ('ncb', 1, 0, 'pk', 'wallet_pk'),
+             ('nout_ext', 2, 1, 'pkh', 'other_pkh'),
+             ('nout_self', 2, 1, 'pkh', 'wallet_pkh')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert name_info");
+
+        sql_query(
+            "INSERT INTO pkh_to_pk (pkh, pk, height, block_id)
+             VALUES ('wallet_pkh', 'wallet_pk', 1, 'b1')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert pkh_to_pk");
+    }
+
+    #[tokio::test]
+    async fn db_public_key_v0_scope_includes_coinbase() {
+        let (mut conn, path) = setup_conn().await;
+        seed_balance_fixture(&mut conn).await;
+
+        let address = AddressInfo {
+            input: "wallet_pk".to_string(),
+            address_type: AddressType::DbPublicKey,
+            scope: VersionScope::V0Only,
+            pkh: "-".to_string(),
+            db_public_key: Some("wallet_pk".to_string()),
+        };
+
+        let balance = wallet_balance(&mut conn, address.clone())
+            .await
+            .expect("wallet_balance");
+        assert_eq!(balance.coinbase_credits_nicks, 50);
+        assert_eq!(balance.unspent_v0_nicks, 0);
+        assert_eq!(balance.balance_nicks, 0);
+
+        let audit = audit_report(&mut conn, address)
+            .await
+            .expect("audit_report");
+        assert!(audit
+            .ledger
+            .iter()
+            .any(|e| e.entry_type == "coinbase" && e.amount_nicks == 50));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn accounting_invariants_and_outgoing_flow_fee_hold() {
+        let (mut conn, path) = setup_conn().await;
+        seed_balance_fixture(&mut conn).await;
+
+        let address = AddressInfo {
+            input: "wallet_pkh".to_string(),
+            address_type: AddressType::Pkh,
+            scope: VersionScope::All,
+            pkh: "wallet_pkh".to_string(),
+            db_public_key: Some("wallet_pk".to_string()),
+        };
+
+        let balance = wallet_balance(&mut conn, address.clone())
+            .await
+            .expect("wallet_balance");
+        assert_eq!(balance.balance_nicks, 25);
+        assert_eq!(balance.tx_credits_nicks, 25);
+        assert_eq!(balance.coinbase_credits_nicks, 50);
+        assert_eq!(balance.spent_nicks, 50);
+        assert_eq!(balance.fees_nicks, 5);
+        assert_eq!(
+            balance.received_nicks - balance.spent_nicks,
+            balance.balance_nicks
+        );
+
+        let audit = audit_report(&mut conn, address)
+            .await
+            .expect("audit_report");
+        assert!(audit
+            .ledger
+            .iter()
+            .any(|e| e.entry_type == "coinbase" && e.amount_nicks == 50));
+        let outgoing_rows = audit
+            .flows
+            .iter()
+            .filter(|f| f.entry_type == "outgoing")
+            .collect::<Vec<_>>();
+        assert_eq!(outgoing_rows.len(), 1);
+        assert_eq!(outgoing_rows[0].recipient.as_deref(), Some("other_pkh"));
+        assert_eq!(outgoing_rows[0].amount_nicks, 20);
+        assert_eq!(outgoing_rows[0].fee_nicks, 5);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn scoped_balances_match_expected_v0_v1_and_combined_views() {
+        let (mut conn, path) = setup_conn().await;
+        seed_balance_fixture(&mut conn).await;
+
+        let v1_address = AddressInfo {
+            input: "wallet_pkh".to_string(),
+            address_type: AddressType::Pkh,
+            scope: VersionScope::V1Only,
+            pkh: "wallet_pkh".to_string(),
+            db_public_key: Some("wallet_pk".to_string()),
+        };
+        let v1 = wallet_balance(&mut conn, v1_address)
+            .await
+            .expect("v1 balance");
+        assert_eq!(v1.unspent_v0_nicks, 0);
+        assert_eq!(v1.unspent_v1_nicks, 0);
+        assert_eq!(v1.balance_nicks, 25);
+        assert_eq!(v1.coinbase_credits_nicks, 0);
+        assert_eq!(v1.tx_credits_nicks, 25);
+        assert_eq!(v1.spent_nicks, 0);
+
+        let all_address = AddressInfo {
+            input: "wallet_pkh".to_string(),
+            address_type: AddressType::Pkh,
+            scope: VersionScope::All,
+            pkh: "wallet_pkh".to_string(),
+            db_public_key: Some("wallet_pk".to_string()),
+        };
+        let all = wallet_balance(&mut conn, all_address)
+            .await
+            .expect("all balance");
+        assert_eq!(all.balance_nicks, 25);
+        assert_eq!(all.coinbase_credits_nicks, 50);
+        assert_eq!(all.tx_credits_nicks, 25);
+        assert_eq!(all.spent_nicks, 50);
+
+        let v0_address = AddressInfo {
+            input: "wallet_pk".to_string(),
+            address_type: AddressType::DbPublicKey,
+            scope: VersionScope::V0Only,
+            pkh: "-".to_string(),
+            db_public_key: Some("wallet_pk".to_string()),
+        };
+        let v0 = wallet_balance(&mut conn, v0_address)
+            .await
+            .expect("v0 balance");
+        assert_eq!(v0.balance_nicks, 0);
+        assert_eq!(v0.coinbase_credits_nicks, 50);
+        assert_eq!(v0.tx_credits_nicks, 0);
+        assert_eq!(v0.spent_nicks, 50);
+
+        let _ = std::fs::remove_file(path);
+    }
 }

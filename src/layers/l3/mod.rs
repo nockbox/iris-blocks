@@ -299,3 +299,95 @@ pub struct L3Stats {
     pub credits: u64,
     pub debits: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::sql_query;
+    use diesel::sql_types::BigInt;
+    use diesel_async::RunQueryDsl;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(diesel::QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+
+    fn test_db_path() -> Option<PathBuf> {
+        std::env::var("TEST_DB_PATH").ok().map(PathBuf::from)
+    }
+
+    fn temp_copy_path() -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("iris-blocks-l3-test-{ts}.sqlite"))
+    }
+
+    async fn setup_conn_and_client() -> Option<(crate::db::AsyncDbConnection, L3Client, PathBuf)> {
+        let src = test_db_path()?;
+        if !src.exists() {
+            return None;
+        }
+
+        let dst = temp_copy_path();
+        std::fs::copy(src, &dst).ok()?;
+        let mut conn = crate::db::new_conn(dst.to_str().expect("db path"))
+            .await
+            .ok()?;
+        crate::db::run_migrations(&mut conn).await.ok()?;
+        let client = L3Client::new(ChainActivations::mainnet(), vec![]);
+        Some((conn, client, dst))
+    }
+
+    #[tokio::test]
+    async fn l3_generates_credits_and_debits_without_refund_double_count() {
+        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
+            eprintln!("Skipping l3 test: TEST_DB_PATH not set");
+            return;
+        };
+
+        client
+            .update_blocks(
+                &mut conn,
+                FixedLayerMetadata {
+                    layer: "l2",
+                    next_block_height: 5651,
+                },
+            )
+            .await
+            .expect("l3 update");
+
+        let credits = sql_query("SELECT COUNT(*) AS count FROM credits")
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .expect("credits count")
+            .count;
+        let debits = sql_query("SELECT COUNT(*) AS count FROM debits")
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .expect("debits count")
+            .count;
+        assert!(credits > 0);
+        assert!(debits >= 0);
+
+        let overlap = sql_query(
+            "SELECT COUNT(*) AS count
+             FROM credits c
+             JOIN debits d
+               ON c.txid = d.txid
+              AND c.first = d.first
+              AND c.height = d.height",
+        )
+        .get_result::<CountRow>(&mut conn)
+        .await
+        .expect("refund overlap count")
+        .count;
+        assert_eq!(overlap, 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+}
