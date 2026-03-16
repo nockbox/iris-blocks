@@ -4,7 +4,10 @@ use super::{l0::schema::transactions, layer::*, shared_schema::*};
 use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use iris_nockchain_types::{v1::SpendV1, Tx};
+use iris_nockchain_types::{
+    v1::{Lock, NoteData, SpendCondition, SpendV1},
+    Note, Tx,
+};
 use iris_ztd::{cue, jam, Hashable, NounDecode, NounEncode};
 use log::*;
 use schema::*;
@@ -78,6 +81,51 @@ impl L2Client {
         i32::try_from(value).map_err(|_| {
             LayerErrorSource::OtherError(format!("numeric value out of range for {field}: {value}"))
         })
+    }
+
+    /// Parse note_data["lock"] as either %lock or %pkh-like forms and return a normalized lock.
+    fn lock_from_note_data(note_data: &NoteData) -> Option<Lock> {
+        let lock_key = "lock".to_string();
+        let lock_noun = note_data.0.get(&lock_key)?;
+
+        // Full lock payload.
+        if let Some(lock) = Lock::from_noun(lock_noun) {
+            return Some(lock);
+        }
+
+        // Direct spend-condition payloads.
+        if let Some(sc) = SpendCondition::from_noun(lock_noun) {
+            return Some(Lock::from(sc));
+        }
+        if let Some((tag, sc)) = <(u64, SpendCondition)>::from_noun(lock_noun) {
+            if tag == 0 {
+                return Some(Lock::from(sc));
+            }
+        }
+        if let Some((tag, sc, trailer)) = <(u64, SpendCondition, u64)>::from_noun(lock_noun) {
+            if tag == 0 && trailer == 0 {
+                return Some(Lock::from(sc));
+            }
+        }
+
+        // Encoded lock with leading tag.
+        if let Some((tag, lock)) = <(u64, Lock)>::from_noun(lock_noun) {
+            if tag == 0 {
+                return Some(lock);
+            }
+        }
+        if let Some((tag, lock, trailer)) = <(u64, Lock, u64)>::from_noun(lock_noun) {
+            if tag == 0 && trailer == 0 {
+                return Some(lock);
+            }
+        }
+
+        None
+    }
+
+    fn spend_conditions_from_lock(lock: &Lock) -> Vec<SpendCondition> {
+        let count = 1usize << (lock.height() - 1);
+        (0..count).map(|idx| lock[idx].clone()).collect()
     }
 
     /// L2.1: Collect transaction internals (spends, seeds, outputs, signers).
@@ -313,11 +361,39 @@ impl L2Client {
             bufs.spend_conditions.push(SpendConditionRow {
                 hash: sc_hash,
                 txid: tx.id,
-                z: z as i32,
+                z: Some(z as i32),
                 height: tx.height,
                 jam: jam(sc.to_noun()),
             });
         }
+
+        // Parse V1 output note_data (%lock/%pkh) and validate lock-root ↔ output-name mapping.
+        for out in vtx.outputs().notes() {
+            let Note::V1(v1_note) = out else { continue };
+            let Some(lock) = Self::lock_from_note_data(&v1_note.note_data) else {
+                continue;
+            };
+            let lock_root = lock.hash();
+            let expected_first = (true, lock_root).hash();
+            let actual_first = v1_note.name.first;
+            if expected_first != actual_first {
+                return Err(LayerErrorSource::OtherError(format!(
+                    "v1 output note_data lock-root/name mismatch: txid={} expected_first={} actual_first={}",
+                    tx.id, expected_first, actual_first
+                )));
+            }
+
+            for sc in Self::spend_conditions_from_lock(&lock) {
+                bufs.spend_conditions.push(SpendConditionRow {
+                    hash: sc.hash().into(),
+                    txid: tx.id,
+                    z: None,
+                    height: tx.height,
+                    jam: jam(sc.to_noun()),
+                });
+            }
+        }
+
         Ok(())
     }
 }

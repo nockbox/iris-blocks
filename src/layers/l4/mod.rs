@@ -1,6 +1,7 @@
 pub mod schema;
 
 use super::{
+    l0::schema::blocks,
     l1::schema::notes,
     l2::schema::{lock_tree, name_to_lock, spend_conditions, SpendConditionRow},
     layer::*,
@@ -10,11 +11,12 @@ use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use iris_nockchain_types::v1::SpendCondition;
+use iris_nockchain_types::Page;
 use iris_ztd::{cue, Hashable, NounDecode};
 use log::*;
 use schema::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
@@ -79,9 +81,11 @@ impl L4Client {
     async fn resolve_owner_from_root_spend_condition(
         conn: &mut crate::db::AsyncDbConnection,
         root: DbDigest,
+        height: i32,
     ) -> Result<(String, String), LayerErrorSource> {
         let sc_row = spend_conditions::table
             .filter(spend_conditions::hash.eq(root))
+            .filter(spend_conditions::height.le(height))
             .first::<SpendConditionRow>(conn)
             .await
             .optional()?;
@@ -108,6 +112,39 @@ impl L4Client {
             )));
         }
         Ok((owner_type, owner))
+    }
+
+    /// Build coinbase first-name ownership map from a block page.
+    /// This provides required context when processing newly created coinbase notes.
+    fn coinbase_recipients(
+        page: &Page,
+        constants: iris_nockchain_types::BlockchainConstants,
+    ) -> BTreeMap<DbDigest, (String, String)> {
+        let notes = page.coinbase(constants);
+        let mut map = BTreeMap::new();
+        match page {
+            Page::V0(p) => {
+                for (note, (sig, _)) in notes.iter().zip(p.coinbase.0.iter()) {
+                    let first = DbDigest(note.name().first);
+                    let pk = sig
+                        .pubkeys
+                        .iter()
+                        .next()
+                        .expect("v0 coinbase sig must have at least one pubkey");
+                    map.insert(
+                        first,
+                        ("pk".to_string(), DbPublicKey::from(*pk).to_string()),
+                    );
+                }
+            }
+            Page::V1(p) => {
+                for (note, (pkh, _)) in notes.iter().zip(p.coinbase.0.iter()) {
+                    let first = DbDigest(note.name().first);
+                    map.insert(first, ("pkh".to_string(), pkh.to_string()));
+                }
+            }
+        }
+        map
     }
 }
 
@@ -192,7 +229,7 @@ impl LayerImpl for L4Client {
         )
         .await?;
 
-        let _constants = self.activations.constants();
+        let constants = self.activations.constants();
         let step = 100u32;
         let last_block_height = core::cmp::min(start_block_height + step - 1, end_block_height);
 
@@ -214,6 +251,7 @@ impl LayerImpl for L4Client {
                 let block_started = Instant::now();
                 let mut block_name_info = vec![];
                 let mut inserted_firsts: HashSet<DbDigest> = HashSet::new();
+                let mut coinbase_owner_map: Option<BTreeMap<DbDigest, (String, String)>> = None;
 
                 // Phase 1: process newly revealed spend conditions at this height.
                 let revealed_sc_hashes = spend_conditions::table
@@ -235,18 +273,24 @@ impl LayerImpl for L4Client {
                     for root in roots {
                         let root_lock_row_count = lock_tree::table
                             .filter(lock_tree::root.eq(root))
+                            .filter(lock_tree::height.le(h))
                             .count()
                             .get_result::<i64>(conn)
                             .await?;
 
                         let (owner_type, owner) = if root_lock_row_count > 1 {
                             ("lock".to_string(), root.to_string())
+                        } else if root_lock_row_count == 1 {
+                            Self::resolve_owner_from_root_spend_condition(conn, root, h).await?
                         } else {
-                            Self::resolve_owner_from_root_spend_condition(conn, root).await?
+                            return Err(LayerErrorSource::OtherError(format!(
+                                "missing lock_tree rows for root={root} at height<={h}"
+                            )));
                         };
 
                         let firsts = name_to_lock::table
                             .filter(name_to_lock::root.eq(root))
+                            .filter(name_to_lock::height.le(h))
                             .select(name_to_lock::first)
                             .load::<DbDigest>(conn)
                             .await?
@@ -284,6 +328,7 @@ impl LayerImpl for L4Client {
 
                     let has_name_info = name_info::table
                         .filter(name_info::first.eq(first))
+                        .filter(name_info::height.le(h))
                         .select(name_info::height)
                         .first::<i32>(conn)
                         .await
@@ -293,12 +338,13 @@ impl LayerImpl for L4Client {
                         continue;
                     }
 
-                    let (version, note_jam) = notes::table
+                    let (version, note_jam, is_coinbase) = notes::table
                         .filter(notes::first.eq(first))
+                        .filter(notes::created_height.le(h))
                         .order(notes::created_height.asc())
                         .then_order_by(notes::last.asc())
-                        .select((notes::version, notes::jam))
-                        .first::<(i32, Vec<u8>)>(conn)
+                        .select((notes::version, notes::jam, notes::coinbase))
+                        .first::<(i32, Vec<u8>, bool)>(conn)
                         .await
                         .map_err(|_| {
                             LayerErrorSource::OtherError(format!(
@@ -306,11 +352,47 @@ impl LayerImpl for L4Client {
                             ))
                         })?;
 
-                    let (owner_type, owner) = if version == 0 {
+                    let (owner_type, owner) = if is_coinbase {
+                        if coinbase_owner_map.is_none() {
+                            let block_jam: Vec<u8> = blocks::table
+                                .filter(blocks::height.eq(h))
+                                .select(blocks::jam)
+                                .first::<Vec<u8>>(conn)
+                                .await
+                                .map_err(|_| {
+                                    LayerErrorSource::OtherError(format!(
+                                        "missing block jam for coinbase mapping at height={h}"
+                                    ))
+                                })?;
+                            let page = Page::from_noun(
+                                &cue(&block_jam).ok_or_else(|| {
+                                    LayerErrorSource::OtherError(format!(
+                                        "failed to cue block at height {h}"
+                                    ))
+                                })?,
+                            )
+                            .ok_or_else(|| {
+                                LayerErrorSource::OtherError(format!(
+                                    "failed to decode block page at height {h}"
+                                ))
+                            })?;
+                            coinbase_owner_map = Some(Self::coinbase_recipients(&page, constants));
+                        }
+
+                        coinbase_owner_map
+                            .as_ref()
+                            .and_then(|m| m.get(&first).cloned())
+                            .ok_or_else(|| {
+                                LayerErrorSource::OtherError(format!(
+                                    "coinbase owner missing for first={first} at height={h}"
+                                ))
+                            })?
+                    } else if version == 0 {
                         Self::resolve_v0_owner(&note_jam)?
                     } else {
                         let root = name_to_lock::table
                             .filter(name_to_lock::first.eq(first))
+                            .filter(name_to_lock::height.le(h))
                             .order(name_to_lock::height.asc())
                             .select(name_to_lock::root)
                             .first::<DbDigest>(conn)
@@ -323,6 +405,7 @@ impl LayerImpl for L4Client {
 
                         let has_revealed_sc = spend_conditions::table
                             .filter(spend_conditions::hash.eq(root))
+                            .filter(spend_conditions::height.le(h))
                             .select(spend_conditions::hash)
                             .first::<DbDigest>(conn)
                             .await
@@ -334,7 +417,45 @@ impl LayerImpl for L4Client {
                             )));
                         }
 
+                        // CTO follow-up: before defaulting to lock, check whether this first
+                        // corresponds to a V1 coinbase recipient and use its PKH when present.
+                        if coinbase_owner_map.is_none() {
+                            let block_jam: Vec<u8> = blocks::table
+                                .filter(blocks::height.eq(h))
+                                .select(blocks::jam)
+                                .first::<Vec<u8>>(conn)
+                                .await
+                                .map_err(|_| {
+                                    LayerErrorSource::OtherError(format!(
+                                        "missing block jam for coinbase mapping at height={h}"
+                                    ))
+                                })?;
+                            let page = Page::from_noun(
+                                &cue(&block_jam).ok_or_else(|| {
+                                    LayerErrorSource::OtherError(format!(
+                                        "failed to cue block at height {h}"
+                                    ))
+                                })?,
+                            )
+                            .ok_or_else(|| {
+                                LayerErrorSource::OtherError(format!(
+                                    "failed to decode block page at height {h}"
+                                ))
+                            })?;
+                            coinbase_owner_map = Some(Self::coinbase_recipients(&page, constants));
+                        }
+                        if let Some((owner_type, owner)) = coinbase_owner_map
+                            .as_ref()
+                            .and_then(|m| m.get(&first).cloned())
+                        {
+                            if owner_type == "pkh" {
+                                (owner_type, owner)
+                            } else {
+                                ("lock".to_string(), root.to_string())
+                            }
+                        } else {
                         ("lock".to_string(), root.to_string())
+                        }
                     };
 
                     if inserted_firsts.insert(first) {
@@ -531,6 +652,30 @@ mod tests {
         .await
         .expect("lock unresolved check");
         assert_eq!(row.count, 0, "resolved V1 rows should not be typed as lock");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn v1_coinbase_rows_are_not_typed_as_lock() {
+        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
+            eprintln!("Skipping v1_coinbase_rows_are_not_typed_as_lock: TEST_DB_PATH not set");
+            return;
+        };
+        run_l4_range(&client, &mut conn, 5650).await;
+
+        let row = sql_query(
+            "SELECT COUNT(*) AS count
+             FROM notes n
+             JOIN name_info ni ON ni.first = n.first
+             WHERE n.coinbase = 1
+               AND n.version >= 1
+               AND ni.owner_type = 'lock'",
+        )
+        .get_result::<CountRow>(&mut conn)
+        .await
+        .expect("v1 coinbase lock typing check");
+        assert_eq!(row.count, 0, "v1 coinbase rows should resolve as pkh");
 
         let _ = std::fs::remove_file(path);
     }
