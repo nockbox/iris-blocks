@@ -1,9 +1,16 @@
 use super::address::{AddressInfo, AddressType, VersionScope};
+use crate::layers::{
+    l0::schema::{blocks, transactions},
+    l2::schema::tx_signers,
+    l3::schema::{credits, debits},
+    shared_schema::{layer_metadata, DbDigest, DbPublicKey},
+};
 use chrono::{DateTime, TimeZone, Utc};
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel_async::RunQueryDsl;
+use iris_ztd::Digest;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
@@ -220,6 +227,10 @@ fn address_type_tag(address_type: &AddressType) -> &'static str {
     }
 }
 
+fn parse_db_digest(input: &str) -> Option<DbDigest> {
+    Digest::try_from(input).ok().map(DbDigest::from)
+}
+
 fn wallet_owner_match_clause(owner_type_col: &str, owner_col: &str) -> String {
     format!(
         "(
@@ -349,13 +360,6 @@ struct TxSpendRow {
     note_assets: i64,
 }
 
-#[derive(QueryableByName)]
-struct TxSignerRow {
-    #[diesel(sql_type = Integer)]
-    z: i32,
-    #[diesel(sql_type = Text)]
-    pk: String,
-}
 
 #[derive(QueryableByName)]
 struct TxOutputRow {
@@ -389,19 +393,6 @@ struct TxCreditRow {
     block_timestamp: i64,
 }
 
-#[derive(QueryableByName)]
-struct TxDebitRow {
-    #[diesel(sql_type = Text)]
-    first: String,
-    #[diesel(sql_type = BigInt)]
-    amount: i64,
-    #[diesel(sql_type = BigInt)]
-    fee: i64,
-    #[diesel(sql_type = Integer)]
-    block_height: i32,
-    #[diesel(sql_type = BigInt)]
-    block_timestamp: i64,
-}
 
 #[derive(QueryableByName)]
 struct BlockBaseRow {
@@ -419,37 +410,6 @@ struct BlockBaseRow {
     msg: Option<String>,
 }
 
-#[derive(QueryableByName)]
-struct BlockTxRow {
-    #[diesel(sql_type = Text)]
-    txid: String,
-    #[diesel(sql_type = Integer)]
-    version: i32,
-    #[diesel(sql_type = BigInt)]
-    fee: i64,
-    #[diesel(sql_type = Integer)]
-    total_size: i32,
-}
-
-#[derive(QueryableByName)]
-struct CoinbaseRow {
-    #[diesel(sql_type = Text)]
-    first: String,
-    #[diesel(sql_type = BigInt)]
-    amount: i64,
-    #[diesel(sql_type = Integer)]
-    block_height: i32,
-    #[diesel(sql_type = BigInt)]
-    block_timestamp: i64,
-}
-
-#[derive(QueryableByName)]
-struct LayerRow {
-    #[diesel(sql_type = Text)]
-    layer: String,
-    #[diesel(sql_type = Integer)]
-    next_block_height: i32,
-}
 
 #[derive(QueryableByName)]
 struct CountRow {
@@ -666,17 +626,33 @@ pub async fn transaction_detail(
     conn: &mut crate::db::AsyncDbConnection,
     txid: &str,
 ) -> Result<TransactionDetail, QueryError> {
-    let base = sql_query(
-        "SELECT t.id AS txid, t.block_id, t.height, COALESCE(b.timestamp, 0) AS block_timestamp, t.version, t.fee, t.total_size
-         FROM transactions t
-         LEFT JOIN blocks b ON b.height = t.height
-         WHERE t.id = ?1
-         LIMIT 1",
-    )
-    .bind::<Text, _>(txid.to_string())
-    .get_result::<TxBaseRow>(conn)
-    .await
-    .optional()?;
+    let Some(txid_digest) = parse_db_digest(txid) else {
+        return Err(QueryError::NotFound(format!("transaction {txid}")));
+    };
+    let base = transactions::table
+        .inner_join(blocks::table.on(blocks::height.eq(transactions::height)))
+        .filter(transactions::id.eq(txid_digest))
+        .select((
+            transactions::id,
+            transactions::block_id,
+            transactions::height,
+            blocks::timestamp,
+            transactions::version,
+            transactions::fee,
+            transactions::total_size,
+        ))
+        .first::<(DbDigest, DbDigest, i32, i64, i32, i64, i32)>(conn)
+        .await
+        .optional()?
+        .map(|r| TxBaseRow {
+            txid: r.0.to_string(),
+            block_id: r.1.to_string(),
+            height: r.2,
+            block_timestamp: r.3,
+            version: r.4,
+            fee: r.5,
+            total_size: r.6,
+        });
 
     let Some(base) = base else {
         return Err(QueryError::NotFound(format!("transaction {txid}")));
@@ -703,17 +679,17 @@ pub async fn transaction_detail(
     })
     .collect();
 
-    let signers = sql_query(
-        "SELECT z, pk
-         FROM tx_signers
-         WHERE txid = ?1
-         ORDER BY z, pk",
-    )
-    .bind::<Text, _>(txid.to_string())
-    .load::<TxSignerRow>(conn)
-    .await?
+    let signers = tx_signers::table
+        .filter(tx_signers::txid.eq(txid_digest))
+        .order((tx_signers::z.asc(), tx_signers::pk.asc()))
+        .select((tx_signers::z, tx_signers::pk))
+        .load::<(i32, DbPublicKey)>(conn)
+        .await?
     .into_iter()
-    .map(|r| TxSignerDetail { z: r.z, pk: r.pk })
+        .map(|(z, pk)| TxSignerDetail {
+            z,
+            pk: pk.to_string(),
+        })
     .collect();
 
     let outputs = sql_query(
@@ -777,26 +753,38 @@ pub async fn transaction_detail(
     .collect();
 
     // L3 debits associated with this tx.
-    let debits = sql_query(
-        "SELECT d.first, d.amount, d.fee, d.height AS block_height, COALESCE(b.timestamp, 0) AS block_timestamp
-         FROM debits d
-         LEFT JOIN blocks b ON b.height = d.height
-         WHERE d.txid = ?1
-         ORDER BY d.first",
-    )
-    .bind::<Text, _>(txid.to_string())
-    .load::<TxDebitRow>(conn)
-    .await?
-    .into_iter()
-    .map(|r| TxDebitDetail {
-        first: r.first,
-        amount_nicks: r.amount,
-        fee_nicks: r.fee,
-        block_height: r.block_height,
-        block_timestamp: r.block_timestamp,
-        block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
-    })
-    .collect();
+    let debit_rows = debits::table
+        .filter(debits::txid.eq(Some(txid_digest)))
+        .order(debits::first.asc())
+        .select((debits::first, debits::amount, debits::fee, debits::height))
+        .load::<(Option<DbDigest>, i64, i64, i32)>(conn)
+        .await?;
+    let heights = debit_rows.iter().map(|(_, _, _, h)| *h).collect::<Vec<_>>();
+    let ts_by_height = if heights.is_empty() {
+        HashMap::new()
+    } else {
+        blocks::table
+            .filter(blocks::height.eq_any(heights))
+            .select((blocks::height, blocks::timestamp))
+            .load::<(i32, i64)>(conn)
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>()
+    };
+    let debits = debit_rows
+        .into_iter()
+        .map(|r| {
+            let ts = *ts_by_height.get(&r.3).unwrap_or(&0);
+            TxDebitDetail {
+                first: r.0.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string()),
+                amount_nicks: r.1,
+                fee_nicks: r.2,
+                block_height: r.3,
+                block_timestamp: ts,
+                block_time_utc: format_chain_timestamp_utc(ts),
+            }
+        })
+        .collect();
 
     Ok(TransactionDetail {
         txid: base.txid,
@@ -821,28 +809,54 @@ pub async fn block_detail(
 ) -> Result<BlockDetail, QueryError> {
     let maybe_height = block.parse::<i32>().ok();
     let base = if let Some(height) = maybe_height {
-        sql_query(
-            "SELECT id, height, version, parent, timestamp, msg
-             FROM blocks
-             WHERE height = ?1
-             ORDER BY id
-             LIMIT 1",
-        )
-        .bind::<Integer, _>(height)
-        .get_result::<BlockBaseRow>(conn)
-        .await
-        .optional()?
+        blocks::table
+            .filter(blocks::height.eq(height))
+            .order(blocks::id.asc())
+            .select((
+                blocks::id,
+                blocks::height,
+                blocks::version,
+                blocks::parent,
+                blocks::timestamp,
+                blocks::msg,
+            ))
+            .first::<(DbDigest, i32, i32, DbDigest, i64, Option<String>)>(conn)
+            .await
+            .optional()?
+            .map(|r| BlockBaseRow {
+                id: r.0.to_string(),
+                height: r.1,
+                version: r.2,
+                parent: r.3.to_string(),
+                timestamp: r.4,
+                msg: r.5,
+            })
     } else {
-        sql_query(
-            "SELECT id, height, version, parent, timestamp, msg
-             FROM blocks
-             WHERE id = ?1
-             LIMIT 1",
-        )
-        .bind::<Text, _>(block.to_string())
-        .get_result::<BlockBaseRow>(conn)
-        .await
-        .optional()?
+        if let Some(block_id) = parse_db_digest(block) {
+            blocks::table
+                .filter(blocks::id.eq(block_id))
+                .select((
+                    blocks::id,
+                    blocks::height,
+                    blocks::version,
+                    blocks::parent,
+                    blocks::timestamp,
+                    blocks::msg,
+                ))
+                .first::<(DbDigest, i32, i32, DbDigest, i64, Option<String>)>(conn)
+                .await
+                .optional()?
+                .map(|r| BlockBaseRow {
+                    id: r.0.to_string(),
+                    height: r.1,
+                    version: r.2,
+                    parent: r.3.to_string(),
+                    timestamp: r.4,
+                    msg: r.5,
+                })
+        } else {
+            None
+        }
     };
 
     let Some(base) = base else {
@@ -850,43 +864,63 @@ pub async fn block_detail(
     };
 
     let block_id = base.id.clone();
-    let transactions = sql_query(
-        "SELECT id AS txid, version, fee, total_size
-         FROM transactions
-         WHERE block_id = ?1
-         ORDER BY id",
-    )
-    .bind::<Text, _>(block_id.clone())
-    .load::<BlockTxRow>(conn)
-    .await?
+    let block_id_digest =
+        parse_db_digest(&block_id).ok_or_else(|| QueryError::NotFound(format!("block {block}")))?;
+    let transactions = transactions::table
+        .filter(transactions::block_id.eq(block_id_digest))
+        .order(transactions::id.asc())
+        .select((
+            transactions::id,
+            transactions::version,
+            transactions::fee,
+            transactions::total_size,
+        ))
+        .load::<(DbDigest, i32, i64, i32)>(conn)
+        .await?
     .into_iter()
     .map(|r| BlockTransaction {
-        txid: r.txid,
-        version: r.version,
-        fee_nicks: r.fee,
-        total_size: r.total_size,
+        txid: r.0.to_string(),
+        version: r.1,
+        fee_nicks: r.2,
+        total_size: r.3,
     })
     .collect();
 
-    let coinbase_credits = sql_query(
-        "SELECT c.first, c.amount, c.height AS block_height, COALESCE(b.timestamp, 0) AS block_timestamp
-         FROM credits c
-         LEFT JOIN blocks b ON b.height = c.height
-         WHERE c.block_id = ?1 AND c.txid IS NULL
-         ORDER BY c.first",
-    )
-    .bind::<Text, _>(block_id)
-    .load::<CoinbaseRow>(conn)
-    .await?
-    .into_iter()
-    .map(|r| CoinbaseCreditDetail {
-        first: r.first,
-        amount_nicks: r.amount,
-        block_height: r.block_height,
-        block_timestamp: r.block_timestamp,
-        block_time_utc: format_chain_timestamp_utc(r.block_timestamp),
-    })
-    .collect();
+    let coinbase_rows = credits::table
+        .filter(credits::block_id.eq(block_id_digest))
+        .filter(credits::txid.is_null())
+        .order(credits::first.asc())
+        .select((credits::first, credits::amount, credits::height))
+        .load::<(DbDigest, i64, i32)>(conn)
+        .await?;
+    let heights = coinbase_rows
+        .iter()
+        .map(|(_, _, h)| *h)
+        .collect::<Vec<_>>();
+    let ts_by_height = if heights.is_empty() {
+        HashMap::new()
+    } else {
+        blocks::table
+            .filter(blocks::height.eq_any(heights))
+            .select((blocks::height, blocks::timestamp))
+            .load::<(i32, i64)>(conn)
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>()
+    };
+    let coinbase_credits = coinbase_rows
+        .into_iter()
+        .map(|r| {
+            let ts = *ts_by_height.get(&r.2).unwrap_or(&0);
+            CoinbaseCreditDetail {
+                first: r.0.to_string(),
+                amount_nicks: r.1,
+                block_height: r.2,
+                block_timestamp: ts,
+                block_time_utc: format_chain_timestamp_utc(ts),
+            }
+        })
+        .collect();
 
     Ok(BlockDetail {
         id: base.id,
@@ -904,20 +938,21 @@ pub async fn block_detail(
 pub async fn sync_status(
     conn: &mut crate::db::AsyncDbConnection,
 ) -> Result<SyncStatus, QueryError> {
-    let layers = sql_query(
-        "SELECT layer, next_block_height
-         FROM layer_metadata
-         ORDER BY layer",
-    )
-    .load::<LayerRow>(conn)
-    .await?
+    let layers = layer_metadata::table
+        .order(layer_metadata::layer.asc())
+        .select((layer_metadata::layer, layer_metadata::next_block_height))
+        .load::<(String, i32)>(conn)
+        .await?
     .into_iter()
     .map(|r| LayerStatus {
-        layer: r.layer,
-        next_block_height: r.next_block_height,
+        layer: r.0,
+        next_block_height: r.1,
     })
     .collect::<Vec<_>>();
 
+    // Intentionally kept as raw SQL: this path needs dynamic table names for
+    // status introspection, which Diesel's typed query DSL does not model
+    // ergonomically without a parallel hard-coded query list.
     let tables = [
         "blocks",
         "transactions",
@@ -972,6 +1007,9 @@ pub async fn audit_report(
 
     let mut ledger = Vec::new();
 
+    // Intentionally raw SQL: this query relies on correlated subqueries and
+    // SQLite aggregation (`GROUP_CONCAT(DISTINCT ...)`) that are critical to
+    // accounting semantics and are migrated in a dedicated hardening pass.
     // Non-coinbase ledger credits for the wallet.
     let credit_sql = format!(
         "SELECT c.height AS block_height,
@@ -1067,6 +1105,8 @@ pub async fn audit_report(
         running_balance_nicks: 0,
     }));
 
+    // Intentionally raw SQL: uses window functions and nested correlated
+    // subqueries for fee and counterparty attribution.
     // Ledger debits for notes spent by this wallet.
     let spent_sql = format!(
         "SELECT n.spent_height AS block_height,
@@ -1236,6 +1276,8 @@ pub async fn audit_report(
         }
     }
 
+    // Intentionally raw SQL: outgoing flow shaping depends on EXISTS filters and
+    // latest-name resolution that are kept stable until dedicated migration.
     // Outgoing flow rows are recipient-level credits for transactions where this
     // wallet spent notes, excluding recipients that resolve back to this wallet.
     let outgoing_sql = format!(

@@ -282,23 +282,9 @@ pub struct L3Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diesel::sql_query;
-    use diesel::sql_types::BigInt;
     use diesel_async::RunQueryDsl;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[derive(diesel::QueryableByName)]
-    struct CountRow {
-        #[diesel(sql_type = BigInt)]
-        count: i64,
-    }
-
-    #[derive(diesel::QueryableByName)]
-    struct SumRow {
-        #[diesel(sql_type = BigInt)]
-        sum_nicks: i64,
-    }
 
     fn test_db_path() -> Option<PathBuf> {
         std::env::var("TEST_DB_PATH").ok().map(PathBuf::from)
@@ -346,43 +332,48 @@ mod tests {
             .await
             .expect("l3 update");
 
-        let credits = sql_query("SELECT COUNT(*) AS count FROM credits")
-            .get_result::<CountRow>(&mut conn)
+        let credits = credits::table
+            .count()
+            .get_result::<i64>(&mut conn)
             .await
-            .expect("credits count")
-            .count;
-        let debits = sql_query("SELECT COUNT(*) AS count FROM debits")
-            .get_result::<CountRow>(&mut conn)
+            .expect("credits count");
+        let debits = debits::table
+            .count()
+            .get_result::<i64>(&mut conn)
             .await
-            .expect("debits count")
-            .count;
+            .expect("debits count");
         assert!(credits > 0);
         assert!(debits >= 0);
 
-        let note_created = sql_query("SELECT COALESCE(SUM(assets), 0) AS sum_nicks FROM notes")
-            .get_result::<SumRow>(&mut conn)
+        let note_created = notes::table
+            .select(notes::assets)
+            .load::<i64>(&mut conn)
             .await
             .expect("note created sum")
-            .sum_nicks;
-        let note_spent = sql_query(
-            "SELECT COALESCE(SUM(assets), 0) AS sum_nicks
-             FROM notes
-             WHERE spent_txid IS NOT NULL",
-        )
-        .get_result::<SumRow>(&mut conn)
-        .await
-        .expect("note spent sum")
-        .sum_nicks;
-        let l3_credits = sql_query("SELECT COALESCE(SUM(amount), 0) AS sum_nicks FROM credits")
-            .get_result::<SumRow>(&mut conn)
+            .into_iter()
+            .sum::<i64>();
+        let note_spent = notes::table
+            .filter(notes::spent_txid.is_not_null())
+            .select(notes::assets)
+            .load::<i64>(&mut conn)
+            .await
+            .expect("note spent sum")
+            .into_iter()
+            .sum::<i64>();
+        let l3_credits = credits::table
+            .select(credits::amount)
+            .load::<i64>(&mut conn)
             .await
             .expect("l3 credits sum")
-            .sum_nicks;
-        let l3_debits = sql_query("SELECT COALESCE(SUM(amount), 0) AS sum_nicks FROM debits")
-            .get_result::<SumRow>(&mut conn)
+            .into_iter()
+            .sum::<i64>();
+        let l3_debits = debits::table
+            .select(debits::amount)
+            .load::<i64>(&mut conn)
             .await
             .expect("l3 debits sum")
-            .sum_nicks;
+            .into_iter()
+            .sum::<i64>();
         assert_eq!(l3_credits, note_created);
         assert_eq!(l3_debits, note_spent);
 

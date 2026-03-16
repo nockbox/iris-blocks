@@ -493,24 +493,10 @@ pub struct L4Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diesel::sql_query;
-    use diesel::sql_types::{BigInt, Text};
     use diesel_async::RunQueryDsl;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[derive(diesel::QueryableByName)]
-    struct RecipientTypeRow {
-        #[diesel(sql_type = Text)]
-        owner_type: String,
-    }
-
-    #[derive(diesel::QueryableByName)]
-    struct CountRow {
-        #[diesel(sql_type = BigInt)]
-        count: i64,
-    }
 
     fn test_db_path() -> Option<PathBuf> {
         std::env::var("TEST_DB_PATH").ok().map(PathBuf::from)
@@ -561,14 +547,13 @@ mod tests {
         };
         run_l4_range(&client, &mut conn, 5650).await;
 
-        let rows = sql_query("SELECT DISTINCT owner_type FROM name_info")
-            .load::<RecipientTypeRow>(&mut conn)
+        let rows = name_info::table
+            .select(name_info::owner_type)
+            .distinct()
+            .load::<String>(&mut conn)
             .await
             .expect("recipient types");
-        let got = rows
-            .into_iter()
-            .map(|r| r.owner_type)
-            .collect::<BTreeSet<_>>();
+        let got = rows.into_iter().collect::<BTreeSet<_>>();
         let allowed = ["pkh", "pk", "musig", "lock"]
             .into_iter()
             .map(str::to_string)
@@ -591,20 +576,35 @@ mod tests {
         };
         run_l4_range(&client, &mut conn, 5650).await;
 
-        let row = sql_query(
-            "SELECT COUNT(*) AS count
-             FROM name_info ni
-             JOIN notes n ON n.first = ni.first
-             JOIN name_to_lock ntl ON ntl.first = ni.first
-             LEFT JOIN spend_conditions sc ON sc.hash = ntl.root
-             WHERE ni.owner_type = 'lock'
-               AND n.version >= 1
-               AND sc.hash IS NOT NULL",
-        )
-        .get_result::<CountRow>(&mut conn)
-        .await
-        .expect("lock unresolved check");
-        assert_eq!(row.count, 0, "resolved V1 rows should not be typed as lock");
+        let lock_firsts = name_info::table
+            .filter(name_info::owner_type.eq("lock"))
+            .select(name_info::first)
+            .distinct()
+            .load::<DbDigest>(&mut conn)
+            .await
+            .expect("load lock firsts");
+        let v1_firsts = notes::table
+            .filter(notes::version.ge(1))
+            .filter(notes::first.eq_any(lock_firsts.clone()))
+            .select(notes::first)
+            .distinct()
+            .load::<DbDigest>(&mut conn)
+            .await
+            .expect("load v1 firsts");
+        let roots = name_to_lock::table
+            .filter(name_to_lock::first.eq_any(v1_firsts))
+            .select(name_to_lock::root)
+            .distinct()
+            .load::<DbDigest>(&mut conn)
+            .await
+            .expect("load lock roots");
+        let count = spend_conditions::table
+            .filter(spend_conditions::hash.eq_any(roots))
+            .count()
+            .get_result::<i64>(&mut conn)
+            .await
+            .expect("lock unresolved check");
+        assert_eq!(count, 0, "resolved V1 rows should not be typed as lock");
 
         let _ = std::fs::remove_file(path);
     }
@@ -617,18 +617,22 @@ mod tests {
         };
         run_l4_range(&client, &mut conn, 5650).await;
 
-        let row = sql_query(
-            "SELECT COUNT(*) AS count
-             FROM notes n
-             JOIN name_info ni ON ni.first = n.first
-             WHERE n.coinbase = 1
-               AND n.version >= 1
-               AND ni.owner_type = 'lock'",
-        )
-        .get_result::<CountRow>(&mut conn)
-        .await
-        .expect("v1 coinbase lock typing check");
-        assert_eq!(row.count, 0, "v1 coinbase rows should resolve as pkh");
+        let lock_firsts = name_info::table
+            .filter(name_info::owner_type.eq("lock"))
+            .select(name_info::first)
+            .distinct()
+            .load::<DbDigest>(&mut conn)
+            .await
+            .expect("load lock firsts");
+        let count = notes::table
+            .filter(notes::coinbase.eq(true))
+            .filter(notes::version.ge(1))
+            .filter(notes::first.eq_any(lock_firsts))
+            .count()
+            .get_result::<i64>(&mut conn)
+            .await
+            .expect("v1 coinbase lock typing check");
+        assert_eq!(count, 0, "v1 coinbase rows should resolve as pkh");
 
         let _ = std::fs::remove_file(path);
     }
