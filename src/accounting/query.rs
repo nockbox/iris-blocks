@@ -1,11 +1,11 @@
-use super::address::{AddressInfo, VersionScope};
+use super::address::{AddressInfo, AddressType, VersionScope};
 use chrono::{DateTime, TimeZone, Utc};
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -213,17 +213,18 @@ fn format_chain_timestamp_utc(ts: i64) -> String {
     }
 }
 
+fn address_type_tag(address_type: &AddressType) -> &'static str {
+    match address_type {
+        AddressType::Pkh => "pkh",
+        AddressType::DbPublicKey => "pk",
+    }
+}
+
 fn wallet_owner_match_clause(owner_type_col: &str, owner_col: &str) -> String {
     format!(
         "(
-            ({owner_type_col} = 'pkh' AND {owner_col} = ?1)
-            OR (
-                {owner_type_col} = 'pk'
-                AND (
-                    {owner_col} IN (SELECT pk FROM pkh_to_pk WHERE pkh = ?1)
-                    OR (?2 IS NOT NULL AND {owner_col} = ?2)
-                )
-            )
+            (?3 = 'pkh' AND {owner_type_col} = 'pkh' AND {owner_col} = ?1)
+            OR (?3 = 'pk' AND ?2 IS NOT NULL AND {owner_type_col} = 'pk' AND {owner_col} = ?2)
         )"
     )
 }
@@ -264,10 +265,9 @@ fn validate_balance_invariant(balance_nicks: i64, accounting_nicks: i64) -> Resu
 }
 
 fn recipient_matches_wallet(
-    _scope: VersionScope,
+    address_type: &AddressType,
     pkh: &str,
     wallet_db_pk: Option<&str>,
-    wallet_pks: &HashSet<String>,
     recipient_type: Option<&str>,
     recipient: Option<&str>,
 ) -> bool {
@@ -277,13 +277,11 @@ fn recipient_matches_wallet(
     let Some(recipient) = recipient else {
         return false;
     };
-    match recipient_type {
-        "pk" => {
-            wallet_pks.contains(recipient)
-                || wallet_db_pk.map(|pk| pk == recipient).unwrap_or(false)
+    match address_type {
+        AddressType::Pkh => recipient_type == "pkh" && recipient == pkh,
+        AddressType::DbPublicKey => {
+            recipient_type == "pk" && wallet_db_pk.map(|pk| pk == recipient).unwrap_or(false)
         }
-        "pkh" => recipient == pkh,
-        _ => false,
     }
 }
 
@@ -309,12 +307,6 @@ struct VersionSumRow {
     version: i32,
     #[diesel(sql_type = BigInt)]
     sum_nicks: i64,
-}
-
-#[derive(QueryableByName)]
-struct PkRow {
-    #[diesel(sql_type = Text)]
-    pk: String,
 }
 
 #[derive(QueryableByName)]
@@ -499,6 +491,7 @@ pub async fn wallet_balance(
 ) -> Result<WalletBalance, QueryError> {
     let pkh = address.pkh.clone();
     let db_public_key = address.db_public_key.clone();
+    let owner_tag = address_type_tag(&address.address_type).to_string();
     let scope = address.scope.clone();
     let note_version_filter = match scope {
         VersionScope::All => "",
@@ -521,6 +514,7 @@ pub async fn wallet_balance(
     let unspent = sql_query(unspent_query)
         .bind::<Text, _>(pkh.clone())
         .bind::<Nullable<Text>, _>(db_public_key.clone())
+        .bind::<Text, _>(owner_tag.clone())
         .get_result::<SumCountRow>(conn)
         .await?;
 
@@ -537,6 +531,7 @@ pub async fn wallet_balance(
     let by_version = sql_query(by_version_sql)
         .bind::<Text, _>(pkh.clone())
         .bind::<Nullable<Text>, _>(db_public_key.clone())
+        .bind::<Text, _>(owner_tag.clone())
         .load::<VersionSumRow>(conn)
         .await?;
 
@@ -572,6 +567,7 @@ pub async fn wallet_balance(
     let tx_credits_nicks = sql_query(tx_credits_sql)
         .bind::<Text, _>(pkh.clone())
         .bind::<Nullable<Text>, _>(db_public_key.clone())
+        .bind::<Text, _>(owner_tag.clone())
         .get_result::<SumRow>(conn)
         .await?
         .sum_nicks;
@@ -593,6 +589,7 @@ pub async fn wallet_balance(
     let coinbase_credits_nicks = sql_query(coinbase_sql)
         .bind::<Text, _>(pkh.clone())
         .bind::<Nullable<Text>, _>(db_public_key.clone())
+        .bind::<Text, _>(owner_tag.clone())
         .get_result::<SumRow>(conn)
         .await?
         .sum_nicks;
@@ -613,6 +610,7 @@ pub async fn wallet_balance(
     let spent_nicks = sql_query(spent_query)
         .bind::<Text, _>(pkh.clone())
         .bind::<Nullable<Text>, _>(db_public_key.clone())
+        .bind::<Text, _>(owner_tag.clone())
         .get_result::<SumRow>(conn)
         .await?
         .sum_nicks;
@@ -633,6 +631,7 @@ pub async fn wallet_balance(
     let fees_nicks = sql_query(fees_sql)
         .bind::<Text, _>(pkh.clone())
         .bind::<Nullable<Text>, _>(db_public_key)
+        .bind::<Text, _>(owner_tag)
         .get_result::<SumRow>(conn)
         .await?
         .sum_nicks;
@@ -959,6 +958,7 @@ pub async fn audit_report(
     let balance = wallet_balance(conn, address.clone()).await?;
     let pkh = address.pkh.clone();
     let db_public_key = address.db_public_key.clone();
+    let owner_tag = address_type_tag(&address.address_type).to_string();
     let scope = address.scope.clone();
     let note_version_filter = match scope {
         VersionScope::All => "",
@@ -969,14 +969,6 @@ pub async fn audit_report(
     let wallet_ni3_filter = wallet_name_info_filter("ni3");
     let wallet_name_info_latest = latest_name_info_subquery("ni");
     let wallet_name_info_latest_ni3 = latest_name_info_subquery("ni3");
-
-    let wallet_pks = sql_query("SELECT pk FROM pkh_to_pk WHERE pkh = ?1")
-        .bind::<Text, _>(pkh.clone())
-        .load::<PkRow>(conn)
-        .await?
-        .into_iter()
-        .map(|r| r.pk)
-        .collect::<HashSet<_>>();
 
     let mut ledger = Vec::new();
 
@@ -1010,6 +1002,7 @@ pub async fn audit_report(
     let credit_rows = sql_query(credit_sql)
         .bind::<Text, _>(pkh.clone())
         .bind::<Nullable<Text>, _>(db_public_key.clone())
+        .bind::<Text, _>(owner_tag.clone())
         .load::<LedgerRow>(conn)
         .await?;
     ledger.extend(credit_rows.into_iter().map(|r| LedgerEntry {
@@ -1056,6 +1049,7 @@ pub async fn audit_report(
     let coinbase_rows = sql_query(coinbase_sql)
         .bind::<Text, _>(pkh.clone())
         .bind::<Nullable<Text>, _>(db_public_key.clone())
+        .bind::<Text, _>(owner_tag.clone())
         .load::<LedgerRow>(conn)
         .await?;
     ledger.extend(coinbase_rows.into_iter().map(|r| LedgerEntry {
@@ -1114,6 +1108,7 @@ pub async fn audit_report(
     let spent_rows = sql_query(spent_sql)
         .bind::<Text, _>(pkh.clone())
         .bind::<Nullable<Text>, _>(db_public_key.clone())
+        .bind::<Text, _>(owner_tag.clone())
         .load::<LedgerRow>(conn)
         .await?;
 
@@ -1260,14 +1255,14 @@ pub async fn audit_report(
     let outgoing_rows = sql_query(outgoing_sql)
         .bind::<Text, _>(pkh.clone())
         .bind::<Nullable<Text>, _>(db_public_key.clone())
+        .bind::<Text, _>(owner_tag.clone())
         .load::<LedgerRow>(conn)
         .await?;
     for row in outgoing_rows {
         if recipient_matches_wallet(
-            scope.clone(),
+            &address.address_type,
             &pkh,
             db_public_key.as_deref(),
-            &wallet_pks,
             row.recipient_type.as_deref(),
             row.recipient.as_deref(),
         ) {
@@ -1513,14 +1508,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accounting_invariants_and_outgoing_flow_fee_hold() {
+    async fn pkh_v1_only_accounting_invariants_hold() {
         let (mut conn, path) = setup_conn().await;
         seed_balance_fixture(&mut conn).await;
 
         let address = AddressInfo {
             input: "wallet_pkh".to_string(),
             address_type: AddressType::Pkh,
-            scope: VersionScope::All,
+            scope: VersionScope::V1Only,
             pkh: "wallet_pkh".to_string(),
             db_public_key: Some("wallet_pk".to_string()),
         };
@@ -1530,9 +1525,9 @@ mod tests {
             .expect("wallet_balance");
         assert_eq!(balance.balance_nicks, 25);
         assert_eq!(balance.tx_credits_nicks, 25);
-        assert_eq!(balance.coinbase_credits_nicks, 50);
-        assert_eq!(balance.spent_nicks, 50);
-        assert_eq!(balance.fees_nicks, 5);
+        assert_eq!(balance.coinbase_credits_nicks, 0);
+        assert_eq!(balance.spent_nicks, 0);
+        assert_eq!(balance.fees_nicks, 0);
         assert_eq!(
             balance.received_nicks - balance.spent_nicks,
             balance.balance_nicks
@@ -1541,25 +1536,19 @@ mod tests {
         let audit = audit_report(&mut conn, address)
             .await
             .expect("audit_report");
-        assert!(audit
-            .ledger
-            .iter()
-            .any(|e| e.entry_type == "coinbase" && e.amount_nicks == 50));
+        assert!(!audit.ledger.iter().any(|e| e.entry_type == "coinbase"));
         let outgoing_rows = audit
             .flows
             .iter()
             .filter(|f| f.entry_type == "outgoing")
             .collect::<Vec<_>>();
-        assert_eq!(outgoing_rows.len(), 1);
-        assert_eq!(outgoing_rows[0].recipient.as_deref(), Some("other_pkh"));
-        assert_eq!(outgoing_rows[0].amount_nicks, 20);
-        assert_eq!(outgoing_rows[0].fee_nicks, 5);
+        assert_eq!(outgoing_rows.len(), 0);
 
         let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
-    async fn scoped_balances_match_expected_v0_v1_and_combined_views() {
+    async fn strict_split_keeps_pkh_v1_and_pk_v0_separate() {
         let (mut conn, path) = setup_conn().await;
         seed_balance_fixture(&mut conn).await;
 
@@ -1580,21 +1569,6 @@ mod tests {
         assert_eq!(v1.tx_credits_nicks, 25);
         assert_eq!(v1.spent_nicks, 0);
 
-        let all_address = AddressInfo {
-            input: "wallet_pkh".to_string(),
-            address_type: AddressType::Pkh,
-            scope: VersionScope::All,
-            pkh: "wallet_pkh".to_string(),
-            db_public_key: Some("wallet_pk".to_string()),
-        };
-        let all = wallet_balance(&mut conn, all_address)
-            .await
-            .expect("all balance");
-        assert_eq!(all.balance_nicks, 25);
-        assert_eq!(all.coinbase_credits_nicks, 50);
-        assert_eq!(all.tx_credits_nicks, 25);
-        assert_eq!(all.spent_nicks, 50);
-
         let v0_address = AddressInfo {
             input: "wallet_pk".to_string(),
             address_type: AddressType::DbPublicKey,
@@ -1609,6 +1583,7 @@ mod tests {
         assert_eq!(v0.coinbase_credits_nicks, 50);
         assert_eq!(v0.tx_credits_nicks, 0);
         assert_eq!(v0.spent_nicks, 50);
+        assert_eq!(v0.fees_nicks, 5);
 
         let _ = std::fs::remove_file(path);
     }

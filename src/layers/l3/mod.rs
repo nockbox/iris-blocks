@@ -213,25 +213,9 @@ impl LayerImpl for L3Client {
                     });
                 }
 
-                // Filter out refunds: remove credit/debit pairs that share
-                // the same (txid, first), meaning assets sent back to the
-                // same identity within the same transaction.
-                let debit_keys: std::collections::BTreeSet<(Option<DbDigest>, DbDigest)> =
-                    block_debits
-                        .iter()
-                        .filter_map(|d| d.first.map(|first| (d.txid, first)))
-                        .collect();
-                let credit_keys: std::collections::BTreeSet<(Option<DbDigest>, DbDigest)> =
-                    block_credits.iter().map(|c| (c.txid, c.first)).collect();
-                let refund_keys: std::collections::BTreeSet<_> =
-                    credit_keys.intersection(&debit_keys).cloned().collect();
-                if !refund_keys.is_empty() {
-                    block_credits.retain(|c| !refund_keys.contains(&(c.txid, c.first)));
-                    block_debits.retain(|d| {
-                        d.first
-                            .map_or(true, |first| !refund_keys.contains(&(d.txid, first)))
-                    });
-                }
+                // Keep both credits and debits even when they share (txid, first):
+                // same-first outputs represent real refund/change and must remain
+                // visible so received - spent tracks note-balance evolution exactly.
 
                 cur_metadata = FixedLayerMetadata {
                     layer: Self::LAYER,
@@ -315,6 +299,12 @@ mod tests {
         count: i64,
     }
 
+    #[derive(diesel::QueryableByName)]
+    struct SumRow {
+        #[diesel(sql_type = BigInt)]
+        sum_nicks: i64,
+    }
+
     fn test_db_path() -> Option<PathBuf> {
         std::env::var("TEST_DB_PATH").ok().map(PathBuf::from)
     }
@@ -374,19 +364,32 @@ mod tests {
         assert!(credits > 0);
         assert!(debits >= 0);
 
-        let overlap = sql_query(
-            "SELECT COUNT(*) AS count
-             FROM credits c
-             JOIN debits d
-               ON c.txid = d.txid
-              AND c.first = d.first
-              AND c.height = d.height",
+        let note_created = sql_query("SELECT COALESCE(SUM(assets), 0) AS sum_nicks FROM notes")
+            .get_result::<SumRow>(&mut conn)
+            .await
+            .expect("note created sum")
+            .sum_nicks;
+        let note_spent = sql_query(
+            "SELECT COALESCE(SUM(assets), 0) AS sum_nicks
+             FROM notes
+             WHERE spent_txid IS NOT NULL",
         )
-        .get_result::<CountRow>(&mut conn)
+        .get_result::<SumRow>(&mut conn)
         .await
-        .expect("refund overlap count")
-        .count;
-        assert_eq!(overlap, 0);
+        .expect("note spent sum")
+        .sum_nicks;
+        let l3_credits = sql_query("SELECT COALESCE(SUM(amount), 0) AS sum_nicks FROM credits")
+            .get_result::<SumRow>(&mut conn)
+            .await
+            .expect("l3 credits sum")
+            .sum_nicks;
+        let l3_debits = sql_query("SELECT COALESCE(SUM(amount), 0) AS sum_nicks FROM debits")
+            .get_result::<SumRow>(&mut conn)
+            .await
+            .expect("l3 debits sum")
+            .sum_nicks;
+        assert_eq!(l3_credits, note_created);
+        assert_eq!(l3_debits, note_spent);
 
         let _ = std::fs::remove_file(path);
     }
