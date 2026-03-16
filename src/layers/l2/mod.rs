@@ -83,43 +83,26 @@ impl L2Client {
         })
     }
 
-    /// Parse note_data["lock"] as either %lock or %pkh-like forms and return a normalized lock.
+    /// Parse note_data `%lock`/`%pkh` entry and return a normalized lock.
     fn lock_from_note_data(note_data: &NoteData) -> Option<Lock> {
         let lock_key = "lock".to_string();
-        let lock_noun = note_data.0.get(&lock_key)?;
+        let pkh_key = "pkh".to_string();
+        let lock_noun = note_data
+            .0
+            .get(&lock_key)
+            .or_else(|| note_data.0.get(&pkh_key))?;
 
-        // Full lock payload.
+        // Common case: single spend-condition payload decodes directly as Lock.
         if let Some(lock) = Lock::from_noun(lock_noun) {
             return Some(lock);
         }
-
-        // Direct spend-condition payloads.
-        if let Some(sc) = SpendCondition::from_noun(lock_noun) {
-            return Some(Lock::from(sc));
+        // Explicitly require v0-tagged %lock encoding when represented as a pair.
+        if let Some((0u64, lock)) = <(u64, Lock)>::from_noun(lock_noun) {
+            return Some(lock);
         }
-        if let Some((tag, sc)) = <(u64, SpendCondition)>::from_noun(lock_noun) {
-            if tag == 0 {
-                return Some(Lock::from(sc));
-            }
+        if let Some((0u64, lock, 0u64)) = <(u64, Lock, u64)>::from_noun(lock_noun) {
+            return Some(lock);
         }
-        if let Some((tag, sc, trailer)) = <(u64, SpendCondition, u64)>::from_noun(lock_noun) {
-            if tag == 0 && trailer == 0 {
-                return Some(Lock::from(sc));
-            }
-        }
-
-        // Encoded lock with leading tag.
-        if let Some((tag, lock)) = <(u64, Lock)>::from_noun(lock_noun) {
-            if tag == 0 {
-                return Some(lock);
-            }
-        }
-        if let Some((tag, lock, trailer)) = <(u64, Lock, u64)>::from_noun(lock_noun) {
-            if tag == 0 && trailer == 0 {
-                return Some(lock);
-            }
-        }
-
         None
     }
 

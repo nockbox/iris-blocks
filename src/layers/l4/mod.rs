@@ -113,34 +113,18 @@ impl L4Client {
         Ok((owner_type, owner))
     }
 
-    /// Build coinbase first-name ownership map from a block page.
-    /// This provides required context when processing newly created coinbase notes.
+    /// Build V1 coinbase first-name ownership map from a block page.
+    /// V0 pages can be skipped because V0 ownership is resolved from notes.
     fn coinbase_recipients(
         page: &Page,
         constants: iris_nockchain_types::BlockchainConstants,
     ) -> BTreeMap<DbDigest, (String, String)> {
-        let notes = page.coinbase(constants);
         let mut map = BTreeMap::new();
-        match page {
-            Page::V0(p) => {
-                for (note, (sig, _)) in notes.iter().zip(p.coinbase.0.iter()) {
-                    let first = DbDigest(note.name().first);
-                    let pk = sig
-                        .pubkeys
-                        .iter()
-                        .next()
-                        .expect("v0 coinbase sig must have at least one pubkey");
-                    map.insert(
-                        first,
-                        ("pk".to_string(), DbPublicKey::from(*pk).to_string()),
-                    );
-                }
-            }
-            Page::V1(p) => {
-                for (note, (pkh, _)) in notes.iter().zip(p.coinbase.0.iter()) {
-                    let first = DbDigest(note.name().first);
-                    map.insert(first, ("pkh".to_string(), pkh.to_string()));
-                }
+        if let Page::V1(p) = page {
+            let notes = page.coinbase(constants);
+            for (note, (pkh, _)) in notes.iter().zip(p.coinbase.0.iter()) {
+                let first = DbDigest(note.name().first);
+                map.insert(first, ("pkh".to_string(), pkh.to_string()));
             }
         }
         map
@@ -250,7 +234,27 @@ impl LayerImpl for L4Client {
                 let block_started = Instant::now();
                 let mut block_name_info = vec![];
                 let mut inserted_firsts: BTreeSet<DbDigest> = BTreeSet::new();
-                let mut coinbase_owner_map: Option<BTreeMap<DbDigest, (String, String)>> = None;
+                let block_jam: Vec<u8> = blocks::table
+                    .filter(blocks::height.eq(h))
+                    .select(blocks::jam)
+                    .first::<Vec<u8>>(conn)
+                    .await
+                    .map_err(|_| {
+                        LayerErrorSource::OtherError(format!(
+                            "missing block jam for coinbase mapping at height={h}"
+                        ))
+                    })?;
+                let page = Page::from_noun(
+                    &cue(&block_jam).ok_or_else(|| {
+                        LayerErrorSource::OtherError(format!("failed to cue block at height {h}"))
+                    })?,
+                )
+                .ok_or_else(|| {
+                    LayerErrorSource::OtherError(format!(
+                        "failed to decode block page at height {h}"
+                    ))
+                })?;
+                let coinbase_owner_map = Self::coinbase_recipients(&page, constants);
 
                 // Phase 1: process newly revealed spend conditions at this height.
                 let revealed_sc_hashes = spend_conditions::table
@@ -352,35 +356,9 @@ impl LayerImpl for L4Client {
                         })?;
 
                     let (owner_type, owner) = if is_coinbase {
-                        if coinbase_owner_map.is_none() {
-                            let block_jam: Vec<u8> = blocks::table
-                                .filter(blocks::height.eq(h))
-                                .select(blocks::jam)
-                                .first::<Vec<u8>>(conn)
-                                .await
-                                .map_err(|_| {
-                                    LayerErrorSource::OtherError(format!(
-                                        "missing block jam for coinbase mapping at height={h}"
-                                    ))
-                                })?;
-                            let page = Page::from_noun(
-                                &cue(&block_jam).ok_or_else(|| {
-                                    LayerErrorSource::OtherError(format!(
-                                        "failed to cue block at height {h}"
-                                    ))
-                                })?,
-                            )
-                            .ok_or_else(|| {
-                                LayerErrorSource::OtherError(format!(
-                                    "failed to decode block page at height {h}"
-                                ))
-                            })?;
-                            coinbase_owner_map = Some(Self::coinbase_recipients(&page, constants));
-                        }
-
                         coinbase_owner_map
-                            .as_ref()
-                            .and_then(|m| m.get(&first).cloned())
+                            .get(&first)
+                            .cloned()
                             .ok_or_else(|| {
                                 LayerErrorSource::OtherError(format!(
                                     "coinbase owner missing for first={first} at height={h}"
@@ -416,36 +394,9 @@ impl LayerImpl for L4Client {
                             )));
                         }
 
-                        // CTO follow-up: before defaulting to lock, check whether this first
-                        // corresponds to a V1 coinbase recipient and use its PKH when present.
-                        if coinbase_owner_map.is_none() {
-                            let block_jam: Vec<u8> = blocks::table
-                                .filter(blocks::height.eq(h))
-                                .select(blocks::jam)
-                                .first::<Vec<u8>>(conn)
-                                .await
-                                .map_err(|_| {
-                                    LayerErrorSource::OtherError(format!(
-                                        "missing block jam for coinbase mapping at height={h}"
-                                    ))
-                                })?;
-                            let page = Page::from_noun(
-                                &cue(&block_jam).ok_or_else(|| {
-                                    LayerErrorSource::OtherError(format!(
-                                        "failed to cue block at height {h}"
-                                    ))
-                                })?,
-                            )
-                            .ok_or_else(|| {
-                                LayerErrorSource::OtherError(format!(
-                                    "failed to decode block page at height {h}"
-                                ))
-                            })?;
-                            coinbase_owner_map = Some(Self::coinbase_recipients(&page, constants));
-                        }
-                        if let Some((owner_type, owner)) = coinbase_owner_map
-                            .as_ref()
-                            .and_then(|m| m.get(&first).cloned())
+                        // Before defaulting to lock, check whether this first is a V1
+                        // coinbase recipient and use its PKH when present.
+                        if let Some((owner_type, owner)) = coinbase_owner_map.get(&first).cloned()
                         {
                             if owner_type == "pkh" {
                                 (owner_type, owner)
@@ -453,7 +404,7 @@ impl LayerImpl for L4Client {
                                 ("lock".to_string(), root.to_string())
                             }
                         } else {
-                        ("lock".to_string(), root.to_string())
+                            ("lock".to_string(), root.to_string())
                         }
                     };
 

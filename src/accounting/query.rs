@@ -5,7 +5,7 @@ use diesel::sql_query;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -1196,10 +1196,26 @@ pub async fn audit_report(
 
     // Summary flow rows
     let mut flows = Vec::new();
+    let wallet_spend_txids = ledger
+        .iter()
+        .filter(|entry| entry.entry_type == "debit")
+        .filter_map(|entry| entry.txid.clone())
+        .collect::<HashSet<_>>();
 
     // Incoming rows from ledger
     for entry in &ledger {
         if entry.entry_type == "credit" || entry.entry_type == "coinbase" {
+            // Summary/default CSV should omit refund/change rows that are part of
+            // wallet-originated spends; those are represented in note view.
+            if entry.entry_type == "credit"
+                && entry
+                    .txid
+                    .as_ref()
+                    .map(|txid| wallet_spend_txids.contains(txid))
+                    .unwrap_or(false)
+            {
+                continue;
+            }
             flows.push(AuditFlowRow {
                 block_height: entry.block_height,
                 block_id: entry.block_id.clone(),
@@ -1584,6 +1600,102 @@ mod tests {
         assert_eq!(v0.tx_credits_nicks, 0);
         assert_eq!(v0.spent_nicks, 50);
         assert_eq!(v0.fees_nicks, 5);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    async fn seed_summary_refund_fixture(conn: &mut crate::db::AsyncDbConnection) {
+        sql_query(
+            "INSERT INTO blocks (id, height, version, parent, timestamp, msg, jam)
+             VALUES ('b1', 1, 1, 'p0', 1, NULL, x'00'),
+                    ('b2', 2, 1, 'b1', 2, NULL, x'00')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert blocks");
+
+        sql_query(
+            "INSERT INTO transactions (id, block_id, height, version, fee, total_size, jam)
+             VALUES ('tx_in', 'b1', 1, 1, 0, 100, x'00'),
+                    ('tx_spend', 'b2', 2, 1, 5, 200, x'00')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert transactions");
+
+        sql_query(
+            "INSERT INTO notes (
+                 first, last, version, assets, coinbase,
+                 created_txid, spent_txid, created_height, spent_height,
+                 created_bid, spent_bid, jam
+             ) VALUES
+             ('wallet_in', 'l0', 1, 50, 0, 'tx_in', 'tx_spend', 1, 2, 'b1', 'b2', x'00'),
+             ('wallet_change', 'l1', 1, 25, 0, 'tx_spend', NULL, 2, NULL, 'b2', NULL, x'00'),
+             ('external_out', 'l2', 1, 20, 0, 'tx_spend', NULL, 2, NULL, 'b2', NULL, x'00')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert notes");
+
+        sql_query(
+            "INSERT INTO credits (txid, first, height, block_id, amount) VALUES
+             ('tx_in', 'wallet_in', 1, 'b1', 50),
+             ('tx_spend', 'wallet_change', 2, 'b2', 25),
+             ('tx_spend', 'external_out', 2, 'b2', 20)",
+        )
+        .execute(conn)
+        .await
+        .expect("insert credits");
+
+        sql_query(
+            "INSERT INTO debits (txid, first, height, block_id, amount, fee)
+             VALUES ('tx_spend', 'wallet_in', 2, 'b2', 50, 5)",
+        )
+        .execute(conn)
+        .await
+        .expect("insert debits");
+
+        sql_query(
+            "INSERT INTO name_info (first, height, version, owner_type, owner) VALUES
+             ('wallet_in', 1, 1, 'pkh', 'wallet_pkh'),
+             ('wallet_change', 2, 1, 'pkh', 'wallet_pkh'),
+             ('external_out', 2, 1, 'pkh', 'other_pkh')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert name_info");
+    }
+
+    #[tokio::test]
+    async fn summary_omits_refund_change_for_wallet_spend_tx() {
+        let (mut conn, path) = setup_conn().await;
+        seed_summary_refund_fixture(&mut conn).await;
+
+        let address = AddressInfo {
+            input: "wallet_pkh".to_string(),
+            address_type: AddressType::Pkh,
+            scope: VersionScope::V1Only,
+            pkh: "wallet_pkh".to_string(),
+            db_public_key: None,
+        };
+
+        let audit = audit_report(&mut conn, address)
+            .await
+            .expect("audit_report");
+        assert!(audit
+            .flows
+            .iter()
+            .all(|row| !(row.txid.as_deref() == Some("tx_spend") && row.entry_type == "incoming")));
+
+        let outgoing_rows = audit
+            .flows
+            .iter()
+            .filter(|row| row.txid.as_deref() == Some("tx_spend") && row.entry_type == "outgoing")
+            .collect::<Vec<_>>();
+        assert_eq!(outgoing_rows.len(), 1);
+        assert_eq!(outgoing_rows[0].recipient.as_deref(), Some("other_pkh"));
+        assert_eq!(outgoing_rows[0].amount_nicks, 20);
+        assert_eq!(outgoing_rows[0].fee_nicks, 5);
 
         let _ = std::fs::remove_file(path);
     }
