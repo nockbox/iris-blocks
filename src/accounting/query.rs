@@ -1301,10 +1301,17 @@ pub async fn audit_report(
 
     // One fee assignment per tx
     let mut tx_fee_map: HashMap<String, i64> = HashMap::new();
+    let mut tx_fee_anchor: HashMap<String, (i32, Option<String>, i64, String)> = HashMap::new();
     for entry in &ledger {
         if entry.entry_type == "debit" {
             if let Some(txid) = entry.txid.as_ref() {
                 *tx_fee_map.entry(txid.clone()).or_insert(0) += entry.fee_nicks;
+                tx_fee_anchor.entry(txid.clone()).or_insert((
+                    entry.block_height,
+                    entry.block_id.clone(),
+                    entry.block_timestamp,
+                    entry.block_time_utc.clone(),
+                ));
             }
         }
     }
@@ -1331,6 +1338,25 @@ pub async fn audit_report(
             .position(|row| row.txid.as_deref() == Some(&txid));
         if let Some(idx) = outgoing_idx.or(any_idx) {
             flows[idx].fee_nicks = fee;
+        } else if let Some((block_height, block_id, block_timestamp, block_time_utc)) =
+            tx_fee_anchor.get(&txid)
+        {
+            // Keep accounting invariant in summary/default CSV: if a wallet spend
+            // transaction has no surviving incoming/outgoing row (self-churn/refund),
+            // we still must materialize the fee deduction.
+            flows.push(AuditFlowRow {
+                block_height: *block_height,
+                block_id: block_id.clone(),
+                txid: Some(txid.clone()),
+                block_timestamp: *block_timestamp,
+                block_time_utc: block_time_utc.clone(),
+                entry_type: "outgoing".to_string(),
+                recipient_type: None,
+                recipient: None,
+                amount_nicks: 0,
+                fee_nicks: fee,
+                running_balance_nicks: 0,
+            });
         }
     }
 
@@ -1344,6 +1370,28 @@ pub async fn audit_report(
         delta -= row.fee_nicks;
         running_flows_nicks += delta;
         row.running_balance_nicks = running_flows_nicks;
+    }
+
+    // Keep tx identifiers explicit in reporting views:
+    // coinbase rows have no canonical txid in storage, so emit a stable
+    // synthetic reference to avoid blank txid cells in accounting exports.
+    for entry in &mut ledger {
+        if entry.txid.is_none() {
+            let anchor = entry
+                .block_id
+                .clone()
+                .unwrap_or_else(|| format!("h{}", entry.block_height));
+            entry.txid = Some(format!("coinbase@{anchor}"));
+        }
+    }
+    for row in &mut flows {
+        if row.txid.is_none() {
+            let anchor = row
+                .block_id
+                .clone()
+                .unwrap_or_else(|| format!("h{}", row.block_height));
+            row.txid = Some(format!("coinbase@{anchor}"));
+        }
     }
 
     Ok(AuditReport {
@@ -1696,6 +1744,105 @@ mod tests {
         assert_eq!(outgoing_rows[0].recipient.as_deref(), Some("other_pkh"));
         assert_eq!(outgoing_rows[0].amount_nicks, 20);
         assert_eq!(outgoing_rows[0].fee_nicks, 5);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    async fn seed_summary_fee_only_fixture(conn: &mut crate::db::AsyncDbConnection) {
+        sql_query(
+            "INSERT INTO blocks (id, height, version, parent, timestamp, msg, jam)
+             VALUES ('b10', 10, 1, 'p0', 10, NULL, x'00'),
+                    ('b11', 11, 1, 'b10', 11, NULL, x'00')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert blocks");
+
+        sql_query(
+            "INSERT INTO transactions (id, block_id, height, version, fee, total_size, jam)
+             VALUES ('tx_seed', 'b10', 10, 1, 0, 100, x'00'),
+                    ('tx_churn', 'b11', 11, 1, 5, 200, x'00')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert transactions");
+
+        sql_query(
+            "INSERT INTO notes (
+                 first, last, version, assets, coinbase,
+                 created_txid, spent_txid, created_height, spent_height,
+                 created_bid, spent_bid, jam
+             ) VALUES
+             ('wallet_seed', 'l0', 1, 50, 0, 'tx_seed', 'tx_churn', 10, 11, 'b10', 'b11', x'00'),
+             ('wallet_change2', 'l1', 1, 45, 0, 'tx_churn', NULL, 11, NULL, 'b11', NULL, x'00')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert notes");
+
+        sql_query(
+            "INSERT INTO credits (txid, first, height, block_id, amount) VALUES
+             ('tx_seed', 'wallet_seed', 10, 'b10', 50),
+             ('tx_churn', 'wallet_change2', 11, 'b11', 45)",
+        )
+        .execute(conn)
+        .await
+        .expect("insert credits");
+
+        sql_query(
+            "INSERT INTO debits (txid, first, height, block_id, amount, fee)
+             VALUES ('tx_churn', 'wallet_seed', 11, 'b11', 50, 5)",
+        )
+        .execute(conn)
+        .await
+        .expect("insert debits");
+
+        sql_query(
+            "INSERT INTO name_info (first, height, version, owner_type, owner) VALUES
+             ('wallet_seed', 10, 1, 'pkh', 'wallet_pkh'),
+             ('wallet_change2', 11, 1, 'pkh', 'wallet_pkh')",
+        )
+        .execute(conn)
+        .await
+        .expect("insert name_info");
+    }
+
+    #[tokio::test]
+    async fn summary_keeps_fee_only_row_when_refund_rows_omitted() {
+        let (mut conn, path) = setup_conn().await;
+        seed_summary_fee_only_fixture(&mut conn).await;
+
+        let address = AddressInfo {
+            input: "wallet_pkh".to_string(),
+            address_type: AddressType::Pkh,
+            scope: VersionScope::V1Only,
+            pkh: "wallet_pkh".to_string(),
+            db_public_key: None,
+        };
+
+        let audit = audit_report(&mut conn, address)
+            .await
+            .expect("audit_report");
+
+        let fee_rows = audit
+            .flows
+            .iter()
+            .filter(|row| row.txid.as_deref() == Some("tx_churn"))
+            .collect::<Vec<_>>();
+        assert_eq!(fee_rows.len(), 1);
+        assert_eq!(fee_rows[0].entry_type, "outgoing");
+        assert_eq!(fee_rows[0].amount_nicks, 0);
+        assert_eq!(fee_rows[0].fee_nicks, 5);
+        assert_eq!(fee_rows[0].recipient_type, None);
+        assert_eq!(fee_rows[0].recipient, None);
+
+        let final_running = audit
+            .flows
+            .last()
+            .expect("at least one flow row")
+            .running_balance_nicks;
+        assert_eq!(final_running, audit.balance.balance_nicks);
+        assert_eq!(final_running, 45);
 
         let _ = std::fs::remove_file(path);
     }
