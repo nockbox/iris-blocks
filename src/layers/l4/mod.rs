@@ -16,7 +16,7 @@ use iris_ztd::{cue, Hashable, NounDecode};
 use log::*;
 use schema::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
@@ -42,9 +42,9 @@ impl L4Client {
 
     /// Determine owner_type and owner from a spend condition.
     fn resolve_owner_from_spend_condition(sc: &SpendCondition) -> (String, String) {
-        let pkhs: Vec<_> = sc.pkh().collect();
-        if pkhs.len() == 1 && pkhs[0].hashes.len() == 1 {
-            if let Some(pkh) = pkhs[0].hashes.iter().next() {
+        let pkhs: BTreeSet<_> = sc.pkh().flat_map(|v| v.hashes.iter()).collect();
+        if pkhs.len() == 1 {
+            if let Some(pkh) = pkhs.iter().next() {
                 return ("pkh".to_string(), pkh.to_string());
             } else {
                 ("musig".to_string(), sc.hash().to_string())
@@ -52,6 +52,7 @@ impl L4Client {
         } else if pkhs.len() > 1 {
             ("musig".to_string(), sc.hash().to_string())
         } else {
+            // No signers at all. This indicates an exotic spend configuration
             ("lock".to_string(), sc.hash().to_string())
         }
     }
@@ -107,9 +108,7 @@ impl L4Client {
 
         let (owner_type, owner) = Self::resolve_owner_from_spend_condition(&sc);
         if owner_type == "lock" {
-            return Err(LayerErrorSource::OtherError(format!(
-                "single lock_tree row for root={root} resolved as lock, expected pkh/musig"
-            )));
+            debug!("single lock_tree row for root={root} has no signers. SC: {sc:?}");
         }
         Ok((owner_type, owner))
     }
@@ -250,7 +249,7 @@ impl LayerImpl for L4Client {
                 let h = height as i32;
                 let block_started = Instant::now();
                 let mut block_name_info = vec![];
-                let mut inserted_firsts: HashSet<DbDigest> = HashSet::new();
+                let mut inserted_firsts: BTreeSet<DbDigest> = BTreeSet::new();
                 let mut coinbase_owner_map: Option<BTreeMap<DbDigest, (String, String)>> = None;
 
                 // Phase 1: process newly revealed spend conditions at this height.
@@ -268,7 +267,7 @@ impl LayerImpl for L4Client {
                         .select(lock_tree::root)
                         .load::<DbDigest>(conn)
                         .await?;
-                    let roots = sc_roots.into_iter().collect::<HashSet<_>>();
+                    let roots = sc_roots.into_iter().collect::<BTreeSet<_>>();
 
                     for root in roots {
                         let root_lock_row_count = lock_tree::table
@@ -295,7 +294,7 @@ impl LayerImpl for L4Client {
                             .load::<DbDigest>(conn)
                             .await?
                             .into_iter()
-                            .collect::<HashSet<_>>();
+                            .collect::<BTreeSet<_>>();
 
                         for first in firsts {
                             if inserted_firsts.insert(first) {
@@ -543,7 +542,7 @@ mod tests {
     use diesel::sql_query;
     use diesel::sql_types::{BigInt, Text};
     use diesel_async::RunQueryDsl;
-    use std::collections::HashSet;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -615,11 +614,11 @@ mod tests {
         let got = rows
             .into_iter()
             .map(|r| r.owner_type)
-            .collect::<HashSet<_>>();
+            .collect::<BTreeSet<_>>();
         let allowed = ["pkh", "pk", "musig", "lock"]
             .into_iter()
             .map(str::to_string)
-            .collect::<HashSet<_>>();
+            .collect::<BTreeSet<_>>();
         assert!(
             got.is_subset(&allowed),
             "unexpected recipient_type values: {got:?}"
