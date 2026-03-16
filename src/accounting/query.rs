@@ -191,12 +191,12 @@ pub struct AuditFlowRow {
 }
 
 fn format_chain_timestamp_utc(ts: i64) -> String {
-    // Preferred path: L0 currently stores plain unix seconds.
+    // Primary path: block timestamps are stored as plain Unix seconds.
     if let Some(dt) = Utc.timestamp_opt(ts, 0).single() {
         return dt.to_rfc3339();
     }
 
-    // Compatibility path: older snapshots may store @da-biased seconds.
+    // Compatibility path: older snapshots may contain Urbit @da-biased seconds.
     const DA_UNIX_EPOCH_BIASED_SECONDS: u64 = 0x8000_000c_ce9e_0d80;
     let raw_u64 = ts as u64;
     if raw_u64 < DA_UNIX_EPOCH_BIASED_SECONDS {
@@ -481,10 +481,10 @@ struct LedgerRow {
     counterparties: Option<String>,
 }
 
-/// Wallet balance derived from L1 notes + L3 credits/debits.
+/// Compute wallet balance and accounting totals from indexed layers.
 ///
-/// The wallet is identified by `pkh`.  We use `pkh_to_pk` (L2.2) to look up
-/// known public keys, then query notes that belong to the wallet via credits.
+/// Ownership is resolved through `name_info` and filtered by `AddressType`:
+/// `pkh` owners for V1-style wallet queries and `pk` owners for V0-style queries.
 pub async fn wallet_balance(
     conn: &mut crate::db::AsyncDbConnection,
     address: AddressInfo,
@@ -501,7 +501,7 @@ pub async fn wallet_balance(
     let wallet_ni_filter = wallet_name_info_filter("ni");
     let wallet_name_info_latest = latest_name_info_subquery("ni");
 
-    // Unspent notes owned by this wallet (via name_info owner resolution)
+    // Unspent notes currently owned by the requested wallet identity.
     let unspent_query = format!(
         "SELECT COALESCE(SUM(n.assets), 0) AS sum_nicks, COUNT(*) AS note_count
          FROM notes n
@@ -550,7 +550,7 @@ pub async fn wallet_balance(
         (0, 0)
     };
 
-    // TX credits (non-coinbase) for this wallet
+    // Non-coinbase credits attributed to this wallet.
     let tx_credits_sql = format!(
         "SELECT COALESCE(SUM(c.amount), 0) AS sum_nicks
          FROM credits c
@@ -572,7 +572,7 @@ pub async fn wallet_balance(
         .await?
         .sum_nicks;
 
-    // Coinbase credits (txid IS NULL) for this wallet
+    // Coinbase credits attributed to this wallet (`txid IS NULL`).
     let coinbase_sql = format!(
         "SELECT COALESCE(SUM(c.amount), 0) AS sum_nicks
          FROM credits c
@@ -594,7 +594,7 @@ pub async fn wallet_balance(
         .await?
         .sum_nicks;
 
-    // Spent notes
+    // Debits: value spent from notes owned by this wallet.
     let spent_query = format!(
         "SELECT COALESCE(SUM(d.amount), 0) AS sum_nicks
          FROM debits d
@@ -615,7 +615,7 @@ pub async fn wallet_balance(
         .await?
         .sum_nicks;
 
-    // Fees
+    // Fees paid by this wallet's spends.
     let fees_sql = format!(
         "SELECT COALESCE(SUM(d.fee), 0) AS sum_nicks
          FROM debits d
@@ -743,7 +743,7 @@ pub async fn transaction_detail(
     })
     .collect();
 
-    // Credits from L3
+    // L3 credits associated with this tx.
     let credits = sql_query(
         "SELECT c.first,
                 ni.owner_type AS recipient_type,
@@ -776,7 +776,7 @@ pub async fn transaction_detail(
     })
     .collect();
 
-    // Debits from L3
+    // L3 debits associated with this tx.
     let debits = sql_query(
         "SELECT d.first, d.amount, d.fee, d.height AS block_height, COALESCE(b.timestamp, 0) AS block_timestamp
          FROM debits d
@@ -972,7 +972,7 @@ pub async fn audit_report(
 
     let mut ledger = Vec::new();
 
-    // Credits for this wallet (non-coinbase)
+    // Non-coinbase ledger credits for the wallet.
     let credit_sql = format!(
         "SELECT c.height AS block_height,
                 COALESCE(b.timestamp, 0) AS block_timestamp,
@@ -1020,7 +1020,7 @@ pub async fn audit_report(
         running_balance_nicks: 0,
     }));
 
-    // Coinbase credits for this wallet
+    // Coinbase ledger credits for the wallet.
     let coinbase_sql = format!(
         "SELECT c.height AS block_height,
                 COALESCE(b.timestamp, 0) AS block_timestamp,
@@ -1067,7 +1067,7 @@ pub async fn audit_report(
         running_balance_nicks: 0,
     }));
 
-    // Debits: spent notes owned by this wallet
+    // Ledger debits for notes spent by this wallet.
     let spent_sql = format!(
         "SELECT n.spent_height AS block_height,
                 COALESCE(b.timestamp, 0) AS block_timestamp,
@@ -1194,7 +1194,7 @@ pub async fn audit_report(
             .then_with(|| a.txid.cmp(&b.txid))
     });
 
-    // Summary flow rows
+    // Build summary-flow rows (accounting view used by default CSV output).
     let mut flows = Vec::new();
     let wallet_spend_txids = ledger
         .iter()
@@ -1202,11 +1202,11 @@ pub async fn audit_report(
         .filter_map(|entry| entry.txid.clone())
         .collect::<HashSet<_>>();
 
-    // Incoming rows from ledger
+    // Incoming flow rows come directly from ledger credits/coinbase credits.
     for entry in &ledger {
         if entry.entry_type == "credit" || entry.entry_type == "coinbase" {
-            // Summary/default CSV should omit refund/change rows that are part of
-            // wallet-originated spends; those are represented in note view.
+            // Omit self-refund credits from summary rows. They remain visible in
+            // note-level output, while summary output focuses on external flows.
             if entry.entry_type == "credit"
                 && entry
                     .txid
@@ -1236,7 +1236,8 @@ pub async fn audit_report(
         }
     }
 
-    // Outgoing rows: recipient-level credits from wallet-spend txs excluding wallet recipients.
+    // Outgoing flow rows are recipient-level credits for transactions where this
+    // wallet spent notes, excluding recipients that resolve back to this wallet.
     let outgoing_sql = format!(
         "SELECT ni.height AS block_height,
                 COALESCE(b.timestamp, 0) AS block_timestamp,
@@ -1299,7 +1300,7 @@ pub async fn audit_report(
         });
     }
 
-    // One fee assignment per tx
+    // Assign each transaction fee once in summary rows.
     let mut tx_fee_map: HashMap<String, i64> = HashMap::new();
     let mut tx_fee_anchor: HashMap<String, (i32, Option<String>, i64, String)> = HashMap::new();
     for entry in &ledger {
@@ -1341,9 +1342,9 @@ pub async fn audit_report(
         } else if let Some((block_height, block_id, block_timestamp, block_time_utc)) =
             tx_fee_anchor.get(&txid)
         {
-            // Keep accounting invariant in summary/default CSV: if a wallet spend
-            // transaction has no surviving incoming/outgoing row (self-churn/refund),
-            // we still must materialize the fee deduction.
+            // Preserve accounting invariants in summary/default CSV. If a spend tx
+            // has no remaining incoming/outgoing row after filtering self-refunds,
+            // emit a fee-only row so running balance still reflects the deduction.
             flows.push(AuditFlowRow {
                 block_height: *block_height,
                 block_id: block_id.clone(),
@@ -1372,9 +1373,9 @@ pub async fn audit_report(
         row.running_balance_nicks = running_flows_nicks;
     }
 
-    // Keep tx identifiers explicit in reporting views:
-    // coinbase rows have no canonical txid in storage, so emit a stable
-    // synthetic reference to avoid blank txid cells in accounting exports.
+    // Keep transaction identifiers explicit in reporting views. Coinbase rows do
+    // not have canonical tx ids in storage, so emit stable synthetic references
+    // to avoid blank `txid` values in text/json/CSV exports.
     for entry in &mut ledger {
         if entry.txid.is_none() {
             let anchor = entry

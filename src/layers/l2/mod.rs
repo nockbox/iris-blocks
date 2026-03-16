@@ -24,7 +24,8 @@ pub struct L2Client {
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
-/// Per-block L2 output buffers, accumulated across all 3 sub-layers.
+/// Per-block buffers for all L2 sub-layer outputs.
+/// Data is collected in-memory per block and inserted in one DB transaction.
 struct L2BlockBuffers {
     // L2.1
     spends: Vec<TxSpend>,
@@ -111,8 +112,8 @@ impl L2Client {
         let mut out = vec![];
         for idx in 0..count {
             let sp = lock[idx].clone();
-            // We don't really need the proof, we just need the axis
-            // There is a better way to compute it, but that is a bit annoying.
+            // We only need the Merkle axis for each leaf; generating a proof is
+            // the most direct way to derive that axis from the lock structure.
             let lmp = MerkleProof::prove_hashable(&sp, idx);
             out.push((lmp.axis, sp));
         }
@@ -268,14 +269,10 @@ impl L2Client {
                             }
                         }
                         SpendV1::S1(witness_spend) => {
-                            // lock proof root → name's first
                             let lock_proof = &witness_spend.witness.lock_merkle_proof;
                             let root: DbDigest = lock_proof.proof().root.into();
-                            // name_to_lock is populated from seeds below,
-                            // and for witness spends we can also map input name → root
-                            // (handled in collect_spend_conditions for consistency)
 
-                            // pkh → pk from witness signatures
+                            // Reverse-map signer PKH to revealed PK from witness signatures.
                             for (pkh, (pk, _)) in &witness_spend.witness.pkh_signature.0 {
                                 bufs.pkh_to_pk.push(PkhToPk {
                                     pkh: (*pkh).into(),
@@ -284,11 +281,11 @@ impl L2Client {
                                     block_id,
                                 });
                             }
-                            let _ = root; // used in collect_spend_conditions
+                            let _ = root; // Root-to-name mapping is written in collect_spend_conditions.
                         }
                     }
 
-                    // name_to_lock from seeds: seed.lock_root → first
+                    // Reverse-map seed lock roots to synthetic first names.
                     for seed in spend.seeds().0.iter() {
                         let root_digest = seed.lock_root.hash();
                         let first = (true, root_digest).hash();
@@ -323,7 +320,7 @@ impl L2Client {
             let sc = lock_proof.spend_condition();
             let sc_hash: DbDigest = sc.hash().into();
 
-            // name_to_lock for spent input
+            // Record input name -> lock root mapping for witness spends.
             let input_first: DbDigest = name.first.into();
             bufs.name_to_lock.push(NameToLock {
                 first: input_first,
@@ -332,7 +329,7 @@ impl L2Client {
                 block_id,
             });
 
-            // lock_tree: merkle proof branches
+            // Persist Merkle proof branch hashes needed to re-materialize lock trees.
             for (axis, digest) in lock_proof
                 .proof()
                 .visible_hashes(lock_proof.axis(), &*sc_hash)
@@ -348,7 +345,7 @@ impl L2Client {
                 });
             }
 
-            // spend_conditions row
+            // Persist the revealed spend condition payload.
             bufs.spend_conditions.push(SpendConditionRow {
                 hash: sc_hash,
                 txid: tx.id,
@@ -358,7 +355,8 @@ impl L2Client {
             });
         }
 
-        // Parse V1 output note_data (%lock/%pkh) and validate lock-root ↔ output-name mapping.
+        // Parse V1 output note_data (`%lock`/`%pkh`) and verify that the derived
+        // lock root matches the output first name before indexing derived rows.
         for out in vtx.outputs().notes() {
             let Note::V1(v1_note) = out else { continue };
             let Some(lock) = Self::lock_from_note_data(&v1_note.note_data) else {
@@ -574,11 +572,11 @@ impl LayerImpl for L2Client {
                     let spend_version =
                         Self::checked_u32_to_i32(u32::from(vtx.version()), "tx_spends.version")?;
 
-                    // L2.1: transaction internals
+                // L2.1: transaction internals
                     Self::collect_tx_internals(&tx, &vtx, spend_version, &mut bufs)?;
-                    // L2.2: hash reversals
+                // L2.2: hash reversals
                     Self::collect_hash_reversals(&tx, &vtx, block_id, &mut bufs);
-                    // L2.3: spend conditions
+                // L2.3: spend conditions
                     Self::collect_spend_conditions(&tx, &vtx, block_id, &mut bufs)?;
 
                     crate::rt::yield_now().await;

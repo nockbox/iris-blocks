@@ -46,7 +46,7 @@ pub async fn resolve_address(
         return Err(AddressError::InvalidAddress(address.to_string()));
     }
 
-    // First try to treat the input as a DB-formatted PK.
+    // Parse as public key first so PK inputs keep strict V0 semantics.
     if let Ok(pk) = PublicKey::try_from(normalized) {
         let db_pk = DbPublicKey::from(pk);
         if let Some(row) = pkh_to_pk::table

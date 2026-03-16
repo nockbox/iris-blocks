@@ -284,7 +284,9 @@ impl LayerImpl for L1Client {
                         ExecuteDsl::execute(q1, conn)?;
                         core::mem::drop(insert_guard);
 
-                        // TODO: batch update
+                        // Apply spent-note updates one-by-one to preserve the
+                        // per-note row-count assertion below. If this is batched
+                        // later, keep the same correctness check semantics.
                         for (name, note) in spent_notes {
                             let update_span = tracing::info_span!("l1_db_update_note");
                             let _update_guard = update_span.enter();

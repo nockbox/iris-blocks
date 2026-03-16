@@ -156,12 +156,13 @@ Merkle proof siblings for lock trees.
 - PK: `hash`
 - `hash` `DigestSql`
 - `txid` `DigestSql` FK -> `transactions.id`
-- `z` `INTEGER`
+- `z` `INTEGER NULL`
 - `height` `INTEGER`
 - `jam` `BLOB`
 - UNIQUE (`txid`, `z`)
 
-V1 spend witness data (serialized).
+Serialized spend condition payloads.
+`z` is NULL for spend conditions derived from V1 output `note_data` (`%lock`/`%pkh`), and set for witness-spend rows.
 
 ### L3
 
@@ -209,8 +210,8 @@ Resolution logic (per block, two phases):
 - **Phase 1: revealed spend conditions**
   - Use new `spend_conditions` at block height `h`
   - Resolve distinct `lock_tree.root` values touched by those spend conditions
-  - If a root has multiple lock-tree entries -> classify as `lock`
-  - If single entry -> decode the root spend condition and classify as `pkh` or `musig`
+  - Decode spend conditions and classify owner as `pkh`, `musig`, or `lock`
+  - `lock` is retained when signer ownership cannot be resolved
   - Insert as `version = 1`
 - **Phase 2: newly created notes with missing metadata**
   - Take distinct `notes.first` created at height `h`
@@ -238,8 +239,10 @@ pk -> pkh -> lock -> name(first)
 
 Query behavior depends on the input identifier:
 
-- PKH address query matches latest `name_info.owner` where `owner_type = 'pkh'`
-- Public key query uses `pkh_to_pk.pk`, then matches latest `name_info.owner` where `owner_type = 'pk'`
+- PKH address query matches latest `name_info.owner` where `owner_type = 'pkh'` (**V1-only scope**).
+- Public key query matches latest `name_info.owner` where `owner_type = 'pk'` (**V0-only scope**).
+
+These scopes are intentionally strict and are not combined in a single query.
 
 ## Common Join Patterns
 
@@ -276,7 +279,7 @@ SELECT * FROM tx_outputs WHERE txid = :txid ORDER BY idx;
 SELECT * FROM tx_signers WHERE txid = :txid ORDER BY z, pk;
 ```
 
-### Credit/debit ledger for an address
+### Credit/debit ledger for an address (conceptual)
 
 ```sql
 SELECT c.first, c.amount, c.height,
@@ -288,10 +291,12 @@ LEFT JOIN name_info ni
  AND ni.height = (
    SELECT MAX(ni2.height) FROM name_info ni2 WHERE ni2.first = c.first
  )
-WHERE (ni.owner_type = 'pkh' AND ni.owner = :pkh)
-   OR (ni.owner_type = 'pk' AND ni.owner IN (SELECT pk FROM pkh_to_pk WHERE pkh = :pkh))
+WHERE ni.owner_type = :owner_type
+  AND ni.owner = :owner
 ORDER BY c.height;
 ```
+
+Use either (`owner_type='pkh'`, `owner=<pkh>`) **or** (`owner_type='pk'`, `owner=<db public key>`), depending on input type.
 
 ## Balance Formula Guidance
 
@@ -319,6 +324,12 @@ Flow-summary rows for accounting (recipient-level, not note-level):
 - `amount_nicks`
 - `fee_nicks` (tx-level fee, attached to one deterministic row per tx)
 - `running_balance_nicks`
+
+Summary-view invariants:
+
+- Internal refund/change incoming rows are omitted.
+- Fee impact is never omitted: transactions without a surviving outgoing/incoming row receive a fee-only outgoing row.
+- `txid` is always present in exports. Coinbase rows use a synthetic identifier (`coinbase@<block-id-or-height>`).
 
 ### Notes CSV (`audit --csv-notes`)
 

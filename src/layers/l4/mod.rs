@@ -40,7 +40,7 @@ impl L4Client {
         }
     }
 
-    /// Determine owner_type and owner from a spend condition.
+    /// Classify owner identity from a decoded spend condition.
     fn resolve_owner_from_spend_condition(sc: &SpendCondition) -> (String, String) {
         let pkhs: BTreeSet<_> = sc.pkh().flat_map(|v| v.hashes.iter()).collect();
         if pkhs.len() == 1 {
@@ -52,7 +52,7 @@ impl L4Client {
         } else if pkhs.len() > 1 {
             ("musig".to_string(), sc.hash().to_string())
         } else {
-            // No signers at all. This indicates an exotic spend configuration
+            // No signer set was recoverable from the spend condition.
             ("lock".to_string(), sc.hash().to_string())
         }
     }
@@ -72,13 +72,14 @@ impl L4Client {
                 .expect("v0 note has 1 pubkey but iter empty");
             Ok(("pk".to_string(), DbPublicKey::from(*pk).to_string()))
         } else {
-            // Multi-sig V0 note
+            // Multi-key V0 note: store by lock hash, not by a single key.
             Ok(("musig".to_string(), note.sig.hash().to_string()))
         }
     }
 
     /// Resolve owner for a lock root by decoding a revealed spend condition.
-    /// Single-row lock trees should resolve to pkh/musig per the CTO spec.
+    /// For single lock roots, classify to `pkh`/`musig` when signer data is present;
+    /// otherwise keep `lock` to represent unresolved ownership.
     async fn resolve_owner_from_root_spend_condition(
         conn: &mut crate::db::AsyncDbConnection,
         root: DbDigest,
@@ -256,7 +257,8 @@ impl LayerImpl for L4Client {
                 })?;
                 let coinbase_owner_map = Self::coinbase_recipients(&page, constants);
 
-                // Phase 1: process newly revealed spend conditions at this height.
+                // Phase 1: resolve ownership for roots whose spend conditions
+                // became visible at this height.
                 let revealed_sc_hashes = spend_conditions::table
                     .filter(spend_conditions::height.eq(h))
                     .select(spend_conditions::hash)
@@ -315,7 +317,8 @@ impl LayerImpl for L4Client {
                     }
                 }
 
-                // Phase 2: process notes created at this height with missing name_info.
+                // Phase 2: backfill ownership for notes created at this height
+                // that still have no `name_info` row.
                 let new_firsts = notes::table
                     .filter(notes::created_height.eq(h))
                     .select(notes::first)
@@ -394,8 +397,8 @@ impl LayerImpl for L4Client {
                             )));
                         }
 
-                        // Before defaulting to lock, check whether this first is a V1
-                        // coinbase recipient and use its PKH when present.
+                        // Before defaulting to `lock`, check V1 coinbase mapping.
+                        // Coinbase first names can be resolved directly to `pkh`.
                         if let Some((owner_type, owner)) = coinbase_owner_map.get(&first).cloned()
                         {
                             if owner_type == "pkh" {

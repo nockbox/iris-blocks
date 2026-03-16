@@ -137,7 +137,7 @@ impl LayerImpl for L3Client {
             for height in start_block_height..=last_block_height {
                 let h = height as i32;
 
-                // Get block_id
+                // Resolve block id once for all rows generated at this height.
                 let block_id: DbDigest = blocks::table
                     .filter(blocks::height.eq(h))
                     .select(blocks::id)
@@ -148,9 +148,9 @@ impl LayerImpl for L3Client {
                 let mut block_credits = vec![];
                 let mut block_debits = vec![];
 
-                // Credits from notes created at this height.
-                // Group by (txid, first) since multiple notes can share
-                // the same `first`. One credit per unique (txid, first).
+                // Credits come from notes created at this height.
+                // Group by `(txid, first)` because multiple note rows may share
+                // the same first name; we persist one aggregated credit row.
                 let created_notes = notes::table
                     .filter(notes::created_height.eq(h))
                     .select((notes::first, notes::created_txid, notes::assets))
@@ -172,24 +172,22 @@ impl LayerImpl for L3Client {
                     });
                 }
 
-                // Debits from notes spent at this height.
-                // Group by (txid, first) since multiple notes can share
-                // the same `first` (lock-derived name). One debit per
-                // unique (txid, first) with summed amounts.
+                // Debits come from notes spent at this height.
+                // Group by `(txid, first)` for the same reason as credits.
                 let spent_notes = notes::table
                     .filter(notes::spent_height.eq(h))
                     .select((notes::first, notes::spent_txid, notes::assets))
                     .load::<(DbDigest, Option<DbDigest>, i64)>(conn)
                     .await?;
 
-                // Accumulate (txid, first) → total_amount
+                // Accumulate `(txid, first)` -> total spent amount.
                 let mut debit_map: std::collections::BTreeMap<(Option<DbDigest>, DbDigest), i64> =
                     std::collections::BTreeMap::new();
                 for (first, spent_txid, assets) in spent_notes {
                     *debit_map.entry((spent_txid, first)).or_insert(0) += assets;
                 }
 
-                // Fee per (txid, first) from L2 tx_spends
+                // Look up fee per `(txid, first)` from L2 spend rows.
                 for ((spent_txid, first), amount) in debit_map {
                     use super::l2::schema::tx_spends;
                     let fee = if let Some(ref txid) = spent_txid {
@@ -213,9 +211,9 @@ impl LayerImpl for L3Client {
                     });
                 }
 
-                // Keep both credits and debits even when they share (txid, first):
-                // same-first outputs represent real refund/change and must remain
-                // visible so received - spent tracks note-balance evolution exactly.
+                // Keep both sides even when `(txid, first)` appears in credits and
+                // debits (self-refund/change). L3 must remain lossless so downstream
+                // accounting can reconcile received - spent against note balances.
 
                 cur_metadata = FixedLayerMetadata {
                     layer: Self::LAYER,
@@ -233,13 +231,10 @@ impl LayerImpl for L3Client {
                             )?;
                         }
                         if !block_debits.is_empty() {
-                            //for block_debit in block_debits {
-                            //log::trace!("New debit: {block_debit:?}");
                             ExecuteDsl::execute(
                                 diesel::insert_into(debits::table).values(&block_debits),
                                 conn,
                             )?;
-                            //}
                         }
                         ExecuteDsl::execute(Self::update_layer_metadata(&next_metadata), conn)?;
                         Ok(())

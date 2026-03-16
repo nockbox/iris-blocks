@@ -217,7 +217,8 @@ impl<S: Scryable> L0Client<S> {
         mut mismatch_block_height: BlockHeight,
         mismatch_block: Digest,
     ) -> Result<FixedLayerMetadata, L0Error> {
-        // Recovery - walk up the elders until we find a common ancestor
+        // Reorg recovery: walk ancestor candidates ("elders") until we find
+        // a block hash that matches local state, then roll back above it.
         debug!("Chain reorg detected at height {mismatch_block_height}. Finding common ancestor");
 
         let client = self.client.as_mut().ok_or(L0Error::GrpcNeeded)?;
@@ -366,7 +367,8 @@ impl<S: Scryable> L0Client<S> {
                     let mut outputs = rtx.outputs(height, self.activations.tx_engine(height));
                     outputs.sort_by_key(|n| n.name());
 
-                    // Verify that iris computes outputs correctly
+                    // Optional integrity check: verify local output derivation
+                    // matches outputs provided by chain data.
                     if chain_outputs != outputs {
                         trace!(
                             "Transaction {} invalid.\nChain outputs: {:?}\nComputed outputs: {:?}",
@@ -450,7 +452,8 @@ impl<S: Scryable> L0Client<S> {
             deps_has_more |= dep.update_blocks(&mut self.conn, metadata).await?;
         }
 
-        // If we had NoNewBlocks, propagate the deps_has_more flag
+        // Preserve `deps_has_more` in the NoNewBlocks result so callers can
+        // keep advancing dependent layers even when L0 itself is caught up.
         if let Err(L0Error::NoNewBlocks(m, a, b, _)) = res {
             res = Err(L0Error::NoNewBlocks(m, a, b, deps_has_more));
         }
@@ -462,7 +465,7 @@ impl<S: Scryable> L0Client<S> {
     pub async fn run(mut self) {
         loop {
             match self.update_blocks().await {
-                // We updated successfully, continue without sleeping
+                // New blocks were ingested; continue immediately.
                 Ok(_) => {}
                 Err(L0Error::Reverted) => {
                     debug!("Chain reverted. Restarting...");
@@ -587,15 +590,15 @@ impl<S: Scryable> L0Client<S> {
         let mut deadline = core::pin::pin!(deadline);
 
         loop {
-            // Process any pending queries first
+            // Drain any pending query requests first.
             self.process_queries().await;
 
-            // Check if the deadline has expired
+            // Stop once the wait deadline is reached.
             if (&mut deadline).now_or_never().is_some() {
                 break;
             }
 
-            // Run deps
+            // Let dependent layers advance while time remains.
             let mut has_more = false;
             for dep in self.dependencies.iter() {
                 match dep.update_blocks(&mut self.conn, metadata).await {
@@ -608,7 +611,7 @@ impl<S: Scryable> L0Client<S> {
             }
 
             if !has_more {
-                // All deps caught up, now just sleep the rest of the duration
+                // Dependencies are caught up; just wait while still serving queries.
                 loop {
                     futures::select! {
                         _ = deadline => break,

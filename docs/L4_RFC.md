@@ -1,4 +1,8 @@
-# L4 Hardening vs Rewrite RFC
+# L4 Hardening vs Rewrite RFC (Historical)
+
+> This RFC captures a past design discussion and is retained for context.
+> Current behavior is documented in `README.md` and `docs/SCHEMA.md`.
+> Where this file conflicts with current implementation/docs, treat this file as historical.
 
 ## Context
 
