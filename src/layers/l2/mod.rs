@@ -8,7 +8,7 @@ use iris_nockchain_types::{
     v1::{Lock, NoteData, SpendCondition, SpendV1},
     Note, Tx,
 };
-use iris_ztd::{cue, jam, Hashable, NounDecode, NounEncode};
+use iris_ztd::{cue, jam, Hashable, MerkleProof, NounDecode, NounEncode};
 use log::*;
 use schema::*;
 use serde::{Deserialize, Serialize};
@@ -123,9 +123,17 @@ impl L2Client {
         None
     }
 
-    fn spend_conditions_from_lock(lock: &Lock) -> Vec<SpendCondition> {
+    fn spend_conditions_from_lock(lock: &Lock) -> Vec<(u64, SpendCondition)> {
         let count = 1usize << (lock.height() - 1);
-        (0..count).map(|idx| lock[idx].clone()).collect()
+        let mut out = vec![];
+        for idx in 0..count {
+            let sp = lock[idx].clone();
+            // We don't really need the proof, we just need the axis
+            // There is a better way to compute it, but that is a bit annoying.
+            let lmp = MerkleProof::prove_hashable(&sp, idx);
+            out.push((lmp.axis, sp));
+        }
+        out
     }
 
     /// L2.1: Collect transaction internals (spends, seeds, outputs, signers).
@@ -383,13 +391,22 @@ impl L2Client {
                 )));
             }
 
-            for sc in Self::spend_conditions_from_lock(&lock) {
+            for (axis, sc) in Self::spend_conditions_from_lock(&lock) {
+                let hash = sc.hash();
+
                 bufs.spend_conditions.push(SpendConditionRow {
-                    hash: sc.hash().into(),
+                    hash: hash.into(),
                     txid: tx.id,
                     z: None,
                     height: tx.height,
                     jam: jam(sc.to_noun()),
+                });
+
+                bufs.lock_trees.push(LockTree {
+                    root: lock_root.into(),
+                    height: tx.height,
+                    axis: axis as i32,
+                    hash: hash.into(),
                 });
             }
         }
