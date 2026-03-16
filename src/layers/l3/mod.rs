@@ -282,6 +282,8 @@ pub struct L3Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{BigInt, Nullable};
     use diesel_async::RunQueryDsl;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -346,34 +348,30 @@ mod tests {
         assert!(debits >= 0);
 
         let note_created = notes::table
-            .select(notes::assets)
-            .load::<i64>(&mut conn)
+            .select(sql::<Nullable<BigInt>>("CAST(SUM(assets) AS BIGINT)"))
+            .first::<Option<i64>>(&mut conn)
             .await
             .expect("note created sum")
-            .into_iter()
-            .sum::<i64>();
+            .unwrap_or_default();
         let note_spent = notes::table
             .filter(notes::spent_txid.is_not_null())
-            .select(notes::assets)
-            .load::<i64>(&mut conn)
+            .select(sql::<Nullable<BigInt>>("CAST(SUM(assets) AS BIGINT)"))
+            .first::<Option<i64>>(&mut conn)
             .await
             .expect("note spent sum")
-            .into_iter()
-            .sum::<i64>();
+            .unwrap_or_default();
         let l3_credits = credits::table
-            .select(credits::amount)
-            .load::<i64>(&mut conn)
+            .select(sql::<Nullable<BigInt>>("CAST(SUM(amount) AS BIGINT)"))
+            .first::<Option<i64>>(&mut conn)
             .await
             .expect("l3 credits sum")
-            .into_iter()
-            .sum::<i64>();
+            .unwrap_or_default();
         let l3_debits = debits::table
-            .select(debits::amount)
-            .load::<i64>(&mut conn)
+            .select(sql::<Nullable<BigInt>>("CAST(SUM(amount) AS BIGINT)"))
+            .first::<Option<i64>>(&mut conn)
             .await
             .expect("l3 debits sum")
-            .into_iter()
-            .sum::<i64>();
+            .unwrap_or_default();
         assert_eq!(l3_credits, note_created);
         assert_eq!(l3_debits, note_spent);
 
