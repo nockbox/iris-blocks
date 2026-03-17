@@ -1281,7 +1281,7 @@ pub async fn audit_report(
     // Outgoing flow rows are recipient-level credits for transactions where this
     // wallet spent notes, excluding recipients that resolve back to this wallet.
     let outgoing_sql = format!(
-        "SELECT ni.height AS block_height,
+        "SELECT c.height AS block_height,
                 COALESCE(b.timestamp, 0) AS block_timestamp,
                 'outgoing' AS entry_type,
                 c.txid AS txid,
@@ -1402,6 +1402,18 @@ pub async fn audit_report(
             });
         }
     }
+
+    // Fee-only rows may be appended after the initial sort above.
+    // Re-apply canonical ordering before computing running balances.
+    flows.sort_by(|a, b| {
+        a.block_height
+            .cmp(&b.block_height)
+            .then_with(|| a.block_timestamp.cmp(&b.block_timestamp))
+            .then_with(|| a.txid.cmp(&b.txid))
+            .then_with(|| a.entry_type.cmp(&b.entry_type))
+            .then_with(|| a.recipient_type.cmp(&b.recipient_type))
+            .then_with(|| a.recipient.cmp(&b.recipient))
+    });
 
     let mut running_flows_nicks = 0i64;
     for row in &mut flows {
