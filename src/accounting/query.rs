@@ -360,7 +360,6 @@ struct TxSpendRow {
     note_assets: i64,
 }
 
-
 #[derive(QueryableByName)]
 struct TxOutputRow {
     #[diesel(sql_type = Integer)]
@@ -393,7 +392,6 @@ struct TxCreditRow {
     block_timestamp: i64,
 }
 
-
 #[derive(QueryableByName)]
 struct BlockBaseRow {
     #[diesel(sql_type = Text)]
@@ -409,7 +407,6 @@ struct BlockBaseRow {
     #[diesel(sql_type = Nullable<Text>)]
     msg: Option<String>,
 }
-
 
 #[derive(QueryableByName)]
 struct CountRow {
@@ -685,12 +682,12 @@ pub async fn transaction_detail(
         .select((tx_signers::z, tx_signers::pk))
         .load::<(i32, DbPublicKey)>(conn)
         .await?
-    .into_iter()
+        .into_iter()
         .map(|(z, pk)| TxSignerDetail {
             z,
             pk: pk.to_string(),
         })
-    .collect();
+        .collect();
 
     let outputs = sql_query(
         "SELECT o.idx, o.first, o.last, o.assets,
@@ -776,7 +773,10 @@ pub async fn transaction_detail(
         .map(|r| {
             let ts = *ts_by_height.get(&r.3).unwrap_or(&0);
             TxDebitDetail {
-                first: r.0.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string()),
+                first: r
+                    .0
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
                 amount_nicks: r.1,
                 fee_nicks: r.2,
                 block_height: r.3,
@@ -877,14 +877,14 @@ pub async fn block_detail(
         ))
         .load::<(DbDigest, i32, i64, i32)>(conn)
         .await?
-    .into_iter()
-    .map(|r| BlockTransaction {
-        txid: r.0.to_string(),
-        version: r.1,
-        fee_nicks: r.2,
-        total_size: r.3,
-    })
-    .collect();
+        .into_iter()
+        .map(|r| BlockTransaction {
+            txid: r.0.to_string(),
+            version: r.1,
+            fee_nicks: r.2,
+            total_size: r.3,
+        })
+        .collect();
 
     let coinbase_rows = credits::table
         .filter(credits::block_id.eq(block_id_digest))
@@ -893,10 +893,7 @@ pub async fn block_detail(
         .select((credits::first, credits::amount, credits::height))
         .load::<(DbDigest, i64, i32)>(conn)
         .await?;
-    let heights = coinbase_rows
-        .iter()
-        .map(|(_, _, h)| *h)
-        .collect::<Vec<_>>();
+    let heights = coinbase_rows.iter().map(|(_, _, h)| *h).collect::<Vec<_>>();
     let ts_by_height = if heights.is_empty() {
         HashMap::new()
     } else {
@@ -943,12 +940,12 @@ pub async fn sync_status(
         .select((layer_metadata::layer, layer_metadata::next_block_height))
         .load::<(String, i32)>(conn)
         .await?
-    .into_iter()
-    .map(|r| LayerStatus {
-        layer: r.0,
-        next_block_height: r.1,
-    })
-    .collect::<Vec<_>>();
+        .into_iter()
+        .map(|r| LayerStatus {
+            layer: r.0,
+            next_block_height: r.1,
+        })
+        .collect::<Vec<_>>();
 
     // Intentionally kept as raw SQL: this path needs dynamic table names for
     // status introspection, which Diesel's typed query DSL does not model

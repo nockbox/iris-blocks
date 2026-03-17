@@ -572,11 +572,11 @@ impl LayerImpl for L2Client {
                     let spend_version =
                         Self::checked_u32_to_i32(u32::from(vtx.version()), "tx_spends.version")?;
 
-                // L2.1: transaction internals
+                    // L2.1: transaction internals
                     Self::collect_tx_internals(&tx, &vtx, spend_version, &mut bufs)?;
-                // L2.2: hash reversals
+                    // L2.2: hash reversals
                     Self::collect_hash_reversals(&tx, &vtx, block_id, &mut bufs);
-                // L2.3: spend conditions
+                    // L2.3: spend conditions
                     Self::collect_spend_conditions(&tx, &vtx, block_id, &mut bufs)?;
 
                     crate::rt::yield_now().await;
