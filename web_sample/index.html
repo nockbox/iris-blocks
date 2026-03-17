@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Iris Blocks WASM Test</title>
-<style>
+    <style>
         * {
             box-sizing: border-box;
         }
@@ -248,7 +248,7 @@
     <div class="config-panel">
         <div class="config-group">
             <label>RPC Endpoint</label>
-            <input type="text" id="rpc-endpoint" value="http://localhost:8080">
+            <input type="text" id="rpc-endpoint" value="">
         </div>
         <div class="config-group">
             <label>Layers</label>
@@ -262,7 +262,8 @@
         </div>
         <div class="config-group">
             <label>Rederive From</label>
-            <select id="rederive-layer" style="background:#161616;border:1px solid #444;border-radius:3px;color:#fff;font-family:monospace;font-size:0.85rem;padding:0.3rem 0.5rem;outline:none;">
+            <select id="rederive-layer"
+                style="background:#161616;border:1px solid #444;border-radius:3px;color:#fff;font-family:monospace;font-size:0.85rem;padding:0.3rem 0.5rem;outline:none;">
                 <option value="">None</option>
                 <option value="l1">L1 (drops L1–L4)</option>
                 <option value="l2">L2 (drops L2–L4)</option>
@@ -298,11 +299,11 @@
         </div>
     </div>
 
-    <script>
+    <script type="module">
+        import Terminal from './terminal.js';
+
         const statusEl = document.getElementById('status');
         const statsGrid = document.getElementById('stats-grid');
-        const terminalOutput = document.getElementById('terminal-output');
-        const terminalInput = document.getElementById('terminal-input');
         const btnStart = document.getElementById('btn-start');
         const btnStop = document.getElementById('btn-stop');
         const btnExport = document.getElementById('btn-export');
@@ -312,6 +313,14 @@
 
         let uploadedDbBytes = null;
         let running = false;
+
+        // --- Terminal ---
+        const terminal = new Terminal({
+            outputEl: document.getElementById('terminal-output'),
+            inputEl: document.getElementById('terminal-input'),
+            promptEl: document.querySelector('#terminal-input-bar span'),
+            sendQuery,
+        });
 
         // --- File drop / select ---
         fileDrop.addEventListener('click', () => fileInput.click());
@@ -392,7 +401,7 @@
                         statusEl.textContent += data.message + '\n';
                         break;
                     case 'ready':
-                        appendOutput("Minimal SQLite terminal ready. Type your queries and press Enter.", "#c678dd");
+                        terminal.appendOutput('iris-blocks worker ready. SQL is active.', '#c678dd');
                         break;
                     case 'stats':
                         allStats[data.layer] = data.stats;
@@ -471,13 +480,13 @@
 
             const rederiveVal = document.getElementById('rederive-layer').value;
             const config = {
-                    layers,
-                    db_connect: ':memory:',
-                    db_run_migrations: true,
-                    remove_layer: rederiveVal || null,
-                    private_grpc_connect: rpcEndpoint.value || null,
-                    scry_no_pow: true,
-                    verify_outputs: false,
+                layers,
+                db_connect: ':memory:',
+                db_run_migrations: true,
+                remove_layer: rederiveVal || null,
+                private_grpc_connect: rpcEndpoint.value || null,
+                scry_no_pow: true,
+                verify_outputs: false,
             };
 
             const msg = {
@@ -512,151 +521,6 @@
             btnExport.disabled = true;
             statusEl.textContent += 'Exporting database...\n';
             worker.postMessage({ type: 'export' });
-        });
-
-        // --- Terminal logic ---
-        let history = [];
-        let historyIndex = -1;
-        let queryBuffer = [];
-        const promptEl = document.querySelector('#terminal-input-bar span');
-        const PRIMARY_PROMPT = 'nocksql>';
-        const CONTINUATION_PROMPT = '   ...>';
-
-        function setPrompt(text) {
-            promptEl.textContent = text;
-        }
-
-        function appendOutput(text, color = '#abb2bf') {
-            const div = document.createElement('div');
-            div.className = 'output-line';
-            div.style.color = color;
-            div.style.marginBottom = '2px';
-            div.style.whiteSpace = 'pre';
-            div.textContent = text;
-            terminalOutput.appendChild(div);
-            terminalOutput.scrollTop = terminalOutput.scrollHeight;
-        }
-
-        function renderTable(jsonStr) {
-            try {
-                const data = JSON.parse(jsonStr);
-                if (!Array.isArray(data) || data.length === 0) {
-                    return "0 rows found";
-                }
-
-                const keys = Object.keys(data[0]);
-                const colWidths = {};
-
-                keys.forEach(k => colWidths[k] = k.length);
-
-                data.forEach(row => {
-                    keys.forEach(k => {
-                        const val = String(row[k] ?? 'NULL');
-                        if (val.length > colWidths[k]) colWidths[k] = val.length;
-                    });
-                });
-
-                let header = keys.map(k => k.padEnd(colWidths[k])).join(' | ');
-                let separator = keys.map(k => '-'.repeat(colWidths[k])).join('-+-');
-
-                let table = header + '\n' + separator + '\n';
-
-                data.forEach(row => {
-                    table += keys.map(k => String(row[k] ?? 'NULL').padEnd(colWidths[k])).join(' | ') + '\n';
-                });
-
-                return table.trimEnd();
-            } catch (e) {
-                return "Error formatting table: " + e.message + "\nRaw: " + jsonStr;
-            }
-        }
-
-        terminalInput.addEventListener('keydown', async (e) => {
-            if (e.key === 'Enter') {
-                const line = terminalInput.value;
-                if (!line.trim() && queryBuffer.length === 0) return;
-
-                const prompt = queryBuffer.length === 0 ? PRIMARY_PROMPT : CONTINUATION_PROMPT;
-                appendOutput(`${prompt} ${line}`, '#51afef');
-                terminalInput.value = '';
-
-                queryBuffer.push(line);
-                const full = queryBuffer.join('\n').trim();
-
-                if (full.endsWith(';')) {
-                    // Complete query — execute
-                    queryBuffer = [];
-                    setPrompt(PRIMARY_PROMPT);
-
-                    if (history[history.length - 1] !== full) {
-                        history.push(full);
-                    }
-                    historyIndex = history.length;
-
-                    try {
-                        const result = await sendQuery(full);
-                        appendOutput(renderTable(result), '#98be65');
-                    } catch (err) {
-                        appendOutput(`Error: ${err}`, '#ff6c6b');
-                    }
-                } else {
-                    // Incomplete — show continuation prompt
-                    setPrompt(CONTINUATION_PROMPT);
-                }
-            } else if (e.key === 'ArrowUp') {
-                if (queryBuffer.length === 0 && historyIndex > 0) {
-                    historyIndex--;
-                    terminalInput.value = history[historyIndex];
-                }
-                e.preventDefault();
-            } else if (e.key === 'ArrowDown') {
-                if (queryBuffer.length === 0) {
-                    if (historyIndex < history.length - 1) {
-                        historyIndex++;
-                        terminalInput.value = history[historyIndex];
-                    } else {
-                        historyIndex = history.length;
-                        terminalInput.value = '';
-                    }
-                }
-                e.preventDefault();
-            } else if (e.key === 'Escape' || (e.key === 'c' && e.ctrlKey)) {
-                // Cancel multi-line buffer
-                if (queryBuffer.length > 0) {
-                    e.preventDefault();
-                    queryBuffer = [];
-                    setPrompt(PRIMARY_PROMPT);
-                    terminalInput.value = '';
-                    appendOutput('(query cancelled)', '#888');
-                }
-            }
-        });
-
-        terminalInput.addEventListener('paste', (e) => {
-            e.preventDefault();
-            const pasted = (e.clipboardData || window.clipboardData).getData('text');
-            const lines = pasted.split('\n');
-
-            // If there's existing text in the input, prepend it to the first pasted line
-            if (terminalInput.value) {
-                lines[0] = terminalInput.value + lines[0];
-            }
-
-            // Feed all lines except the last into the buffer (as if Enter was pressed)
-            for (let i = 0; i < lines.length - 1; i++) {
-                const prompt = queryBuffer.length === 0 ? PRIMARY_PROMPT : CONTINUATION_PROMPT;
-                appendOutput(`${prompt} ${lines[i]}`, '#51afef');
-                queryBuffer.push(lines[i]);
-            }
-
-            // Put the last line into the input field
-            const lastLine = lines[lines.length - 1];
-            terminalInput.value = lastLine;
-
-            // Update prompt if we buffered lines
-            if (queryBuffer.length > 0) {
-                setPrompt(CONTINUATION_PROMPT);
-            }
         });
     </script>
 </body>
