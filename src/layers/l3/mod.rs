@@ -137,7 +137,7 @@ impl LayerImpl for L3Client {
             for height in start_block_height..=last_block_height {
                 let h = height as i32;
 
-                // Get block_id
+                // Resolve block id once for all rows generated at this height.
                 let block_id: DbDigest = blocks::table
                     .filter(blocks::height.eq(h))
                     .select(blocks::id)
@@ -148,9 +148,9 @@ impl LayerImpl for L3Client {
                 let mut block_credits = vec![];
                 let mut block_debits = vec![];
 
-                // Credits from notes created at this height.
-                // Group by (txid, first) since multiple notes can share
-                // the same `first`. One credit per unique (txid, first).
+                // Credits come from notes created at this height.
+                // Group by `(txid, first)` because multiple note rows may share
+                // the same first name; we persist one aggregated credit row.
                 let created_notes = notes::table
                     .filter(notes::created_height.eq(h))
                     .select((notes::first, notes::created_txid, notes::assets))
@@ -172,24 +172,22 @@ impl LayerImpl for L3Client {
                     });
                 }
 
-                // Debits from notes spent at this height.
-                // Group by (txid, first) since multiple notes can share
-                // the same `first` (lock-derived name). One debit per
-                // unique (txid, first) with summed amounts.
+                // Debits come from notes spent at this height.
+                // Group by `(txid, first)` for the same reason as credits.
                 let spent_notes = notes::table
                     .filter(notes::spent_height.eq(h))
                     .select((notes::first, notes::spent_txid, notes::assets))
                     .load::<(DbDigest, Option<DbDigest>, i64)>(conn)
                     .await?;
 
-                // Accumulate (txid, first) → total_amount
+                // Accumulate `(txid, first)` -> total spent amount.
                 let mut debit_map: std::collections::BTreeMap<(Option<DbDigest>, DbDigest), i64> =
                     std::collections::BTreeMap::new();
                 for (first, spent_txid, assets) in spent_notes {
                     *debit_map.entry((spent_txid, first)).or_insert(0) += assets;
                 }
 
-                // Fee per (txid, first) from L2 tx_spends
+                // Look up fee per `(txid, first)` from L2 spend rows.
                 for ((spent_txid, first), amount) in debit_map {
                     use super::l2::schema::tx_spends;
                     let fee = if let Some(ref txid) = spent_txid {
@@ -213,25 +211,9 @@ impl LayerImpl for L3Client {
                     });
                 }
 
-                // Filter out refunds: remove credit/debit pairs that share
-                // the same (txid, first), meaning assets sent back to the
-                // same identity within the same transaction.
-                let debit_keys: std::collections::BTreeSet<(Option<DbDigest>, DbDigest)> =
-                    block_debits
-                        .iter()
-                        .filter_map(|d| d.first.map(|first| (d.txid, first)))
-                        .collect();
-                let credit_keys: std::collections::BTreeSet<(Option<DbDigest>, DbDigest)> =
-                    block_credits.iter().map(|c| (c.txid, c.first)).collect();
-                let refund_keys: std::collections::BTreeSet<_> =
-                    credit_keys.intersection(&debit_keys).cloned().collect();
-                if !refund_keys.is_empty() {
-                    block_credits.retain(|c| !refund_keys.contains(&(c.txid, c.first)));
-                    block_debits.retain(|d| {
-                        d.first
-                            .map_or(true, |first| !refund_keys.contains(&(d.txid, first)))
-                    });
-                }
+                // Keep both sides even when `(txid, first)` appears in credits and
+                // debits (self-refund/change). L3 must remain lossless so downstream
+                // accounting can reconcile received - spent against note balances.
 
                 cur_metadata = FixedLayerMetadata {
                     layer: Self::LAYER,
@@ -249,13 +231,10 @@ impl LayerImpl for L3Client {
                             )?;
                         }
                         if !block_debits.is_empty() {
-                            //for block_debit in block_debits {
-                            //log::trace!("New debit: {block_debit:?}");
                             ExecuteDsl::execute(
                                 diesel::insert_into(debits::table).values(&block_debits),
                                 conn,
                             )?;
-                            //}
                         }
                         ExecuteDsl::execute(Self::update_layer_metadata(&next_metadata), conn)?;
                         Ok(())
@@ -298,4 +277,104 @@ impl LayerImpl for L3Client {
 pub struct L3Stats {
     pub credits: u64,
     pub debits: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{BigInt, Nullable};
+    use diesel_async::RunQueryDsl;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_db_path() -> Option<PathBuf> {
+        std::env::var("TEST_DB_PATH").ok().map(PathBuf::from)
+    }
+
+    fn temp_copy_path() -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("iris-blocks-l3-test-{ts}.sqlite"))
+    }
+
+    async fn setup_conn_and_client() -> Option<(crate::db::AsyncDbConnection, L3Client, PathBuf)> {
+        let src = test_db_path()?;
+        if !src.exists() {
+            return None;
+        }
+
+        let dst = temp_copy_path();
+        std::fs::copy(src, &dst).ok()?;
+        let mut conn = crate::db::new_conn(dst.to_str().expect("db path"))
+            .await
+            .ok()?;
+        crate::db::run_migrations(&mut conn).await.ok()?;
+        let client = L3Client::new(ChainActivations::mainnet(), vec![]);
+        Some((conn, client, dst))
+    }
+
+    #[tokio::test]
+    async fn l3_generates_credits_and_debits_without_refund_double_count() {
+        let Some((mut conn, client, path)) = setup_conn_and_client().await else {
+            eprintln!("Skipping l3 test: TEST_DB_PATH not set");
+            return;
+        };
+
+        client
+            .update_blocks(
+                &mut conn,
+                FixedLayerMetadata {
+                    layer: "l2",
+                    next_block_height: 5651,
+                },
+            )
+            .await
+            .expect("l3 update");
+
+        let credits = credits::table
+            .count()
+            .get_result::<i64>(&mut conn)
+            .await
+            .expect("credits count");
+        let debits = debits::table
+            .count()
+            .get_result::<i64>(&mut conn)
+            .await
+            .expect("debits count");
+        assert!(credits > 0);
+        assert!(debits >= 0);
+
+        let note_created = notes::table
+            .select(sql::<Nullable<BigInt>>("CAST(SUM(assets) AS BIGINT)"))
+            .first::<Option<i64>>(&mut conn)
+            .await
+            .expect("note created sum")
+            .unwrap_or_default();
+        let note_spent = notes::table
+            .filter(notes::spent_txid.is_not_null())
+            .select(sql::<Nullable<BigInt>>("CAST(SUM(assets) AS BIGINT)"))
+            .first::<Option<i64>>(&mut conn)
+            .await
+            .expect("note spent sum")
+            .unwrap_or_default();
+        let l3_credits = credits::table
+            .select(sql::<Nullable<BigInt>>("CAST(SUM(amount) AS BIGINT)"))
+            .first::<Option<i64>>(&mut conn)
+            .await
+            .expect("l3 credits sum")
+            .unwrap_or_default();
+        let l3_debits = debits::table
+            .select(sql::<Nullable<BigInt>>("CAST(SUM(amount) AS BIGINT)"))
+            .first::<Option<i64>>(&mut conn)
+            .await
+            .expect("l3 debits sum")
+            .unwrap_or_default();
+        assert_eq!(l3_credits, note_created);
+        assert_eq!(l3_debits, note_spent);
+
+        let _ = std::fs::remove_file(path);
+    }
 }

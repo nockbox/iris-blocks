@@ -107,7 +107,7 @@ diesel::table! {
     spend_conditions (hash) {
         hash -> DigestSql,
         txid -> DigestSql,
-        z -> Integer,
+        z -> Nullable<Integer>,
         height -> Integer,
         jam -> Binary,
     }
@@ -205,7 +205,7 @@ pub struct LockTree {
 pub struct SpendConditionRow {
     pub hash: DbDigest,
     pub txid: DbDigest,
-    pub z: i32,
+    pub z: Option<i32>,
     pub height: i32,
     pub jam: Vec<u8>,
 }

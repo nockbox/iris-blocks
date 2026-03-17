@@ -31,7 +31,7 @@ Commands:
 - `tx <txid>`: transaction drilldown (spends, outputs, signers, credits, debits)
 - `block <height-or-id>`: block metadata, tx list, coinbase credits
 - `status`: layer cursors + key table row counts
-- `audit <address>`: wallet audit with selectable text/json view (`--view summary|notes|both`), plus CSV exports for summary (`--csv`) and detailed notes based export (`--csv-notes`)
+- `audit <address>`: wallet audit with selectable text/json view (`--view summary|notes|both`), plus CSV exports for summary accounting view (`--csv`) and detailed note ledger view (`--csv-notes`)
 
 ### Data sources
 
@@ -77,6 +77,28 @@ iris-blocks --db nockchain.sqlite audit <address> \
 
 - All amounts are represented in **nicks**.
 - This repository does not convert values to NOCK in CLI output.
+
+## Address Input Semantics
+
+Address input type controls the query scope:
+
+- PKH input (`AddressType::Pkh`) -> V1-only accounting and note views.
+- Public key input (`AddressType::DbPublicKey`) -> V0-only accounting and note views.
+
+This split is intentional and prevents mixed V0/V1 balances when a PK and PKH are related.
+
+## Audit/CSV Behavior
+
+`audit` exposes two views:
+
+- **Summary view** (`--view summary`, default `--csv`):
+  - recipient-level accounting rows (`incoming` / `outgoing` / `coinbase`)
+  - self-refund/change incoming rows are omitted from summary output
+  - transaction fees are always represented (including fee-only rows when needed)
+  - `txid` is always populated; coinbase rows use synthetic ids (`coinbase@<block-id-or-height>`)
+- **Notes view** (`--view notes`, `--csv-notes`):
+  - raw note-level ledger rows (`credit` / `debit` / `coinbase`)
+  - includes refund/change entries and counterparties
 
 ## Wasm
 
@@ -146,7 +168,7 @@ Hash reversals.
 Spend condition retrieval.
 
 - `lock_tree`: PK (`root`), `height`, `axis`, `hash`
-- `spend_conditions`: PK (`hash`), UNIQUE (`txid`, `z`), `height`, `jam`
+- `spend_conditions`: PK (`hash`), UNIQUE (`txid`, `z`), `height`, `jam`, nullable `z`
 
 ### L3
 
@@ -161,11 +183,26 @@ _Null txid/first imply coinbase_
 
 Additional accounting information, more frequently recomputed.
 
-- `credit_info`: PK (`txid`, `first`, `height`), `updated_height`, `recipient_type`, `recipient`
+- `name_info`: PK (`first`, `height`), `version`, `owner_type`, `owner`
 
-_Reset behavior is as follows: collect all rows where `updated_height >= next_block_height`, and set L4's `next_block_height` to the minimum of `height` in the row set._
+_Reset behavior is height-based: delete `name_info` rows with `height >= next_block_height`._
 
-_Update behavior is as follows: collect all new spend conditions within the range `[local_next_block_height, next_block_height)`, and for each related name (transitively through matching lock trees of SP), update the corresponding `credit_info` rows._
+_Update behavior is two-phase per block:_
+- _process newly revealed `spend_conditions` + `lock_tree` roots (resolve owner as `pkh` / `musig` / `lock`), then insert `version=1` name rows;_
+- _process newly created notes missing name metadata (V0 decode to `pk` / `musig`; V1 defaults to `lock`, with V1 coinbase first names resolved to `pkh`) and insert versioned rows._
+
+_Reporting/query behavior uses the latest `name_info` row per `first` (`ORDER BY height DESC LIMIT 1`)._
+
+### Upgrading existing databases
+
+If your SQLite DB was created before `name_info` replaced `credit_info`, run:
+
+```bash
+iris-blocks --db <path-to-db.sqlite> sync --remove-layer l4
+iris-blocks --db <path-to-db.sqlite> sync --run-migrations
+```
+
+This recreates only L4 with the new schema and avoids `no such table: name_info` runtime errors.
 
 ## Recipients
 

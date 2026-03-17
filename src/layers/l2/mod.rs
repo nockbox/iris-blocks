@@ -4,8 +4,11 @@ use super::{l0::schema::transactions, layer::*, shared_schema::*};
 use crate::chain_activations::ChainActivations;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use iris_nockchain_types::{v1::SpendV1, Tx};
-use iris_ztd::{cue, jam, Hashable, NounDecode, NounEncode};
+use iris_nockchain_types::{
+    v1::{Lock, NoteData, SpendCondition, SpendV1},
+    Note, Tx,
+};
+use iris_ztd::{cue, jam, Hashable, MerkleProof, NounDecode, NounEncode};
 use log::*;
 use schema::*;
 use serde::{Deserialize, Serialize};
@@ -21,7 +24,8 @@ pub struct L2Client {
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
-/// Per-block L2 output buffers, accumulated across all 3 sub-layers.
+/// Per-block buffers for all L2 sub-layer outputs.
+/// Data is collected in-memory per block and inserted in one DB transaction.
 struct L2BlockBuffers {
     // L2.1
     spends: Vec<TxSpend>,
@@ -78,6 +82,42 @@ impl L2Client {
         i32::try_from(value).map_err(|_| {
             LayerErrorSource::OtherError(format!("numeric value out of range for {field}: {value}"))
         })
+    }
+
+    /// Parse note_data `%lock`/`%pkh` entry and return a normalized lock.
+    fn lock_from_note_data(note_data: &NoteData) -> Option<Lock> {
+        let lock_key = "lock".to_string();
+        let pkh_key = "pkh".to_string();
+        let lock_noun = note_data
+            .0
+            .get(&lock_key)
+            .or_else(|| note_data.0.get(&pkh_key))?;
+
+        // Common case: single spend-condition payload decodes directly as Lock.
+        if let Some(lock) = Lock::from_noun(lock_noun) {
+            return Some(lock);
+        }
+        // Explicitly require v0-tagged %lock encoding when represented as a pair.
+        if let Some((0u64, lock)) = <(u64, Lock)>::from_noun(lock_noun) {
+            return Some(lock);
+        }
+        if let Some((0u64, lock, 0u64)) = <(u64, Lock, u64)>::from_noun(lock_noun) {
+            return Some(lock);
+        }
+        None
+    }
+
+    fn spend_conditions_from_lock(lock: &Lock) -> Vec<(u64, SpendCondition)> {
+        let count = 1usize << (lock.height() - 1);
+        let mut out = vec![];
+        for idx in 0..count {
+            let sp = lock[idx].clone();
+            // We only need the Merkle axis for each leaf; generating a proof is
+            // the most direct way to derive that axis from the lock structure.
+            let lmp = MerkleProof::prove_hashable(&sp, idx);
+            out.push((lmp.axis, sp));
+        }
+        out
     }
 
     /// L2.1: Collect transaction internals (spends, seeds, outputs, signers).
@@ -229,14 +269,10 @@ impl L2Client {
                             }
                         }
                         SpendV1::S1(witness_spend) => {
-                            // lock proof root → name's first
                             let lock_proof = &witness_spend.witness.lock_merkle_proof;
                             let root: DbDigest = lock_proof.proof().root.into();
-                            // name_to_lock is populated from seeds below,
-                            // and for witness spends we can also map input name → root
-                            // (handled in collect_spend_conditions for consistency)
 
-                            // pkh → pk from witness signatures
+                            // Reverse-map signer PKH to revealed PK from witness signatures.
                             for (pkh, (pk, _)) in &witness_spend.witness.pkh_signature.0 {
                                 bufs.pkh_to_pk.push(PkhToPk {
                                     pkh: (*pkh).into(),
@@ -245,11 +281,11 @@ impl L2Client {
                                     block_id,
                                 });
                             }
-                            let _ = root; // used in collect_spend_conditions
+                            let _ = root; // Root-to-name mapping is written in collect_spend_conditions.
                         }
                     }
 
-                    // name_to_lock from seeds: seed.lock_root → first
+                    // Reverse-map seed lock roots to synthetic first names.
                     for seed in spend.seeds().0.iter() {
                         let root_digest = seed.lock_root.hash();
                         let first = (true, root_digest).hash();
@@ -284,7 +320,7 @@ impl L2Client {
             let sc = lock_proof.spend_condition();
             let sc_hash: DbDigest = sc.hash().into();
 
-            // name_to_lock for spent input
+            // Record input name -> lock root mapping for witness spends.
             let input_first: DbDigest = name.first.into();
             bufs.name_to_lock.push(NameToLock {
                 first: input_first,
@@ -293,7 +329,7 @@ impl L2Client {
                 block_id,
             });
 
-            // lock_tree: merkle proof branches
+            // Persist Merkle proof branch hashes needed to re-materialize lock trees.
             for (axis, digest) in lock_proof
                 .proof()
                 .visible_hashes(lock_proof.axis(), &*sc_hash)
@@ -309,15 +345,53 @@ impl L2Client {
                 });
             }
 
-            // spend_conditions row
+            // Persist the revealed spend condition payload.
             bufs.spend_conditions.push(SpendConditionRow {
                 hash: sc_hash,
                 txid: tx.id,
-                z: z as i32,
+                z: Some(z as i32),
                 height: tx.height,
                 jam: jam(sc.to_noun()),
             });
         }
+
+        // Parse V1 output note_data (`%lock`/`%pkh`) and verify that the derived
+        // lock root matches the output first name before indexing derived rows.
+        for out in vtx.outputs().notes() {
+            let Note::V1(v1_note) = out else { continue };
+            let Some(lock) = Self::lock_from_note_data(&v1_note.note_data) else {
+                continue;
+            };
+            let lock_root = lock.hash();
+            let expected_first = (true, lock_root).hash();
+            let actual_first = v1_note.name.first;
+            if expected_first != actual_first {
+                return Err(LayerErrorSource::OtherError(format!(
+                    "v1 output note_data lock-root/name mismatch: txid={} expected_first={} actual_first={}",
+                    tx.id, expected_first, actual_first
+                )));
+            }
+
+            for (axis, sc) in Self::spend_conditions_from_lock(&lock) {
+                let hash = sc.hash();
+
+                bufs.spend_conditions.push(SpendConditionRow {
+                    hash: hash.into(),
+                    txid: tx.id,
+                    z: None,
+                    height: tx.height,
+                    jam: jam(sc.to_noun()),
+                });
+
+                bufs.lock_trees.push(LockTree {
+                    root: lock_root.into(),
+                    height: tx.height,
+                    axis: axis as i32,
+                    hash: hash.into(),
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -498,11 +572,11 @@ impl LayerImpl for L2Client {
                     let spend_version =
                         Self::checked_u32_to_i32(u32::from(vtx.version()), "tx_spends.version")?;
 
-                    // L2.1: transaction internals
+                // L2.1: transaction internals
                     Self::collect_tx_internals(&tx, &vtx, spend_version, &mut bufs)?;
-                    // L2.2: hash reversals
+                // L2.2: hash reversals
                     Self::collect_hash_reversals(&tx, &vtx, block_id, &mut bufs);
-                    // L2.3: spend conditions
+                // L2.3: spend conditions
                     Self::collect_spend_conditions(&tx, &vtx, block_id, &mut bufs)?;
 
                     crate::rt::yield_now().await;
@@ -659,7 +733,7 @@ mod tests {
         let mut conn = crate::db::new_conn(dst.to_str().expect("db path"))
             .await
             .ok()?;
-        crate::db::run_migrations(&mut conn).await;
+        crate::db::run_migrations(&mut conn).await.ok()?;
         let client = L2Client::new(ChainActivations::mainnet(), vec![]);
         Some((conn, client, dst))
     }

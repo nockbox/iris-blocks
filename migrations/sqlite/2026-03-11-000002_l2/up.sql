@@ -90,7 +90,7 @@ CREATE INDEX idx_lock_tree_hash ON lock_tree(hash);
 CREATE TABLE spend_conditions (
     hash   TEXT    NOT NULL PRIMARY KEY,
     txid   TEXT    NOT NULL,
-    z      INTEGER NOT NULL,
+    z      INTEGER,
     height INTEGER NOT NULL,
     jam    BLOB    NOT NULL,
     UNIQUE (txid, z),

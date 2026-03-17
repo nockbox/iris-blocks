@@ -273,3 +273,23 @@ pub fn print_audit_notes_text(report: &query::AuditReport) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_csv_path;
+
+    #[test]
+    fn default_csv_path_uses_generated_filename() {
+        let path = resolve_csv_path("", "BrsEhM/Wallet", "nockchain_transactions").expect("path");
+        let file_name = path.file_name().and_then(|f| f.to_str()).expect("file");
+        assert_eq!(file_name, "nockchain_transactions_BrsEhM_Wallet.csv");
+    }
+
+    #[test]
+    fn directory_csv_path_appends_generated_filename() {
+        let path = resolve_csv_path("/tmp/iris-csv-tests/", "wallet.address", "nockchain_notes")
+            .expect("path");
+        let file_name = path.file_name().and_then(|f| f.to_str()).expect("file");
+        assert_eq!(file_name, "nockchain_notes_wallet.address.csv");
+    }
+}

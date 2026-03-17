@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - thomas-l2-4
+
+jobs:
+  build-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo +nightly fmt --all -- --check
+      - name: Build
+        run: cargo +nightly build --features binary
+      - name: Clippy
+        run: cargo +nightly clippy --features binary --all-targets
+
+  tests-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Full test suite
+        run: cargo +nightly test --features binary --all-targets
+      - name: Migration reset smoke
+        run: cargo +nightly test --features binary remove_and_reapply_layers_preserves_integrity -- --exact
+      - name: CLI fixture smoke
+        run: cargo +nightly test --features binary command_smoke_on_fixture_db -- --exact
