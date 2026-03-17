@@ -133,7 +133,11 @@ export default class Terminal {
         } else {
           this.mode = 'js';
           this.#setPrompt(Terminal.PROMPTS.js);
-          this.appendOutput('Switched to JavaScript mode. The following globals are injected:\nlastQuery - result of the last query ran in SQL mode\niris - iris-wasm module\nsqlQuery - function to run a query in javascript', '#c678dd');
+          this.appendOutput('Switched to JavaScript mode. The following globals are injected:', '#c678dd');
+          this.appendOutput('lastQuery - result of the last query ran in SQL mode', '#c678dd');
+          this.appendOutput('iris - iris-wasm module', '#c678dd');
+          this.appendOutput('sqlQuery - function to run a query in javascript', '#c678dd');
+          this.appendOutput('nounRows - function to get jam rows from a table and return them as nouns (args: tailExpr, e.g. "blocks where height < 10")', '#c678dd');
         }
       },
     };
@@ -278,7 +282,16 @@ export default class Terminal {
     while ((m = bareRe.exec(code)) !== null) newNames.push(m[1]);
 
     // Build scope: existing jsContext + lastResult + placeholders for new vars
-    const scope = { ...this.jsContext, lastResult: this.lastResult, iris: iris_wasm, sqlQuery: this.#sendQuery };
+    const scope = {
+      ...this.jsContext,
+      lastResult: this.lastResult,
+      iris: iris_wasm,
+      sqlQuery: this.#sendQuery,
+      nounRows: async (tail) => {
+        const rows = await this.#sendQuery(`SELECT jam FROM ${tail}`);
+        return rows.map((r) => iris_wasm.cue(r.jam));
+      }
+    };
     for (const n of newNames) {
       if (!(n in scope)) scope[n] = undefined;
     }
