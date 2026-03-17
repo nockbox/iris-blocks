@@ -1,4 +1,4 @@
-import init, * as iris_wasm from 'https://esm.sh/@nockbox/iris-wasm@0.2.0-alpha.7/iris_wasm.js';
+import init, * as iris_wasm from 'https://esm.sh/@nockbox/iris-wasm@0.2.0-alpha.8/iris_wasm.js';
 
 await init();
 
