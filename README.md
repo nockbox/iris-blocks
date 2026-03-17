@@ -170,6 +170,8 @@ Spend condition retrieval.
 - `lock_tree`: PK (`root`), `height`, `axis`, `hash`
 - `spend_conditions`: PK (`hash`), UNIQUE (`txid`, `z`), `height`, `jam`, nullable `z`
 
+_Null z implies non-witness derived spend condition (%lock note-data)_
+
 ### L3
 
 Double entry accounting ledger.

@@ -366,10 +366,11 @@ impl L2Client {
             let expected_first = (true, lock_root).hash();
             let actual_first = v1_note.name.first;
             if expected_first != actual_first {
-                return Err(LayerErrorSource::OtherError(format!(
+                warn!(
                     "v1 output note_data lock-root/name mismatch: txid={} expected_first={} actual_first={}",
                     tx.id, expected_first, actual_first
-                )));
+                );
+                continue;
             }
 
             for (axis, sc) in Self::spend_conditions_from_lock(&lock) {
