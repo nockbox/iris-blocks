@@ -1,0 +1,4 @@
+[toolchain]
+channel = "1.91"
+components = ["miri", "rust-src"]
+
