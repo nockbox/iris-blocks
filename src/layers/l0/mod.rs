@@ -3,14 +3,13 @@ pub mod schema;
 use super::{layer::*, shared_schema::*};
 use crate::chain_activations::ChainActivations;
 use crate::db::AsyncDbConnection;
-use crate::rt;
+use crate::rt::{self, RtBound, RtSync};
 use crate::scry::{NounError, ScryError, ScryFailed, Scryable};
 use crate::StringDigest;
 use clap::Parser;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use futures::channel::{mpsc, oneshot};
-use futures::lock::Mutex;
 use futures::{FutureExt, StreamExt};
 use iris_nockchain_types::BlockHeight;
 use iris_ztd::{jam, Digest, NounEncode};
@@ -20,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::watch;
+use tokio::sync::Mutex;
 
 mod block_range_manager;
 use block_range_manager::BlockRangeManager;
@@ -142,7 +142,7 @@ impl From<ScryError> for L0Error {
     }
 }
 
-impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
+impl<S: Scryable, D: AsRef<dyn LayerDependency> + RtBound + RtSync> L0Client<S, D> {
     fn checked_u64_to_i64(value: u64, field: &'static str) -> Result<i64, L0Error> {
         i64::try_from(value).map_err(|_| L0Error::ValueOutOfRange { field, value })
     }
@@ -215,9 +215,18 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
         Err(L0Error::Reverted)
     }
 
-    async fn chain_reorged(
-        &self,
-        conn: &mut AsyncDbConnection,
+    fn chain_reorged<'a>(
+        &'a self,
+        conn: &'a mut AsyncDbConnection,
+        mismatch_block_height: BlockHeight,
+        mismatch_block: Digest,
+    ) -> impl core::future::Future<Output = Result<FixedLayerMetadata, L0Error>> + Send + 'a {
+        self.chain_reorged_impl(conn, mismatch_block_height, mismatch_block)
+    }
+
+    async fn chain_reorged_impl<'a>(
+        &'a self,
+        conn: &'a mut AsyncDbConnection,
         mut mismatch_block_height: BlockHeight,
         mut mismatch_block: Digest,
     ) -> Result<FixedLayerMetadata, L0Error> {
@@ -228,9 +237,14 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
         let mut client = self.client.clone().ok_or(L0Error::GrpcNeeded)?;
 
         while mismatch_block_height > 0 {
+            let mut client = client.clone();
             trace!("Querying elders for block {mismatch_block} {mismatch_block_height}");
-            let Some(Some((last_bid, blocks))): Option<Option<(BlockHeight, Vec<Digest>)>> = client
-                .remote_scry(("elders", StringDigest(mismatch_block), 0))
+            let Some(Some((last_bid, blocks))): Option<Option<(BlockHeight, Vec<Digest>)>> =
+                async move {
+                    client
+                        .remote_scry(("elders", StringDigest(mismatch_block), 0))
+                        .await
+                }
                 .await?
             else {
                 return Err(L0Error::UnableToPullElders(
@@ -325,6 +339,7 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
         let Some(Some(new_blocks)) = manager.scry_blocks(next_height_start).await? else {
             return Err(L0Error::UnableToParseBlocksRangeResponse);
         };
+        //let new_blocks: Vec<(BlockHeight, Digest, iris_nockchain_types::Page, iris_ztd::ZMap<Digest, iris_nockchain_types::Tx>)> = vec![];
 
         match (cur_tail, new_blocks.is_empty()) {
             (Some((tail_block, mdata)), true) => {
@@ -444,6 +459,11 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
 
         self.stats_tx.send(Some(new_stats)).ok();
 
+        let metadata = FixedLayerMetadata {
+            layer: self.layer(),
+            next_block_height: 0,
+        };
+
         Ok(metadata)
     }
 
@@ -481,8 +501,12 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
         res
     }
 
+    pub fn run(self) -> impl core::future::Future<Output = ()> + RtBound {
+        self.run_impl()
+    }
+
     #[tracing::instrument(skip_all)]
-    pub async fn run(mut self) {
+    async fn run_impl(mut self) {
         loop {
             match self.update_blocks().await {
                 // New blocks were ingested; continue immediately.
@@ -533,7 +557,8 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
     }
 
     async fn process_query(&mut self, req: L0Request<S>) {
-        let mut conn = self.conn.lock().await;
+        let conn = self.conn.clone();
+        let mut conn = conn.lock().await;
         match req {
             L0Request::Query { sql, responder } => {
                 let res = conn
@@ -617,7 +642,8 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                 break;
             }
 
-            let mut conn = self.conn.lock().await;
+            let conn = self.conn.clone();
+            let mut conn = conn.lock().await;
 
             // Let dependent layers advance while time remains.
             let mut cur_metadata = metadata;

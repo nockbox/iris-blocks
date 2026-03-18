@@ -6,6 +6,7 @@ pub mod block;
 pub mod status;
 pub mod sync;
 pub mod tx;
+pub mod verify_balance;
 
 pub use audit::{AuditArgs, AuditView};
 pub use balance::BalanceArgs;
@@ -13,6 +14,7 @@ pub use block::BlockArgs;
 pub use status::StatusArgs;
 pub use sync::SyncArgs;
 pub use tx::TxArgs;
+pub use verify_balance::VerifyBalanceArgs;
 
 // ── Shared formatting helpers ────────────────────────────────────────────────
 
@@ -70,6 +72,7 @@ impl Cli {
             Commands::Block(args) => args.run(&self.db).await?,
             Commands::Status(args) => args.run(&self.db).await?,
             Commands::Audit(args) => args.run(&self.db).await?,
+            Commands::VerifyBalance(args) => args.run(&self.db).await?,
         }
         Ok(())
     }
@@ -83,6 +86,7 @@ pub enum Commands {
     Block(BlockArgs),
     Status(StatusArgs),
     Audit(AuditArgs),
+    VerifyBalance(VerifyBalanceArgs),
 }
 
 #[cfg(test)]

@@ -44,6 +44,16 @@ pub type DbConnection = SqliteConnection;
 /// Async-compatible SQLite connection (sync diesel wrapped for use with bb8).
 pub type AsyncDbConnection = SyncConnectionWrapper<SqliteConnection, DbRuntime>;
 
+const _: () = {
+    const fn is_send<T: Send>() {}
+    is_send::<AsyncDbConnection>();
+    is_send::<tokio::sync::Mutex<AsyncDbConnection>>();
+
+    const fn is_send_ref<'a>(_: &'a ()) {
+        is_send::<&'a tokio::sync::Mutex<AsyncDbConnection>>();
+    }
+};
+
 #[derive(thiserror::Error, Debug)]
 pub enum DbError {
     #[error(transparent)]

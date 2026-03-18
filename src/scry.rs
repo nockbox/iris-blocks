@@ -1,4 +1,4 @@
-use crate::rt::RtBound;
+use crate::rt::{RtBound, RtSync};
 use iris_grpc_proto::pb::private::v1::{
     nock_app_service_client::NockAppServiceClient, peek_response::Result as PeekResult, *,
 };
@@ -28,15 +28,15 @@ pub enum ScryError {
     ScryFailed(ScryFailed),
 }
 
-pub trait Scryable: Clone + RtBound + 'static {
+pub trait Scryable: Clone + RtBound + RtSync + 'static {
     fn remote_scry<'a, T: NounDecode + RtBound + 'a>(
         &'a mut self,
         path: impl NounEncode + RtBound + 'a,
     ) -> impl core::future::Future<Output = Result<T, ScryError>> + RtBound + 'a;
 }
 
-impl<C: tonic::client::GrpcService<tonic::body::BoxBody> + RtBound + Clone + 'static> Scryable
-    for NockAppServiceClient<C>
+impl<C: tonic::client::GrpcService<tonic::body::BoxBody> + RtBound + RtSync + Clone + 'static>
+    Scryable for NockAppServiceClient<C>
 where
     C::Error: Into<StdError>,
     C::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
@@ -49,11 +49,10 @@ where
         &'a mut self,
         path: impl NounEncode + RtBound + 'a,
     ) -> Result<T, ScryError>
-    where
+/*where
         C::Error: Into<StdError>,
         C::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
-        <C::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
-    {
+        <C::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,*/ {
         let peek_req = PeekRequest {
             pid: 0,
             path: jam(path.to_noun()),
