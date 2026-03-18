@@ -43,7 +43,7 @@ impl L4Client {
         let pkhs: BTreeSet<_> = sc.pkh().flat_map(|v| v.hashes.iter()).collect();
         if pkhs.len() == 1 {
             if let Some(pkh) = pkhs.iter().next() {
-                return ("pkh".to_string(), pkh.to_string());
+                ("pkh".to_string(), pkh.to_string())
             } else {
                 ("musig".to_string(), sc.hash().to_string())
             }

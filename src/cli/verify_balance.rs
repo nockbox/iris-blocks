@@ -107,10 +107,10 @@ async fn check_first_name(
             (name, note)
         })
         .collect();
-    local_notes.sort_by(|a, b| a.0.cmp(&b.0));
+    local_notes.sort_by_key(|a| a.0);
 
     let mut remote_notes: Vec<(Name, Note)> = balance_update.notes.0.into_iter().collect();
-    remote_notes.sort_by(|a, b| a.0.cmp(&b.0));
+    remote_notes.sort_by_key(|a| a.0);
 
     if local_notes.len() != remote_notes.len() {
         eprintln!(
@@ -188,7 +188,7 @@ impl VerifyBalanceArgs {
             None
         };
 
-        let mut grpc = PublicNockchainGrpcClient::connect(self.connect.to_string()).await?;
+        let grpc = PublicNockchainGrpcClient::connect(self.connect.to_string()).await?;
 
         if let Some(first_name) = self.first_name {
             check_first_name(conn, grpc, first_name, l0_stats.as_mut()).await?;

@@ -25,7 +25,7 @@ use std::sync::Arc;
 const DERIVABLE_LAYERS: &[&str] = &["l1", "l2", "l3", "l4"];
 
 fn validate_layer_name(layer: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if DERIVABLE_LAYERS.iter().any(|valid| *valid == layer) {
+    if DERIVABLE_LAYERS.contains(&layer) {
         return Ok(());
     }
     Err(Box::new(io::Error::new(

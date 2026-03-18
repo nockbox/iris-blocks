@@ -142,7 +142,7 @@ impl L2Client {
                             bufs.signers.push(TxSigner {
                                 txid: tx.id,
                                 z: Self::checked_usize_to_i32(z, "tx_signers.z")?,
-                                pk: pk.clone().into(),
+                                pk: (*pk).into(),
                                 height: tx.height,
                             });
                         }
@@ -179,7 +179,7 @@ impl L2Client {
                                 bufs.signers.push(TxSigner {
                                     txid: tx.id,
                                     z: Self::checked_usize_to_i32(z, "tx_signers.z")?,
-                                    pk: pk.clone().into(),
+                                    pk: (*pk).into(),
                                     height: tx.height,
                                 });
                             }
@@ -189,7 +189,7 @@ impl L2Client {
                                 bufs.signers.push(TxSigner {
                                     txid: tx.id,
                                     z: Self::checked_usize_to_i32(z, "tx_signers.z")?,
-                                    pk: pk.clone().into(),
+                                    pk: (*pk).into(),
                                     height: tx.height,
                                 });
                             }
@@ -243,7 +243,7 @@ impl L2Client {
                             let pkh = pk.hash();
                             bufs.pkh_to_pk.push(PkhToPk {
                                 pkh: pkh.into(),
-                                pk: pk.clone().into(),
+                                pk: (*pk).into(),
                                 height: tx.height,
                                 block_id,
                             });
@@ -259,7 +259,7 @@ impl L2Client {
                                 let pkh = pk.hash();
                                 bufs.pkh_to_pk.push(PkhToPk {
                                     pkh: pkh.into(),
-                                    pk: pk.clone().into(),
+                                    pk: (*pk).into(),
                                     height: tx.height,
                                     block_id,
                                 });
@@ -273,7 +273,7 @@ impl L2Client {
                             for (pkh, (pk, _)) in &witness_spend.witness.pkh_signature.0 {
                                 bufs.pkh_to_pk.push(PkhToPk {
                                     pkh: (*pkh).into(),
-                                    pk: pk.clone().into(),
+                                    pk: (*pk).into(),
                                     height: tx.height,
                                     block_id,
                                 });

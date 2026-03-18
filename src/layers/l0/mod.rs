@@ -346,12 +346,12 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency> + RtBound + RtSync> L0Client<S, 
                     false,
                 ))
             }
-            (Some((tail_block, _)), false) => {
-                if new_blocks[0].0 != 0 && new_blocks[0].2.parent() != *tail_block.id {
-                    return self
-                        .chain_reorged(conn, new_blocks[0].0, new_blocks[0].1)
-                        .await;
-                }
+            (Some((tail_block, _)), false)
+                if new_blocks[0].0 != 0 && new_blocks[0].2.parent() != *tail_block.id =>
+            {
+                return self
+                    .chain_reorged(conn, new_blocks[0].0, new_blocks[0].1)
+                    .await;
             }
             (None, true) => return Err(L0Error::NoNewBlocksNoGenesis),
             _ => (),
@@ -416,7 +416,7 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency> + RtBound + RtSync> L0Client<S, 
                     version: rtx.version() as _,
                     fee: Self::checked_u64_to_i64(rtx.total_fees().0, "transactions.fee")?,
                     total_size: Self::checked_u64_to_i32(
-                        tx.total_size() as u64,
+                        tx.total_size(),
                         "transactions.total_size",
                     )?,
                     jam: jam(tx.to_noun()),

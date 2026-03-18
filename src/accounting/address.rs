@@ -83,21 +83,21 @@ pub async fn resolve_address(
         .await
         .optional()?
     {
-        return Ok(AddressInfo {
+        Ok(AddressInfo {
             input: normalized.to_string(),
             address_type: AddressType::Pkh,
             scope: VersionScope::V1Only,
             pkh: row.pkh.to_string(),
             db_public_key: Some(row.pk.to_string()),
-        });
+        })
     } else {
-        return Ok(AddressInfo {
+        Ok(AddressInfo {
             input: normalized.to_string(),
             address_type: AddressType::Pkh,
             scope: VersionScope::V1Only,
             pkh: digest.to_string(),
             db_public_key: None,
-        });
+        })
     }
 }
 

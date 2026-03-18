@@ -118,7 +118,7 @@ pub async fn remove_layers_down_to(
 ) -> Result<(), DbError> {
     use diesel::migration::MigrationSource;
 
-    if !LAYERS_REVERSE.iter().any(|l| *l == target_layer) {
+    if !LAYERS_REVERSE.contains(&target_layer) {
         return Err(DbError::InvalidLayer(target_layer.to_string()));
     }
 
