@@ -54,31 +54,33 @@ async fn check_first_name(
         balance_update.notes.0.len()
     );
 
-    let mut conn = conn.lock().await;
-    let l1_meta = layer_metadata::table
-        .filter(layer_metadata::layer.eq("l1"))
-        .select(layer_metadata::next_block_height)
-        .first::<i32>(&mut conn)
-        .await
-        .map_err(|e| format!("Failed to read l1 layer_metadata: {e}"))?;
-    core::mem::drop(conn);
+    {
+        let mut conn = conn.lock().await;
+        let l1_meta = layer_metadata::table
+            .filter(layer_metadata::layer.eq("l1"))
+            .select(layer_metadata::next_block_height)
+            .first::<i32>(&mut conn)
+            .await
+            .map_err(|e| format!("Failed to read l1 layer_metadata: {e}"))?;
+        core::mem::drop(conn);
 
-    if (l1_meta as u32) <= height {
-        if let Some(l0_stats) = l0_stats {
-            debug!("l1 height = ({l1_meta}) is not above remote height ({height}). Syncing.");
-            l0_stats
-                .wait_for(|v| v.as_ref().map(|v| v.next_block_height).unwrap_or(0) >= height)
-                .await
-                .unwrap();
-        } else {
-            return Err(format!(
-                "l1 next_block_height ({l1_meta}) is not above remote height ({height}). \
-                     Sync further before verifying."
-            )
-            .into());
+        if (l1_meta as u32) <= height {
+            if let Some(l0_stats) = l0_stats {
+                debug!("l1 height = ({l1_meta}) is not above remote height ({height}). Syncing.");
+                l0_stats
+                    .wait_for(|v| v.as_ref().map(|v| v.next_block_height).unwrap_or(0) >= height)
+                    .await
+                    .unwrap();
+            } else {
+                return Err(format!(
+                    "l1 next_block_height ({l1_meta}) is not above remote height ({height}). \
+                         Sync further before verifying."
+                )
+                .into());
+            }
         }
+        eprintln!("l1 next_block_height={l1_meta}, covers remote height {height}");
     }
-    eprintln!("l1 next_block_height={l1_meta}, covers remote height {height}");
 
     let h = height as i32;
     let mut conn = conn.lock().await;
