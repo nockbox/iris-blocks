@@ -25,12 +25,17 @@ A fast, self-hosted Nockchain indexer that syncs chain data into a local SQLite 
 - [Using iris-blocks in JavaScript/TypeScript](#using-iris-blocks-in-javascripttypescript)
 - [Architecture and Schema](#architecture-and-schema)
 - [Reference](#reference)
-- [Building from Source](#building-from-source)
 - [License](#license)
 
 ---
 
 ## Getting Started
+
+Requires Rust nightly (minimum `1.88.0`). The CLI is feature-gated — run all commands with:
+
+```bash
+cargo +nightly run --features binary -- <args>
+```
 
 There are two ways to get a populated database: download a pre-built snapshot, or sync directly from a Nockchain node.
 
@@ -45,10 +50,10 @@ We publish a new chain snapshot every 24 hours so you can start querying immedia
 **2. Query it:**
 
 ```bash
-iris-blocks --db nockchain.sqlite status
-iris-blocks --db nockchain.sqlite balance <address>
-iris-blocks --db nockchain.sqlite tx <txid>
-iris-blocks --db nockchain.sqlite audit <address> --csv
+cargo +nightly run --features binary -- --db nockchain.sqlite status
+cargo +nightly run --features binary -- --db nockchain.sqlite balance <address>
+cargo +nightly run --features binary -- --db nockchain.sqlite tx <txid>
+cargo +nightly run --features binary -- --db nockchain.sqlite audit <address> --csv
 ```
 
 The snapshot is a standard SQLite file — you can also open it with any SQLite client (`sqlite3`, DB Browser, DBeaver, etc.) and write your own queries against the [documented schema](docs/SCHEMA.md).
@@ -64,7 +69,7 @@ For real-time data, sync iris-blocks directly from a Nockchain node's private gR
 **2. Initialize and sync:**
 
 ```bash
-iris-blocks --db nockchain.sqlite sync \
+cargo +nightly run --features binary -- --db nockchain.sqlite sync \
   --connect http://localhost:5555 \
   --run-migrations
 ```
@@ -74,13 +79,13 @@ This creates the database, runs migrations, connects to the node, and begins fet
 **3. Query while syncing** from a second terminal:
 
 ```bash
-iris-blocks --db nockchain.sqlite balance <address>
+cargo +nightly run --features binary -- --db nockchain.sqlite balance <address>
 ```
 
 **Selective layer syncing** — restrict which layers are derived if you don't need all of them:
 
 ```bash
-iris-blocks --db nockchain.sqlite sync \
+cargo +nightly run --features binary -- --db nockchain.sqlite sync \
   --connect http://localhost:5555 \
   --run-migrations \
   --only-enable-layers l1,l2
@@ -89,7 +94,7 @@ iris-blocks --db nockchain.sqlite sync \
 **Re-derive without re-syncing** — when no `--connect` is provided, iris-blocks processes existing L0 blocks through the enabled upper layers, then exits:
 
 ```bash
-iris-blocks --db nockchain.sqlite sync --run-migrations
+cargo +nightly run --features binary -- --db nockchain.sqlite sync --run-migrations
 ```
 
 ---
@@ -97,7 +102,7 @@ iris-blocks --db nockchain.sqlite sync --run-migrations
 ## CLI Reference
 
 ```
-iris-blocks [--db <path>] <command>
+cargo +nightly run --features binary -- [--db <path>] <command>
 ```
 
 `--db` defaults to `nockchain.sqlite`. All query commands support `--format text` (default) or `--format json`.
@@ -115,18 +120,18 @@ iris-blocks [--db <path>] <command>
 
 ```bash
 # Summary CSV (auto-named: nockchain_transactions_<address>.csv)
-iris-blocks --db nockchain.sqlite audit <address> --csv
+cargo +nightly run --features binary -- --db nockchain.sqlite audit <address> --csv
 
 # Detailed note-level CSV (auto-named: nockchain_notes_<address>.csv)
-iris-blocks --db nockchain.sqlite audit <address> --csv-notes
+cargo +nightly run --features binary -- --db nockchain.sqlite audit <address> --csv-notes
 
 # Both CSVs into a directory
-iris-blocks --db nockchain.sqlite audit <address> \
+cargo +nightly run --features binary -- --db nockchain.sqlite audit <address> \
   --csv /path/to/output/ \
   --csv-notes /path/to/output/
 
 # JSON output with both views
-iris-blocks --db nockchain.sqlite audit <address> --format json --view both
+cargo +nightly run --features binary -- --db nockchain.sqlite audit <address> --format json --view both
 ```
 
 **Summary view** (`--csv`) produces recipient-level accounting rows: `incoming`, `outgoing`, `coinbase` entries with running balance. Self-refund/change rows are excluded, fees are always represented. Coinbase rows use synthetic txids (`coinbase@<block-id-or-height>`).
@@ -261,20 +266,8 @@ This split prevents mixed V0/V1 balances when a public key and its derived PKH a
 If your database was created before `name_info` replaced `credit_info`:
 
 ```bash
-iris-blocks --db <path.sqlite> sync --remove-layer l4
-iris-blocks --db <path.sqlite> sync --run-migrations
-```
-
----
-
-## Building from Source
-
-Requires Rust nightly (minimum `1.88.0`).
-
-```bash
-cargo +nightly run --features binary -- --help
-cargo +nightly run --features binary -- --db nockchain.sqlite balance <address>
-cargo +nightly build --features binary --release
+cargo +nightly run --features binary -- --db <path.sqlite> sync --remove-layer l4
+cargo +nightly run --features binary -- --db <path.sqlite> sync --run-migrations
 ```
 
 ---
