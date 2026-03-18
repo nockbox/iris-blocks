@@ -1,6 +1,5 @@
 [profile.release]
 debug = 2
-rustflags = ["-C", "force-frame-pointers=yes", "-C", "force-unwind-tables=yes"]
 split-debuginfo = "off"
 strip = "none"
 
