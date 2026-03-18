@@ -17,6 +17,7 @@ use log::*;
 use schema::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "binary")]
 use std::time::Instant;
 use tokio::sync::watch;
 use tracing::Instrument;
@@ -222,6 +223,7 @@ impl LayerImpl for L4Client {
         async {
             for height in start_block_height..=last_block_height {
                 let h = height as i32;
+                #[cfg(feature = "binary")]
                 let block_started = Instant::now();
                 let mut block_name_info = vec![];
                 let mut inserted_firsts: BTreeSet<DbDigest> = BTreeSet::new();
@@ -438,6 +440,7 @@ impl LayerImpl for L4Client {
                 .instrument(tracing::info_span!("l4_commit_block", height))
                 .await?;
 
+                #[cfg(feature = "binary")]
                 tracing::trace!(
                     block_height = h,
                     revealed_root_count,
@@ -446,6 +449,10 @@ impl LayerImpl for L4Client {
                     elapsed_ms = block_started.elapsed().as_millis() as u64,
                     "l4 block derivation profile"
                 );
+                #[cfg(not(feature = "binary"))]
+                {
+                    let _ = (revealed_root_count, created_note_count, inserted_name_info_rows);
+                }
 
                 crate::rt::yield_now().await;
             }
@@ -459,7 +466,7 @@ impl LayerImpl for L4Client {
 
         self.stats_tx
             .send(Some(L4Stats {
-                credit_info: ni_count,
+                name_info: ni_count,
             }))
             .unwrap();
 
@@ -471,7 +478,7 @@ impl LayerImpl for L4Client {
 #[cfg_attr(feature = "wasm", derive(tsify::Tsify))]
 #[cfg_attr(feature = "wasm", tsify(from_wasm_abi, into_wasm_abi))]
 pub struct L4Stats {
-    pub credit_info: u64,
+    pub name_info: u64,
 }
 
 #[cfg(test)]

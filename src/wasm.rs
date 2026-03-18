@@ -103,6 +103,8 @@ impl BlockExporter {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         log::info!("Starting block exporter");
 
+        console_error_panic_hook::set_once();
+
         let mut enable_l0 = false;
         let mut enable_l1 = false;
         let mut enable_l2 = false;

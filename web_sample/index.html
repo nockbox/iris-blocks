@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Iris Blocks WASM Test</title>
+    <title>Iris Blocks Demo</title>
     <style>
         * {
             box-sizing: border-box;
@@ -30,17 +30,6 @@
             flex-shrink: 0;
         }
 
-        .status {
-            padding: 0.75rem 1rem;
-            background: #2d2d2d;
-            border-radius: 4px;
-            font-family: monospace;
-            white-space: pre-wrap;
-            font-size: 0.85rem;
-            flex-shrink: 0;
-            max-height: 5rem;
-            overflow-y: auto;
-        }
 
         .config-panel {
             display: flex;
@@ -247,8 +236,12 @@
 
     <div class="config-panel">
         <div class="config-group">
-            <label>RPC Endpoint</label>
+            <label title="gRPC-Web endpoint for nockchain private API">RPC Endpoint</label>
             <input type="text" id="rpc-endpoint" value="">
+            <label style="font-size:0.8rem;color:#ccc;cursor:pointer;display:flex;align-items:center;gap:0.25rem;"
+                title="peek using %heaviest-chain-blocks-range-no-pow">
+                <input type="checkbox" id="fast-peek" checked> Fast Peek
+            </label>
         </div>
         <div class="config-group">
             <label>Layers</label>
@@ -284,8 +277,6 @@
         </div>
     </div>
 
-    <div class="status" id="status" style="margin-top: 0.75rem;"></div>
-
     <div class="stats-grid" id="stats-grid"></div>
 
     <div id="terminal-container">
@@ -302,7 +293,6 @@
     <script type="module">
         import Terminal from './terminal.js';
 
-        const statusEl = document.getElementById('status');
         const statsGrid = document.getElementById('stats-grid');
         const btnStart = document.getElementById('btn-start');
         const btnStop = document.getElementById('btn-stop');
@@ -368,7 +358,7 @@
                 { key: 'debits', label: 'Debits' },
             ],
             l4: [
-                { key: 'credit_info', label: 'Credit Info' },
+                { key: 'name_info', label: 'Name Info' },
             ],
         };
 
@@ -398,7 +388,7 @@
                 const { type, ...data } = e.data;
                 switch (type) {
                     case 'status':
-                        statusEl.textContent += data.message + '\n';
+                        terminal.appendOutput(data.message, '#888');
                         break;
                     case 'ready':
                         terminal.appendOutput('iris-blocks worker ready. SQL is active.', '#c678dd');
@@ -424,12 +414,12 @@
                         btnStart.disabled = false;
                         btnStop.disabled = true;
                         btnExport.disabled = true;
-                        statusEl.textContent += 'Stopped.\n';
+                        terminal.appendOutput('Stopped.', '#ff6c6b');
                         worker = null;
                         break;
                     case 'exportResult':
                         if (data.error) {
-                            statusEl.textContent += `Export error: ${data.error}\n`;
+                            terminal.appendOutput(`Export error: ${data.error}`, '#ff6c6b');
                         } else {
                             const blob = new Blob([data.data], { type: 'application/x-sqlite3' });
                             const a = document.createElement('a');
@@ -437,12 +427,12 @@
                             a.download = 'iris-blocks.sqlite';
                             a.click();
                             URL.revokeObjectURL(a.href);
-                            statusEl.textContent += 'Database exported.\n';
+                            terminal.appendOutput('Database exported.', '#98be65');
                         }
                         btnExport.disabled = false;
                         break;
                     case 'error':
-                        statusEl.textContent += `Error: ${data.message}\n`;
+                        terminal.appendOutput(`Error: ${data.message}`, '#ff6c6b');
                         break;
                 }
             };
@@ -464,7 +454,6 @@
             btnStart.disabled = true;
             btnStop.disabled = false;
             btnExport.disabled = false;
-            statusEl.textContent = '';
 
             // Clear previous stats
             for (const k of Object.keys(allStats)) delete allStats[k];
@@ -485,7 +474,7 @@
                 db_run_migrations: true,
                 remove_layer: rederiveVal || null,
                 private_grpc_connect: rpcEndpoint.value || null,
-                scry_no_pow: true,
+                scry_no_pow: document.getElementById('fast-peek').checked,
                 verify_outputs: false,
             };
 
@@ -505,7 +494,7 @@
             if (!running || !worker) return;
             btnStop.disabled = true;
             btnExport.disabled = true;
-            statusEl.textContent += 'Stopping...\n';
+            terminal.appendOutput('Stopping...', '#888');
             worker.postMessage({ type: 'stop' });
         });
 
@@ -519,7 +508,7 @@
         btnExport.addEventListener('click', () => {
             if (!running || !worker) return;
             btnExport.disabled = true;
-            statusEl.textContent += 'Exporting database...\n';
+            terminal.appendOutput('Exporting database...', '#888');
             worker.postMessage({ type: 'export' });
         });
     </script>

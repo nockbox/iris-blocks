@@ -109,7 +109,9 @@ pub enum L0Error {
     NoNewBlocks(FixedLayerMetadata, Digest, BlockHeight, bool),
     #[error("Unable to parse blocks range response")]
     UnableToParseBlocksRangeResponse,
-    #[error("Block missing pow")]
+    #[error(
+        "Block {0} missing pow. Are you peeking with --store-pow=true --block-range-scry-no-pow?"
+    )]
     BlockMissingPow(Digest),
     #[error("TX {0} invalid on block {1} ({2})")]
     TransactionInvalid(Digest, BlockHeight, Digest),
@@ -341,11 +343,14 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                 "Processing block {bid} at height {height}. Num transactions: {}",
                 txs.len()
             );
-            if !self.config.store_pow {
-                *block.pow_mut() = None;
-            } else if block.pow_mut().is_none() {
-                return Err(L0Error::BlockMissingPow(bid));
-            }
+
+            let pow_jam = match (self.config.store_pow, block.pow_mut()) {
+                (true, Some(pow)) => Some(jam(pow.to_noun())),
+                (true, None) => return Err(L0Error::BlockMissingPow(bid)),
+                (false, _) => None,
+            };
+
+            *block.pow_mut() = None;
 
             create_blocks.push(Block {
                 id: bid.into(),
@@ -358,6 +363,7 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                 )?,
                 msg: block.msg().try_into().ok(),
                 jam: jam(block.to_noun()),
+                pow_jam,
             });
             for (txid, tx) in txs {
                 let rtx = tx.raw();
@@ -498,7 +504,7 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                         .await;
                 }
                 Err(e) => {
-                    error!("Error updating blocks: {e:?}");
+                    error!("Error updating blocks: {e} ({e:?})");
                     self.sleep_and_process_queries(std::time::Duration::from_secs(30))
                         .await;
                 }

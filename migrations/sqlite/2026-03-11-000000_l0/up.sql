@@ -12,7 +12,8 @@ CREATE TABLE blocks (
     parent    TEXT    NOT NULL UNIQUE,
     timestamp INTEGER NOT NULL,
     msg       TEXT,
-    jam       BLOB    NOT NULL
+    jam       BLOB    NOT NULL,
+    pow_jam  BLOB
 );
 
 CREATE TABLE transactions (

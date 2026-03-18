@@ -87,12 +87,26 @@ export default class Terminal {
 
   #registerBuiltinCommands() {
     this.commands['.help'] = {
-      description: 'Show available commands',
+      description: 'Show help',
       handler: () => {
-        const lines = Object.entries(this.commands)
+        const commands = Object.entries(this.commands)
           .map(([name, cmd]) => `  ${name.padEnd(10)} ${cmd.description}`)
           .join('\n');
-        this.appendOutput(lines, '#c678dd');
+        const color = '#c678dd';
+        const help = `Iris Blocks Demo - In-Browser SQL Engine
+
+This is a demo of the iris-blocks library, which is a library for building nockchain representations in SQL.
+
+You can either load an sql database (see snapshots on https://github.com/nockbox/iris-blocks/releases), or connect to a gRPC-Web endpoint for nockchain private API.
+Fast peek option allows you to sync the chain without downloading ZKPs, but requires special node support (see: https://github.com/nockchain/nockchain/pull/108).
+
+This demo has two modes: SQL and JavaScript.
+In SQL mode, you can run SQL queries against the nockchain data using iris-wasm as helper.
+In JavaScript mode, you can run JavaScript code against the nockchain data, and have full access to iris-wasm.
+
+Available commands:
+${commands}`;
+        this.appendOutput(help, color);
       },
     };
 
@@ -142,7 +156,7 @@ export default class Terminal {
       },
     };
 
-    this.appendOutput('Welcome to iris-blocks. Type ".help" for commands.', '#c678dd');
+    this.appendOutput('Welcome to iris-blocks. Type ".help" for help and commands.', '#c678dd');
   }
 
   // ---------------------------------------------------------------------------

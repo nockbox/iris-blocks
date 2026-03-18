@@ -20,6 +20,7 @@ diesel::table! {
         timestamp -> BigInt,
         msg -> Nullable<Text>,
         jam -> Binary,
+        pow_jam -> Nullable<Binary>,
     }
 }
 
@@ -55,6 +56,7 @@ pub struct Block {
     pub timestamp: i64,
     pub msg: Option<String>,
     pub jam: Vec<u8>,
+    pub pow_jam: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable)]
