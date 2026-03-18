@@ -220,7 +220,8 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency> + RtBound + RtSync> L0Client<S, 
         conn: &'a mut AsyncDbConnection,
         mismatch_block_height: BlockHeight,
         mismatch_block: Digest,
-    ) -> impl core::future::Future<Output = Result<FixedLayerMetadata, L0Error>> + Send + 'a {
+    ) -> impl core::future::Future<Output = Result<FixedLayerMetadata, L0Error>> + RtBound + 'a
+    {
         self.chain_reorged_impl(conn, mismatch_block_height, mismatch_block)
     }
 
@@ -237,14 +238,9 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency> + RtBound + RtSync> L0Client<S, 
         let mut client = self.client.clone().ok_or(L0Error::GrpcNeeded)?;
 
         while mismatch_block_height > 0 {
-            let mut client = client.clone();
             trace!("Querying elders for block {mismatch_block} {mismatch_block_height}");
-            let Some(Some((last_bid, blocks))): Option<Option<(BlockHeight, Vec<Digest>)>> =
-                async move {
-                    client
-                        .remote_scry(("elders", StringDigest(mismatch_block), 0))
-                        .await
-                }
+            let Some(Some((last_bid, blocks))): Option<Option<(BlockHeight, Vec<Digest>)>> = client
+                .remote_scry(("elders", StringDigest(mismatch_block), 0))
                 .await?
             else {
                 return Err(L0Error::UnableToPullElders(
