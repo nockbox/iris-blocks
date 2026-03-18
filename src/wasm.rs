@@ -165,9 +165,9 @@ impl BlockExporter {
 
         let activations = ChainActivations::mainnet();
 
-        // Build layer chain bottom-up: l4 → l3 → l2 → l1 → l0
+        // Build layer chain: each layer is independent, L0 holds the flat deps list.
         let (l4_client, l4_stats) = if enable_l4 {
-            let client = L4Client::new(activations.clone(), vec![]);
+            let client = L4Client::new(activations.clone());
             let stats = client.stats_handle();
             (Some(Arc::new(client)), Some(stats))
         } else {
@@ -175,12 +175,7 @@ impl BlockExporter {
         };
 
         let (l3_client, l3_stats) = if enable_l3 {
-            let deps: Vec<Arc<dyn LayerDependency>> = if let Some(ref l4) = l4_client {
-                vec![l4.clone()]
-            } else {
-                vec![]
-            };
-            let client = L3Client::new(activations.clone(), deps);
+            let client = L3Client::new(activations.clone());
             let stats = client.stats_handle();
             (Some(Arc::new(client)), Some(stats))
         } else {
@@ -188,12 +183,7 @@ impl BlockExporter {
         };
 
         let (l2_client, l2_stats) = if enable_l2 {
-            let deps: Vec<Arc<dyn LayerDependency>> = if let Some(ref l3) = l3_client {
-                vec![l3.clone()]
-            } else {
-                vec![]
-            };
-            let client = L2Client::new(activations.clone(), deps);
+            let client = L2Client::new(activations.clone());
             let stats = client.stats_handle();
             (Some(Arc::new(client)), Some(stats))
         } else {
@@ -201,23 +191,27 @@ impl BlockExporter {
         };
 
         let (l1_client, l1_stats) = if enable_l1 {
-            let deps: Vec<Arc<dyn LayerDependency>> = if let Some(ref l2) = l2_client {
-                vec![l2.clone()]
-            } else {
-                vec![]
-            };
-            let client = L1Client::new(activations.clone(), deps);
+            let client = L1Client::new(activations.clone());
             let stats = client.stats_handle();
             (Some(client), Some(stats))
         } else {
             (None, None)
         };
 
-        let l0_deps: Vec<Arc<dyn LayerDependency>> = if let Some(l1_client) = l1_client {
-            vec![Arc::new(l1_client)]
-        } else {
-            vec![]
-        };
+        // Build flat deps list in order: l1, l2, l3, l4 (only enabled ones).
+        let mut l0_deps: Vec<Arc<dyn LayerDependency>> = vec![];
+        if let Some(l1_client) = l1_client {
+            l0_deps.push(Arc::new(l1_client));
+        }
+        if let Some(ref l2) = l2_client {
+            l0_deps.push(l2.clone());
+        }
+        if let Some(ref l3) = l3_client {
+            l0_deps.push(l3.clone());
+        }
+        if let Some(ref l4) = l4_client {
+            l0_deps.push(l4.clone());
+        }
 
         let mut cfg = L0Config::default();
         cfg.store_pow = false;

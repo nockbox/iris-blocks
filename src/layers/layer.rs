@@ -4,7 +4,6 @@ use core::future::Future;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use iris_ztd::Digest;
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -44,67 +43,69 @@ impl core::fmt::Display for LayerError {
 }
 
 pub trait LayerBase {
-    const ACCEPT_LAYERS: &'static [&'static str];
+    const DEPEND_ON_LAYERS: &'static [&'static str];
     const LAYER: &'static str;
     type Stats;
     fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>>;
 }
 
 pub trait Layer {
-    fn accepts_layers(&self) -> &'static [&'static str];
+    fn depend_on_layers(&self) -> &'static [&'static str];
     fn layer(&self) -> &'static str;
 }
 
 impl<T: ?Sized + LayerBase> Layer for T {
-    fn accepts_layers(&self) -> &'static [&'static str] {
-        Self::ACCEPT_LAYERS
+    fn depend_on_layers(&self) -> &'static [&'static str] {
+        Self::DEPEND_ON_LAYERS
     }
     fn layer(&self) -> &'static str {
         Self::LAYER
     }
 }
 
-pub struct VerifyDependenciesError(&'static str, Vec<&'static str>);
+pub struct VerifyDependentsError(String);
 
-impl core::fmt::Display for VerifyDependenciesError {
+impl core::fmt::Display for VerifyDependentsError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "The following dependents don't accept {} layer: {}",
-            self.0,
-            self.1.join(", ")
-        )
+        write!(f, "{}", self.0)
     }
 }
 
-impl core::fmt::Debug for VerifyDependenciesError {
+impl core::fmt::Debug for VerifyDependentsError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{self}")
     }
 }
 
-impl std::error::Error for VerifyDependenciesError {}
+impl std::error::Error for VerifyDependentsError {}
 
 pub trait LayerExt: LayerBase {
-    fn verify_dependencies(
-        deps: &[Arc<dyn LayerDependency>],
+    fn verify_dependents(
+        deps: &[impl AsRef<dyn LayerDependency>],
     ) -> Result<
         (
             watch::Sender<Option<Self::Stats>>,
             watch::Receiver<Option<Self::Stats>>,
         ),
-        VerifyDependenciesError,
+        VerifyDependentsError,
     > {
-        let mismatch = deps
-            .iter()
-            .filter(|dep| !dep.accepts_layers().contains(&Self::LAYER))
-            .map(|dep| dep.layer())
-            .collect::<Vec<_>>();
-        if mismatch.is_empty() {
-            Ok(watch::channel(None))
-        } else {
-            Err(VerifyDependenciesError(Self::LAYER, mismatch))
+        // For each dep, check that every layer it depends on is provided by
+        // either Self::LAYER or a previously checked dep.
+        let mut provided_layers: Vec<&'static str> = vec![Self::LAYER];
+        for dep in deps.iter().map(AsRef::as_ref) {
+            for needed in dep.depend_on_layers() {
+                if !provided_layers.contains(needed) {
+                    return Err(VerifyDependentsError(format!(
+                        "Dependent '{}' requires layer '{}' which is not provided by '{}' or any prior dependent",
+                        dep.layer(),
+                        needed,
+                        Self::LAYER,
+                    )));
+                }
+            }
+            provided_layers.push(dep.layer());
         }
+        Ok(watch::channel(None))
     }
 
     #[allow(async_fn_in_trait)]
@@ -150,7 +151,7 @@ pub trait LayerImpl: Layer {
         &'a self,
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
-    ) -> impl Future<Output = Result<bool, LayerErrorSource>> + RtBound + 'a;
+    ) -> impl Future<Output = Result<shared_schema::FixedLayerMetadata, LayerErrorSource>> + RtBound + 'a;
 }
 
 #[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
@@ -165,7 +166,7 @@ pub trait LayerDependency: Layer + RtBound + RtSync {
         &self,
         conn: &mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
-    ) -> Result<bool, LayerError>;
+    ) -> Result<shared_schema::FixedLayerMetadata, LayerError>;
 }
 
 #[cfg_attr(feature = "wasm", async_trait::async_trait(?Send))]
@@ -189,7 +190,7 @@ impl<T: ?Sized + LayerImpl + RtBound + RtSync> LayerDependency for T {
         &self,
         conn: &mut crate::db::AsyncDbConnection,
         metadata: shared_schema::FixedLayerMetadata,
-    ) -> Result<bool, LayerError> {
+    ) -> Result<shared_schema::FixedLayerMetadata, LayerError> {
         self.update_blocks_impl(conn, metadata)
             .await
             .map_err(|e| LayerError {

@@ -43,11 +43,11 @@ impl Default for L0Config {
     }
 }
 
-pub struct L0Client<S: Scryable> {
+pub struct L0Client<S: Scryable, D: AsRef<dyn LayerDependency> = Arc<dyn LayerDependency>> {
     conn: AsyncDbConnection,
     client: Option<S>,
     manager: Option<BlockRangeManager<S>>,
-    dependencies: Vec<Arc<dyn LayerDependency>>,
+    dependents: Box<[D]>,
     activations: ChainActivations,
     config: L0Config,
     stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
@@ -139,7 +139,7 @@ impl From<ScryError> for L0Error {
     }
 }
 
-impl<S: Scryable> L0Client<S> {
+impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
     fn checked_u64_to_i64(value: u64, field: &'static str) -> Result<i64, L0Error> {
         i64::try_from(value).map_err(|_| L0Error::ValueOutOfRange { field, value })
     }
@@ -153,9 +153,10 @@ impl<S: Scryable> L0Client<S> {
         client: Option<S>,
         config: L0Config,
         activations: ChainActivations,
-        dependencies: Vec<Arc<dyn LayerDependency>>,
+        dependents: impl Into<Box<[D]>>,
     ) -> (Self, DbQueryHandle<S>) {
-        let (stats_tx, stats_rx) = Self::verify_dependencies(&dependencies).unwrap();
+        let dependents = dependents.into();
+        let (stats_tx, stats_rx) = Self::verify_dependents(&dependents).unwrap();
         let (query_tx, query_rx) = mpsc::unbounded();
         (
             Self {
@@ -164,7 +165,7 @@ impl<S: Scryable> L0Client<S> {
                 manager: client
                     .map(|client| BlockRangeManager::new(client, config.block_range_config)),
                 activations,
-                dependencies,
+                dependents,
                 config,
                 stats_tx,
                 stats_rx,
@@ -185,7 +186,7 @@ impl<S: Scryable> L0Client<S> {
             next_block_height: new_next_block_height as _,
         };
 
-        for dep in self.dependencies.iter() {
+        for dep in self.dependents.iter().rev().map(AsRef::as_ref) {
             dep.expire_blocks(&mut self.conn, metadata).await?;
         }
 
@@ -446,11 +447,12 @@ impl<S: Scryable> L0Client<S> {
             Err(e) => return Err(e),
         };
 
-        let mut deps_has_more = false;
-        for dep in self.dependencies.iter() {
+        let mut cur_metadata = metadata;
+        for dep in self.dependents.iter().map(AsRef::as_ref) {
             trace!("Updating {}", dep.layer());
-            deps_has_more |= dep.update_blocks(&mut self.conn, metadata).await?;
+            cur_metadata = dep.update_blocks(&mut self.conn, cur_metadata).await?;
         }
+        let deps_has_more = cur_metadata.next_block_height != metadata.next_block_height;
 
         // Preserve `deps_has_more` in the NoNewBlocks result so callers can
         // keep advancing dependent layers even when L0 itself is caught up.
@@ -599,16 +601,19 @@ impl<S: Scryable> L0Client<S> {
             }
 
             // Let dependent layers advance while time remains.
-            let mut has_more = false;
-            for dep in self.dependencies.iter() {
-                match dep.update_blocks(&mut self.conn, metadata).await {
-                    Ok(more) => has_more |= more,
+            let mut cur_metadata = metadata;
+            for dep in self.dependents.iter().map(AsRef::as_ref) {
+                match dep.update_blocks(&mut self.conn, cur_metadata).await {
+                    Ok(new_metadata) => {
+                        cur_metadata = new_metadata;
+                    }
                     Err(e) => {
                         error!("Error updating dependency {}: {e:?}", dep.layer());
                         break;
                     }
                 }
             }
+            let has_more = cur_metadata.next_block_height != metadata.next_block_height;
 
             if !has_more {
                 // Dependencies are caught up; just wait while still serving queries.
@@ -640,8 +645,8 @@ pub struct L0Stats {
     pub total_txs: u64,
 }
 
-impl<S: Scryable> LayerBase for L0Client<S> {
-    const ACCEPT_LAYERS: &'static [&'static str] = &[];
+impl<S: Scryable, D: AsRef<dyn LayerDependency>> LayerBase for L0Client<S, D> {
+    const DEPEND_ON_LAYERS: &'static [&'static str] = &[];
     const LAYER: &'static str = "l0";
     type Stats = L0Stats;
     fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>> {

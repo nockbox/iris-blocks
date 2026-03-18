@@ -168,7 +168,7 @@ mod tests {
 
         sql_query(
             "INSERT INTO blocks (id, height, version, parent, timestamp, msg, jam)
-             VALUES ('b1', 1, 1, 'p0', ?1, NULL, x'00')",
+             VALUES ('b1', 1, 1, '1', ?1, NULL, x'00')",
         )
         .bind::<BigInt, _>(b1_ts)
         .execute(&mut conn)

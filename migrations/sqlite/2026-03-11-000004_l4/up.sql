@@ -6,7 +6,7 @@ CREATE TABLE name_info (
     version    INTEGER NOT NULL,
     owner_type TEXT    NOT NULL,
     owner      TEXT    NOT NULL,
-    PRIMARY KEY (first, height)
+    PRIMARY KEY (first, height),
     FOREIGN KEY (height) REFERENCES blocks(height)
 );
 

@@ -1,6 +1,7 @@
 use clap::Parser;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use tonic::transport::{Channel, Uri};
@@ -48,8 +49,8 @@ pub struct SyncArgs {
     /// then re-running up migrations. This drops and recreates tables.
     #[arg(long, value_name = "LAYER")]
     pub remove_layer: Option<String>,
-    #[arg(long, default_value = "false")]
-    pub disable_l4: bool,
+    #[arg(long, value_delimiter = ',')]
+    pub only_enable_layers: Option<Vec<String>>,
     #[command(flatten)]
     pub l0: L0Config,
 }
@@ -88,20 +89,25 @@ impl SyncArgs {
         }
 
         let activations = ChainActivations::mainnet();
-        let l4_client = if self.disable_l4 {
-            None
-        } else {
-            Some(Arc::new(L4Client::new(activations.clone(), vec![])))
-        };
-        let l3_deps: Vec<Arc<dyn LayerDependency>> = l4_client
+        let mut all_deps: Vec<Arc<dyn LayerDependency>> = vec![];
+
+        let el = self
+            .only_enable_layers
             .as_ref()
-            .map(|c| vec![c.clone() as Arc<dyn LayerDependency>])
-            .unwrap_or_default();
-        let l3_client = Arc::new(L3Client::new(activations.clone(), l3_deps));
-        let l2_deps: Vec<Arc<dyn LayerDependency>> = vec![l3_client.clone()];
-        let l2_client = Arc::new(L2Client::new(activations.clone(), l2_deps));
-        let l1_deps: Vec<Arc<dyn LayerDependency>> = vec![l2_client.clone()];
-        let l1_client = Arc::new(L1Client::new(activations.clone(), l1_deps));
+            .map(|v| v.iter().map(|s| &(**s)).collect::<HashSet<_>>());
+
+        if el.as_ref().map(|v| v.contains("l1")).unwrap_or(true) {
+            all_deps.push(Arc::new(L1Client::new(activations.clone())));
+        }
+        if el.as_ref().map(|v| v.contains("l2")).unwrap_or(true) {
+            all_deps.push(Arc::new(L2Client::new(activations.clone())));
+        }
+        if el.as_ref().map(|v| v.contains("l3")).unwrap_or(true) {
+            all_deps.push(Arc::new(L3Client::new(activations.clone())));
+        }
+        if el.as_ref().map(|v| v.contains("l4")).unwrap_or(true) {
+            all_deps.push(Arc::new(L4Client::new(activations.clone())));
+        }
 
         let connect: Uri = match self.connect {
             Some(uri) => uri,
@@ -116,11 +122,17 @@ impl SyncArgs {
                                 "missing l0 layer metadata; run sync with a connection first",
                             )
                         })?;
-                while l1_client
-                    .update_blocks(&mut conn, l0_metadata)
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
-                {
+                loop {
+                    let mut cur_metadata = l0_metadata;
+                    for dep in &all_deps {
+                        cur_metadata = dep
+                            .update_blocks(&mut conn, cur_metadata)
+                            .await
+                            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+                    }
+                    if cur_metadata == l0_metadata {
+                        break;
+                    }
                     log::trace!("More blocks available, looping");
                 }
                 return Ok(());
@@ -129,8 +141,7 @@ impl SyncArgs {
         let scry = Some(NockAppServiceClient::new(
             Channel::builder(connect).connect().await?,
         ));
-        let l0_deps: Vec<Arc<dyn LayerDependency>> = vec![l1_client.clone()];
-        let (client, _query_tx) = L0Client::new(conn, scry, self.l0, activations, l0_deps);
+        let (client, _query_tx) = L0Client::new(conn, scry, self.l0, activations, all_deps);
         client.run().await;
 
         Ok(())

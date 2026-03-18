@@ -17,24 +17,21 @@ use log::*;
 use schema::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
 use tracing::Instrument;
 
 pub struct L4Client {
     activations: ChainActivations,
-    deps: Vec<Arc<dyn LayerDependency>>,
     stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
 impl L4Client {
-    pub fn new(activations: ChainActivations, deps: Vec<Arc<dyn LayerDependency>>) -> Self {
-        let (stats_tx, stats_rx) = Self::verify_dependencies(&deps).unwrap();
+    pub fn new(activations: ChainActivations) -> Self {
+        let (stats_tx, stats_rx) = watch::channel(None);
         Self {
             activations,
-            deps,
             stats_tx,
             stats_rx,
         }
@@ -133,7 +130,7 @@ impl L4Client {
 }
 
 impl LayerBase for L4Client {
-    const ACCEPT_LAYERS: &'static [&'static str] = &["l3"];
+    const DEPEND_ON_LAYERS: &'static [&'static str] = &["l3"];
     const LAYER: &'static str = "l4";
     type Stats = L4Stats;
     fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>> {
@@ -159,10 +156,6 @@ impl LayerImpl for L4Client {
             metadata = cur_metadata;
         }
 
-        for dep in &self.deps {
-            dep.expire_blocks(conn, metadata).await?;
-        }
-
         metadata.layer = Self::LAYER;
 
         diesel::delete(name_info::table)
@@ -179,13 +172,12 @@ impl LayerImpl for L4Client {
         &'a self,
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: FixedLayerMetadata,
-    ) -> Result<bool, LayerErrorSource> {
+    ) -> Result<FixedLayerMetadata, LayerErrorSource> {
         if metadata.next_block_height == 0 {
-            let mut has_more = false;
-            for dep in &self.deps {
-                has_more |= dep.update_blocks(conn, metadata).await?;
-            }
-            return Ok(has_more);
+            return Ok(FixedLayerMetadata {
+                layer: Self::LAYER,
+                next_block_height: 0,
+            });
         }
 
         let cur_metadata = Self::layer_metadata(conn).await?;
@@ -196,12 +188,10 @@ impl LayerImpl for L4Client {
         let end_block_height = metadata.next_block_height as u32 - 1;
 
         if start_block_height > end_block_height {
-            let dep_metadata = cur_metadata.unwrap_or(metadata);
-            let mut has_more = false;
-            for dep in &self.deps {
-                has_more |= dep.update_blocks(conn, dep_metadata).await?;
-            }
-            return Ok(has_more);
+            return Ok(cur_metadata.unwrap_or(FixedLayerMetadata {
+                layer: Self::LAYER,
+                next_block_height: start_block_height as i32,
+            }));
         }
 
         self.expire_blocks_impl(
@@ -358,7 +348,9 @@ impl LayerImpl for L4Client {
                             ))
                         })?;
 
-                    let (owner_type, owner) = if is_coinbase {
+                    let (owner_type, owner) = if version == 0 {
+                        Self::resolve_v0_owner(&note_jam)?
+                    } else if is_coinbase {
                         coinbase_owner_map
                             .get(&first)
                             .cloned()
@@ -367,8 +359,6 @@ impl LayerImpl for L4Client {
                                     "coinbase owner missing for first={first} at height={h}"
                                 ))
                             })?
-                    } else if version == 0 {
-                        Self::resolve_v0_owner(&note_jam)?
                     } else {
                         let root = name_to_lock::table
                             .filter(name_to_lock::first.eq(first))
@@ -448,7 +438,7 @@ impl LayerImpl for L4Client {
                 .instrument(tracing::info_span!("l4_commit_block", height))
                 .await?;
 
-                tracing::debug!(
+                tracing::trace!(
                     block_height = h,
                     revealed_root_count,
                     created_note_count,
@@ -473,13 +463,7 @@ impl LayerImpl for L4Client {
             }))
             .unwrap();
 
-        let self_has_more = last_block_height < end_block_height;
-        let mut has_more = self_has_more;
-        for dep in &self.deps {
-            has_more |= dep.update_blocks(conn, cur_metadata).await?;
-        }
-
-        Ok(has_more)
+        Ok(cur_metadata)
     }
 }
 
@@ -522,7 +506,7 @@ mod tests {
             .await
             .ok()?;
         crate::db::run_migrations(&mut conn).await.ok()?;
-        let client = L4Client::new(ChainActivations::mainnet(), vec![]);
+        let client = L4Client::new(ChainActivations::mainnet());
         Some((conn, client, dst))
     }
 

@@ -7,24 +7,21 @@ use diesel_async::RunQueryDsl;
 use log::*;
 use schema::*;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::Instrument;
 
 pub struct L3Client {
     #[allow(dead_code)]
     activations: ChainActivations,
-    deps: Vec<Arc<dyn LayerDependency>>,
     stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
 }
 
 impl L3Client {
-    pub fn new(activations: ChainActivations, deps: Vec<Arc<dyn LayerDependency>>) -> Self {
-        let (stats_tx, stats_rx) = Self::verify_dependencies(&deps).unwrap();
+    pub fn new(activations: ChainActivations) -> Self {
+        let (stats_tx, stats_rx) = watch::channel(None);
         Self {
             activations,
-            deps,
             stats_tx,
             stats_rx,
         }
@@ -32,7 +29,7 @@ impl L3Client {
 }
 
 impl LayerBase for L3Client {
-    const ACCEPT_LAYERS: &'static [&'static str] = &["l2"];
+    const DEPEND_ON_LAYERS: &'static [&'static str] = &["l2"];
     const LAYER: &'static str = "l3";
     type Stats = L3Stats;
     fn stats_handle(&self) -> watch::Receiver<Option<Self::Stats>> {
@@ -58,10 +55,6 @@ impl LayerImpl for L3Client {
             metadata = cur_metadata;
         }
 
-        for dep in &self.deps {
-            dep.expire_blocks(conn, metadata).await?;
-        }
-
         metadata.layer = Self::LAYER;
 
         trace!("Dropping debits");
@@ -84,13 +77,12 @@ impl LayerImpl for L3Client {
         &'a self,
         conn: &'a mut crate::db::AsyncDbConnection,
         metadata: FixedLayerMetadata,
-    ) -> Result<bool, LayerErrorSource> {
+    ) -> Result<FixedLayerMetadata, LayerErrorSource> {
         if metadata.next_block_height == 0 {
-            let mut has_more = false;
-            for dep in &self.deps {
-                has_more |= dep.update_blocks(conn, metadata).await?;
-            }
-            return Ok(has_more);
+            return Ok(FixedLayerMetadata {
+                layer: Self::LAYER,
+                next_block_height: 0,
+            });
         }
 
         let cur_metadata = Self::layer_metadata(conn).await?;
@@ -101,12 +93,10 @@ impl LayerImpl for L3Client {
         let end_block_height = metadata.next_block_height as u32 - 1;
 
         if start_block_height > end_block_height {
-            let dep_metadata = cur_metadata.unwrap_or(metadata);
-            let mut has_more = false;
-            for dep in &self.deps {
-                has_more |= dep.update_blocks(conn, dep_metadata).await?;
-            }
-            return Ok(has_more);
+            return Ok(cur_metadata.unwrap_or(FixedLayerMetadata {
+                layer: Self::LAYER,
+                next_block_height: start_block_height as i32,
+            }));
         }
 
         self.expire_blocks_impl(
@@ -261,13 +251,7 @@ impl LayerImpl for L3Client {
             }))
             .unwrap();
 
-        let self_has_more = last_block_height < end_block_height;
-        let mut has_more = self_has_more;
-        for dep in &self.deps {
-            has_more |= dep.update_blocks(conn, cur_metadata).await?;
-        }
-
-        Ok(has_more)
+        Ok(cur_metadata)
     }
 }
 
@@ -312,7 +296,7 @@ mod tests {
             .await
             .ok()?;
         crate::db::run_migrations(&mut conn).await.ok()?;
-        let client = L3Client::new(ChainActivations::mainnet(), vec![]);
+        let client = L3Client::new(ChainActivations::mainnet());
         Some((conn, client, dst))
     }
 

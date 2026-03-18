@@ -199,7 +199,7 @@ pub struct LayerMetadata {
     pub next_block_height: i32,
 }
 
-#[derive(Debug, Clone, Copy, Queryable, Selectable, Insertable, AsChangeset)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Queryable, Selectable, Insertable, AsChangeset)]
 #[diesel(table_name = layer_metadata)]
 pub struct FixedLayerMetadata {
     pub layer: &'static str,
