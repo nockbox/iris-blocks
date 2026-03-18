@@ -28,7 +28,7 @@ use block_range_manager::BlockRangeManager;
 pub struct L0Config {
     #[command(flatten)]
     pub block_range_config: block_range_manager::BlockRangeConfig,
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub store_pow: bool,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub verify_outputs: bool,
