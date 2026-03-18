@@ -1,224 +1,277 @@
-# Layered Nockchain Indexer and Query CLI
+# iris-blocks
 
-`iris-blocks` incrementally syncs nockchain data into a local SQLite database and exposes query commands over that indexed state.
+### Layered Nockchain Indexer, Accounting Engine, and Query CLI
 
-The database is built in layers (`l0` -> `l4`) where each layer depends on the previous one. Reorgs are handled by cascading invalidation from `l0` upwards.
+A fast, self-hosted Nockchain indexer that syncs chain data into a local SQLite database and gives you full SQL access to blocks, transactions, notes, ownership, and double-entry accounting — all queryable in under a second.
 
-## CLI
+## What can you do with iris-blocks?
 
-```bash
-iris-blocks --help
-```
+- **Time-travel to any block** — query chain state at any height: block metadata, transactions, coinbase rewards.
+- **Track owners of complex notes** — resolves ownership across V0 public keys, V1 PKHs, multi-sig, and lock trees, continuously enriched as spend conditions are revealed.
+- **Reveal public keys behind PKHs** — captures reverse mappings when PKH holders sign transactions.
+- **Debit/credit tracking with instant CSV export** — full double-entry accounting ledger, export a wallet's complete history.
+- **Extend with custom SQL** — plain SQLite database, build your own queries and APIs on top. Schema documented in [docs/SCHEMA.md](docs/SCHEMA.md).
+- **Self-hosted and private** — your data stays on your machine. No third-party APIs, no rate limits.
+- **Sub-second block parsing** — each new block parsed and all five layers derived in under a second.
+- **Runs in the browser** — compiles to WebAssembly and runs entirely client-side.
 
-### From source (Cargo)
+---
 
-The CLI binary target is feature-gated. Use `--features binary` when running from source:
+## Table of Contents
 
-```bash
-# Show CLI help
-cargo +nightly run --features binary -- --help
+- [Getting Started](#getting-started)
+- [CLI Reference](#cli-reference)
+- [Web Interface](#web-interface)
+- [Using iris-blocks in JavaScript/TypeScript](#using-iris-blocks-in-javascripttypescript)
+- [Architecture and Schema](#architecture-and-schema)
+- [Reference](#reference)
+- [License](#license)
 
-# Example query
-cargo +nightly run --features binary -- \
-  --db nockchain.sqlite \
-  balance <address>
-```
+---
 
-Commands:
+## Getting Started
 
-- `sync`: connect to a node and update local DB state
-- `balance <address>`: wallet balance view (ground truth from unspent notes)
-- `tx <txid>`: transaction drilldown (spends, outputs, signers, credits, debits)
-- `block <height-or-id>`: block metadata, tx list, coinbase credits
-- `status`: layer cursors + key table row counts
-- `audit <address>`: wallet audit with selectable text/json view (`--view summary|notes|both`), plus CSV exports for summary accounting view (`--csv`) and detailed note ledger view (`--csv-notes`)
-
-### Data sources
-
-- Local file mode (query commands): `--db <path>` points to a SQLite file
-- Node mode (sync): `sync --connect <grpc-uri>`
-
-Examples:
+The CLI is feature-gated — run all commands with:
 
 ```bash
-# Initialize/upgrade schema locally (no node sync)
-iris-blocks --db nockchain.sqlite sync --run-migrations
-
-# Sync from node
-iris-blocks --db nockchain.sqlite sync --connect http://localhost:5555 --run-migrations
-
-# Query by PKH or legacy V0 key
-iris-blocks --db nockchain.sqlite balance <address>
-iris-blocks --db nockchain.sqlite audit <address> --csv wallet_flow_summary.csv
-
-# Audit text/json view selection:
-iris-blocks --db nockchain.sqlite audit <address> --view summary
-iris-blocks --db nockchain.sqlite audit <address> --format json --view notes
-iris-blocks --db nockchain.sqlite audit <address> --view both
-
-# Auto-name summary CSV in current directory:
-# nockchain_transactions_<address>.csv
-iris-blocks --db nockchain.sqlite audit <address> --csv
-
-# Auto-name detailed notes CSV:
-# nockchain_notes_<address>.csv
-iris-blocks --db nockchain.sqlite audit <address> --csv-notes
-
-# Write auto-named summary CSV into a directory:
-iris-blocks --db nockchain.sqlite audit <address> --csv /path/to/output-dir/
-
-# Write both summary and detailed CSV in one run:
-iris-blocks --db nockchain.sqlite audit <address> \
-  --csv /path/to/output-dir/ \
-  --csv-notes /path/to/output-dir/
+cargo run --features binary -- <args>
 ```
 
-## Units
+There are two ways to get a populated database: download a pre-built snapshot, or sync directly from a Nockchain node.
 
-- All amounts are represented in **nicks**.
-- This repository does not convert values to NOCK in CLI output.
+### Option A: Download a Chain Snapshot
 
-## Address Input Semantics
+We publish a new chain snapshot every 24 hours so you can start querying immediately without running a node.
 
-Address input type controls the query scope:
+**1. Download the latest snapshot** from the release page:
 
-- PKH input (`AddressType::Pkh`) -> V1-only accounting and note views.
-- Public key input (`AddressType::DbPublicKey`) -> V0-only accounting and note views.
+> [github.com/nockbox/iris-blocks/releases/tag/sample-db](https://github.com/nockbox/iris-blocks/releases/tag/sample-db)
 
-This split is intentional and prevents mixed V0/V1 balances when a PK and PKH are related.
+**2. Query it:**
 
-## Audit/CSV Behavior
+```bash
+cargo run --features binary -- --db nockchain.sqlite status
+cargo run --features binary -- --db nockchain.sqlite balance <address>
+cargo run --features binary -- --db nockchain.sqlite tx <txid>
+cargo run --features binary -- --db nockchain.sqlite audit <address> --csv
+```
 
-`audit` exposes two views:
+The snapshot is a standard SQLite file — you can also open it with any SQLite client (`sqlite3`, DB Browser, DBeaver, etc.) and write your own queries against the [documented schema](docs/SCHEMA.md).
 
-- **Summary view** (`--view summary`, default `--csv`):
-  - recipient-level accounting rows (`incoming` / `outgoing` / `coinbase`)
-  - self-refund/change incoming rows are omitted from summary output
-  - transaction fees are always represented (including fee-only rows when needed)
-  - `txid` is always populated; coinbase rows use synthetic ids (`coinbase@<block-id-or-height>`)
-- **Notes view** (`--view notes`, `--csv-notes`):
-  - raw note-level ledger rows (`credit` / `debit` / `coinbase`)
-  - includes refund/change entries and counterparties
+### Option B: Sync from a Nockchain Node (Private gRPC)
 
-## Wasm
+For real-time data, sync iris-blocks directly from a Nockchain node's private gRPC interface.
 
-You may build this as a wasm module with:
+> **Note:** NockBox does not offer hosted gRPC services. You need access to your own Nockchain node's private gRPC endpoint.
+
+**1. Start your Nockchain node** with the private gRPC API enabled (default port `5555`).
+
+**2. Initialize and sync:**
+
+```bash
+cargo run --features binary -- --db nockchain.sqlite sync \
+  --connect http://localhost:5555 \
+  --run-migrations
+```
+
+This creates the database, runs migrations, connects to the node, and begins fetching blocks through all layers (L0–L4). It keeps running and syncing new blocks as they appear.
+
+**3. Query while syncing** from a second terminal:
+
+```bash
+cargo run --features binary -- --db nockchain.sqlite balance <address>
+```
+
+**Selective layer syncing** — restrict which layers are derived if you don't need all of them:
+
+```bash
+cargo run --features binary -- --db nockchain.sqlite sync \
+  --connect http://localhost:5555 \
+  --run-migrations \
+  --only-enable-layers l1,l2
+```
+
+**Re-derive without re-syncing** — when no `--connect` is provided, iris-blocks processes existing L0 blocks through the enabled upper layers, then exits:
+
+```bash
+cargo run --features binary -- --db nockchain.sqlite sync --run-migrations
+```
+
+---
+
+## CLI Reference
 
 ```
+cargo run --features binary -- [--db <path>] <command>
+```
+
+`--db` defaults to `nockchain.sqlite`. All query commands support `--format text` (default) or `--format json`.
+
+| Command | Description |
+|---------|-------------|
+| `sync` | Connect to a node and sync chain data into the local database |
+| `balance <address>` | Wallet balance (ground truth from unspent notes) |
+| `tx <txid>` | Transaction drilldown: spends, outputs, signers, credits, debits |
+| `block <height-or-id>` | Block metadata, transaction list, coinbase credits |
+| `status` | Layer sync cursors and table row counts |
+| `audit <address>` | Wallet audit with text/JSON views and CSV export |
+
+### Audit and CSV Export
+
+```bash
+# Summary CSV (auto-named: nockchain_transactions_<address>.csv)
+cargo run --features binary -- --db nockchain.sqlite audit <address> --csv
+
+# Detailed note-level CSV (auto-named: nockchain_notes_<address>.csv)
+cargo run --features binary -- --db nockchain.sqlite audit <address> --csv-notes
+
+# Both CSVs into a directory
+cargo run --features binary -- --db nockchain.sqlite audit <address> \
+  --csv /path/to/output/ \
+  --csv-notes /path/to/output/
+
+# JSON output with both views
+cargo run --features binary -- --db nockchain.sqlite audit <address> --format json --view both
+```
+
+**Summary view** (`--csv`) produces recipient-level accounting rows: `incoming`, `outgoing`, `coinbase` entries with running balance. Self-refund/change rows are excluded, fees are always represented. Coinbase rows use synthetic txids (`coinbase@<block-id-or-height>`).
+
+**Notes view** (`--csv-notes`) produces note-level ledger rows: `credit`, `debit`, `coinbase` entries including counterparties.
+
+### Sync Flags
+
+| Flag | Description |
+|------|-------------|
+| `--connect <uri>` | gRPC URI of the Nockchain node (e.g. `http://localhost:5555`) |
+| `--run-migrations` | Run schema migrations before syncing |
+| `--rederive-layer <layer>` | Reset a layer's cursor to 0 to re-derive it (l1–l4) |
+| `--remove-layer <layer>` | Drop and recreate a layer's tables (l1–l4) |
+| `--only-enable-layers <l1,l2,...>` | Restrict which layers are derived |
+
+---
+
+## Web Interface
+
+A hosted version is available at **[nockbox.github.io/iris-blocks](https://nockbox.github.io/iris-blocks/)** — no installation required, runs entirely in your browser via WebAssembly.
+
+- **Load a snapshot** — download a `.sqlite` file from the [daily snapshots](https://github.com/nockbox/iris-blocks/releases/tag/sample-db) and drag it into the interface to start querying.
+- **Connect to a gRPC-Web endpoint** — enter your node's gRPC-Web URL and hit Start to sync blocks live.
+- **Run SQL queries** — the built-in `nocksql>` terminal accepts arbitrary SQL against the full [schema](docs/SCHEMA.md).
+- **JavaScript mode** — type `.js` to get an `iris>` REPL with access to `iris-wasm`, `sqlQuery()`, and `nounRows()` for decoding JAM blobs into nouns.
+- **Export the database** — download the in-memory database as a `.sqlite` file for offline use.
+
+Data in the web interface is held in-memory and is not persisted across page reloads — use Export DB to save your work.
+
+---
+
+## Using iris-blocks in JavaScript/TypeScript
+
+Integrate iris-blocks directly into your own web application as a WASM library:
+
+```javascript
+import { BlockExporter, setLogging } from "@nockbox/iris-blocks";
+
+setLogging();
+
+const exporter = await new BlockExporter({
+  layers: ["l0", "l1", "l2", "l3", "l4"],
+  db_connect: ":memory:",
+  db_run_migrations: true,
+  remove_layer: null,
+  private_grpc_connect: "http://localhost:8080",
+  scry_no_pow: true,
+  verify_outputs: false,
+});
+
+const result = await exporter.query("SELECT COUNT(*) as cnt FROM blocks");
+const dbBytes = await exporter.exportDb();
+await exporter.stop();
+```
+
+### Building the WASM Package
+
+```bash
 wasm-pack build --features=wasm --target web --out-dir pkg --scope nockbox
 ```
 
-If you run a direct wasm target check (`cargo +nightly check --features wasm --target wasm32-unknown-unknown`),
-`sqlite-wasm-rs` requires a wasm-capable clang toolchain (Apple clang alone is not enough).
-One working approach:
+`sqlite-wasm-rs` requires a WASM-capable clang toolchain. If Apple clang alone isn't sufficient:
 
 ```bash
 nix shell nixpkgs#llvmPackages_18.clang nixpkgs#llvmPackages_18.llvm -c sh -lc '
   export CC_wasm32_unknown_unknown="$(command -v clang)"
   export AR_wasm32_unknown_unknown="$(command -v llvm-ar)"
-  cargo +nightly check --features wasm --target wasm32-unknown-unknown
+  cargo check --features wasm --target wasm32-unknown-unknown
 '
 ```
 
-And then use it with:
+---
+
+## Architecture and Schema
+
+iris-blocks builds its database in five layers. Each layer depends on the previous one; reorgs cascade invalidation from L0 upward.
 
 ```
-import { BlockExporter, setLogging } from "@nockbox/iris-blocks";
-setLogging();
-const e = await new BlockExporter(["l0", "l1"], ":memory:", true, "http://localhost:8080");
+L0  Blocks & Transactions     ← canonical chain data from node
+ └─ L1  Note Lifecycle         ← created / spent / unspent notes
+     └─ L2  Transaction Detail ← spends, outputs, signers, hash reversals, spend conditions
+         └─ L3  Accounting     ← double-entry credits & debits
+         └─ L4  Ownership  ← resolved owner per note (pk / pkh / lock / musig)
 ```
 
-Data is not persisted.
+### Tables
 
-## Layer Summary
+| Table | Layer | Purpose |
+|-------|-------|---------|
+| `blocks` | L0 | Block headers and metadata |
+| `transactions` | L0 | Transaction data with fees and JAM blobs |
+| `notes` | L1 | Note lifecycle (created, spent, unspent) |
+| `tx_spends`, `tx_seeds`, `tx_outputs`, `tx_signers` | L2 | Transaction internals |
+| `name_to_lock` | L2 | Note name to lock tree root mapping |
+| `pkh_to_pk` | L2 | Public key hash to public key reverse lookup |
+| `lock_tree`, `spend_conditions` | L2 | Lock trees and spend condition payloads |
+| `credits` | L3 | Incoming value (including coinbase) |
+| `debits` | L3 | Outgoing value with fees |
+| `name_info` | L4 | Resolved ownership per note name |
 
-### L0
+Since this is plain SQLite, you can query it with any SQL-compatible tool and build custom APIs, dashboards, or analytics on top. For column types, indexes, join patterns, and query examples, see [docs/SCHEMA.md](docs/SCHEMA.md).
 
-Canonical block/transaction storage.
+---
 
-- `blocks`: PK (`id`), UNIQUE (`height`), `version`, UNIQUE (`parent`), `timestamp`, `msg`, `jam`
-- `transactions`: PK (`id`), `block_id`, `height`, `version`, `fee`, `total_size`, `jam`
+## Reference
 
-### L1
+### Units
 
-Note lifecycle (created/spent/unspent notes).
+All amounts are in **nicks** (native chain unit). `65536 nicks = 1 NOCK`. The CLI does not convert to NOCK.
 
-- `notes`: PK (`first`, `last`), `version`, `assets`, `coinbase`, `created_*`, `spent_*`, `jam`
+### Address Input
 
-### L2
+The type of address you pass determines the query scope:
 
-#### L2.1
+- **PKH** (public key hash) — queries V1 notes only (standard wallet queries)
+- **Public key** — queries V0 notes only (legacy wallet queries)
 
-Transaction internals and ordering.
+This split prevents mixed V0/V1 balances when a public key and its derived PKH are related.
 
-- `tx_spends`: PK (`txid`, `z`), `version`, UNIQUE (`first`, `last`), `fee`, `height`
-- `tx_seeds`: PK (`txid`, `z`, `idx`), `amount`, `first`, `height`
-- `tx_outputs`: PK (`txid`, `idx`), UNIQUE (`first`, `last`), `assets`, `height`
-- `tx_signers`: PK (`txid`, `z`, `pk`), `height`
+### Recipient Types
 
-#### L2.2
+| Type | Meaning |
+|------|---------|
+| `pk` | Resolved or V0 public key |
+| `pkh` | Public key hash (V1) |
+| `lock` | Unresolved or multi-owner lock tree |
+| `musig` | Multi-signature |
 
-Hash reversals.
+### Upgrading Existing Databases
 
-- `name_to_lock`: PK (`first`), UNIQUE (`root`), `height`, `block_id`
-- `pkh_to_pk`: PK (`pkh`), UNIQUE (`pk`), `height`, `block_id`
-
-#### L2.3
-
-Spend condition retrieval.
-
-- `lock_tree`: PK (`root`), `height`, `axis`, `hash`
-- `spend_conditions`: PK (`hash`), UNIQUE (`txid`, `z`), `height`, `jam`, nullable `z`
-
-_Null z implies non-witness derived spend condition (%lock note-data)_
-
-### L3
-
-Double entry accounting ledger.
-
-- `credits`: PK (NULLABLE (`txid`), `first`, `height`), `block_id`, `amount`
-- `debits`: PK (NULLABLE (`txid`), NULLABLE (`first`), `height`), `block_id`, `amount`, `fee`
-
-_Null txid/first imply coinbase_
-
-### L4
-
-Additional accounting information, more frequently recomputed.
-
-- `name_info`: PK (`first`, `height`), `version`, `owner_type`, `owner`
-
-_Reset behavior is height-based: delete `name_info` rows with `height >= next_block_height`._
-
-_Update behavior is two-phase per block:_
-- _process newly revealed `spend_conditions` + `lock_tree` roots (resolve owner as `pkh` / `musig` / `lock`), then insert `version=1` name rows;_
-- _process newly created notes missing name metadata (V0 decode to `pk` / `musig`; V1 defaults to `lock`, with V1 coinbase first names resolved to `pkh`) and insert versioned rows._
-
-_Reporting/query behavior uses the latest `name_info` row per `first` (`ORDER BY height DESC LIMIT 1`)._
-
-### Upgrading existing databases
-
-If your SQLite DB was created before `name_info` replaced `credit_info`, run:
+If your database was created before `name_info` replaced `credit_info`:
 
 ```bash
-iris-blocks --db <path-to-db.sqlite> sync --remove-layer l4
-iris-blocks --db <path-to-db.sqlite> sync --run-migrations
+cargo run --features binary -- --db <path.sqlite> sync --remove-layer l4
+cargo run --features binary -- --db <path.sqlite> sync --run-migrations
 ```
 
-This recreates only L4 with the new schema and avoids `no such table: name_info` runtime errors.
+---
 
-## Recipients
+## License
 
-- `pk`: resolved or v0 public key recipient
-- `pkh`: public key hash recipient
-- `lock`: unresolved or multi-owner lock-level recipient
-- `musig`: multi-sig recipient
-
-## Address mapping model
-
-Observed mapping chain:
-
-```text
-pk -> pkh -> lock -> name(first)
-```
-
-For full schema details, joins, and query patterns, see [docs/SCHEMA.md](docs/SCHEMA.md).
+[MIT](LICENSE)
