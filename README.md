@@ -211,11 +211,11 @@ nix shell nixpkgs#llvmPackages_18.clang nixpkgs#llvmPackages_18.llvm -c sh -lc '
 iris-blocks builds its database in five layers. Each layer depends on the previous one; reorgs cascade invalidation from L0 upward.
 
 ```
-L0  Blocks & Transactions     ← canonical chain data from node
+L0  Blocks & Transactions      ← canonical chain data from node
  └─ L1  Note Lifecycle         ← created / spent / unspent notes
      └─ L2  Transaction Detail ← spends, outputs, signers, hash reversals, spend conditions
          └─ L3  Accounting     ← double-entry credits & debits
-         └─ L4  Ownership  ← resolved owner per note (pk / pkh / lock / musig)
+         └─ L4  Ownership      ← resolved owner per note (pk / pkh / lock / musig)
 ```
 
 ### Tables
