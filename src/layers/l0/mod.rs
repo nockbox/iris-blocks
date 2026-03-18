@@ -10,6 +10,7 @@ use clap::Parser;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use futures::channel::{mpsc, oneshot};
+use futures::lock::Mutex;
 use futures::{FutureExt, StreamExt};
 use iris_nockchain_types::BlockHeight;
 use iris_ztd::{jam, Digest, NounEncode};
@@ -44,7 +45,7 @@ impl Default for L0Config {
 }
 
 pub struct L0Client<S: Scryable, D: AsRef<dyn LayerDependency> = Arc<dyn LayerDependency>> {
-    conn: AsyncDbConnection,
+    conn: Arc<Mutex<AsyncDbConnection>>,
     client: Option<S>,
     manager: Option<BlockRangeManager<S>>,
     dependents: Box<[D]>,
@@ -52,10 +53,10 @@ pub struct L0Client<S: Scryable, D: AsRef<dyn LayerDependency> = Arc<dyn LayerDe
     config: L0Config,
     stats_tx: watch::Sender<Option<<Self as LayerBase>::Stats>>,
     stats_rx: watch::Receiver<Option<<Self as LayerBase>::Stats>>,
-    query_rx: mpsc::UnboundedReceiver<DbQueryRequest<S>>,
+    query_rx: mpsc::UnboundedReceiver<L0Request<S>>,
 }
 
-pub enum DbQueryRequest<S> {
+pub enum L0Request<S> {
     Query {
         sql: String,
         responder: oneshot::Sender<Result<Vec<serde_json::Value>, String>>,
@@ -69,15 +70,15 @@ pub enum DbQueryRequest<S> {
 }
 
 #[derive(Clone)]
-pub struct DbQueryHandle<S> {
-    tx: mpsc::UnboundedSender<DbQueryRequest<S>>,
+pub struct L0Handle<S> {
+    tx: mpsc::UnboundedSender<L0Request<S>>,
 }
 
-impl<S: Scryable> DbQueryHandle<S> {
+impl<S: Scryable> L0Handle<S> {
     pub async fn query(&self, sql: String) -> Result<Vec<serde_json::Value>, String> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .unbounded_send(DbQueryRequest::Query { sql, responder: tx })
+            .unbounded_send(L0Request::Query { sql, responder: tx })
             .map_err(|e| e.to_string())?;
         rx.await.map_err(|e| e.to_string())?
     }
@@ -85,14 +86,14 @@ impl<S: Scryable> DbQueryHandle<S> {
     pub async fn export(&self) -> Result<Vec<u8>, String> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .unbounded_send(DbQueryRequest::Export { responder: tx })
+            .unbounded_send(L0Request::Export { responder: tx })
             .map_err(|e| e.to_string())?;
         rx.await.map_err(|e| e.to_string())?
     }
 
     pub fn update_rpc(&self, client: Option<S>) -> Result<(), String> {
         self.tx
-            .unbounded_send(DbQueryRequest::UpdateRpc { client })
+            .unbounded_send(L0Request::UpdateRpc { client })
             .map_err(|e| e.to_string())
     }
 }
@@ -151,12 +152,12 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
     }
 
     pub fn new(
-        conn: AsyncDbConnection,
+        conn: Arc<Mutex<AsyncDbConnection>>,
         client: Option<S>,
         config: L0Config,
         activations: ChainActivations,
         dependents: impl Into<Box<[D]>>,
-    ) -> (Self, DbQueryHandle<S>) {
+    ) -> (Self, L0Handle<S>) {
         let dependents = dependents.into();
         let (stats_tx, stats_rx) = Self::verify_dependents(&dependents).unwrap();
         let (query_tx, query_rx) = mpsc::unbounded();
@@ -173,12 +174,13 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                 stats_rx,
                 query_rx,
             },
-            DbQueryHandle { tx: query_tx },
+            L0Handle { tx: query_tx },
         )
     }
 
     async fn revert_to(
-        &mut self,
+        &self,
+        conn: &mut AsyncDbConnection,
         new_next_block_height: u32,
     ) -> Result<FixedLayerMetadata, L0Error> {
         debug!("Reverting l0 to next_block={new_next_block_height}");
@@ -189,46 +191,46 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
         };
 
         for dep in self.dependents.iter().rev().map(AsRef::as_ref) {
-            dep.expire_blocks(&mut self.conn, metadata).await?;
+            dep.expire_blocks(conn, metadata).await?;
         }
 
         trace!("Dropping transactions");
 
         diesel::delete(transactions::table)
             .filter(transactions::height.ge(new_next_block_height as i32))
-            .execute(&mut self.conn)
+            .execute(conn)
             .await?;
 
         trace!("Dropping blocks");
 
         diesel::delete(blocks::table)
             .filter(blocks::height.ge(new_next_block_height as i32))
-            .execute(&mut self.conn)
+            .execute(conn)
             .await?;
 
         trace!("Setting metadata");
 
-        Self::update_layer_metadata(&metadata)
-            .execute(&mut self.conn)
-            .await?;
+        Self::update_layer_metadata(&metadata).execute(conn).await?;
 
         Err(L0Error::Reverted)
     }
 
     async fn chain_reorged(
-        &mut self,
+        &self,
+        conn: &mut AsyncDbConnection,
         mut mismatch_block_height: BlockHeight,
-        mismatch_block: Digest,
+        mut mismatch_block: Digest,
     ) -> Result<FixedLayerMetadata, L0Error> {
         // Reorg recovery: walk ancestor candidates ("elders") until we find
         // a block hash that matches local state, then roll back above it.
         debug!("Chain reorg detected at height {mismatch_block_height}. Finding common ancestor");
 
-        let client = self.client.as_mut().ok_or(L0Error::GrpcNeeded)?;
+        let mut client = self.client.clone().ok_or(L0Error::GrpcNeeded)?;
 
         while mismatch_block_height > 0 {
+            trace!("Querying elders for block {mismatch_block} {mismatch_block_height}");
             let Some(Some((last_bid, blocks))): Option<Option<(BlockHeight, Vec<Digest>)>> = client
-                .remote_scry(("elders", StringDigest(mismatch_block)))
+                .remote_scry(("elders", StringDigest(mismatch_block), 0))
                 .await?
             else {
                 return Err(L0Error::UnableToPullElders(
@@ -242,7 +244,7 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                 .filter(blocks::height.le(last_bid as i32))
                 .order_by(blocks::height.desc())
                 .limit(blocks.len() as i64)
-                .load::<JamlessBlock>(&mut self.conn)
+                .load::<JamlessBlock>(conn)
                 .await?;
 
             for (remote, local) in blocks.into_iter().zip(cur_blocks) {
@@ -254,26 +256,30 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                     break;
                 }
                 mismatch_block_height = local.height as BlockHeight;
+                mismatch_block = remote;
             }
         }
 
-        self.revert_to(mismatch_block_height).await
+        self.revert_to(conn, mismatch_block_height).await
     }
 
     #[tracing::instrument(skip_all)]
-    async fn update_blocks_impl(&mut self) -> Result<FixedLayerMetadata, L0Error> {
+    async fn update_blocks_impl(
+        &mut self,
+        conn: &mut AsyncDbConnection,
+    ) -> Result<FixedLayerMetadata, L0Error> {
         trace!("Updating blocks");
 
-        let Some(mdata) = Self::layer_metadata(&mut self.conn).await? else {
+        let Some(mdata) = Self::layer_metadata(conn).await? else {
             debug!("Metadata not set. Triggering reset");
-            return self.revert_to(0).await;
+            return self.revert_to(conn, 0).await;
         };
 
         let cur_tail: Option<JamlessBlock> = blocks::table
             .select(JamlessBlock::as_select())
             .order_by(blocks::height.desc())
             .limit(1)
-            .load::<JamlessBlock>(&mut self.conn)
+            .load::<JamlessBlock>(conn)
             .await?
             .pop();
 
@@ -284,7 +290,10 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                     last.height, mdata.next_block_height
                 );
                 return self
-                    .revert_to(core::cmp::min(last.height + 1, mdata.next_block_height) as _)
+                    .revert_to(
+                        conn,
+                        core::cmp::min(last.height + 1, mdata.next_block_height) as _,
+                    )
                     .await;
             }
             trace!("Current tail at height {}", last.height);
@@ -328,7 +337,9 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
             }
             (Some((tail_block, _)), false) => {
                 if new_blocks[0].0 != 0 && new_blocks[0].2.parent() != *tail_block.id {
-                    return self.chain_reorged(new_blocks[0].0, new_blocks[0].1).await;
+                    return self
+                        .chain_reorged(conn, new_blocks[0].0, new_blocks[0].1)
+                        .await;
                 }
             }
             (None, true) => return Err(L0Error::NoNewBlocksNoGenesis),
@@ -409,31 +420,27 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
             next_block_height: create_blocks.last().unwrap().height + 1,
         };
 
-        let cur_txs: i64 = transactions::table
-            .count()
-            .get_result(&mut self.conn)
-            .await?;
+        let cur_txs: i64 = transactions::table.count().get_result(conn).await?;
 
         let new_stats = L0Stats {
             next_block_height: metadata.next_block_height as _,
             total_txs: cur_txs as u64 + create_txs.len() as u64,
         };
 
-        self.conn
-            .spawn_blocking(move |conn| {
-                use diesel::query_dsl::methods::ExecuteDsl;
-                conn.transaction(move |conn| {
-                    let q1 = diesel::insert_into(blocks::table).values(create_blocks);
-                    let q2 = diesel::insert_into(transactions::table).values(create_txs);
-                    let q3 = Self::update_layer_metadata(&metadata);
+        conn.spawn_blocking(move |conn| {
+            use diesel::query_dsl::methods::ExecuteDsl;
+            conn.transaction(move |conn| {
+                let q1 = diesel::insert_into(blocks::table).values(create_blocks);
+                let q2 = diesel::insert_into(transactions::table).values(create_txs);
+                let q3 = Self::update_layer_metadata(&metadata);
 
-                    ExecuteDsl::execute(q1, conn)?;
-                    ExecuteDsl::execute(q2, conn)?;
-                    ExecuteDsl::execute(q3, conn)?;
-                    Ok(())
-                })
+                ExecuteDsl::execute(q1, conn)?;
+                ExecuteDsl::execute(q2, conn)?;
+                ExecuteDsl::execute(q3, conn)?;
+                Ok(())
             })
-            .await?;
+        })
+        .await?;
 
         self.stats_tx.send(Some(new_stats)).ok();
 
@@ -444,7 +451,12 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
     async fn update_blocks(&mut self) -> Result<(), L0Error> {
         let mut res = Ok(());
 
-        let metadata = match self.update_blocks_impl().await {
+        // NOTE: we do not re-acquire the lock inside.
+        let conn = self.conn.clone();
+        let mut conn = conn.lock().await;
+        let conn = &mut *conn;
+
+        let metadata = match self.update_blocks_impl(conn).await {
             Ok(metadata) => metadata,
             Err(L0Error::NoNewBlocks(metadata, a, b, _)) => {
                 res = Err(L0Error::NoNewBlocks(metadata, a, b, false));
@@ -456,7 +468,7 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
         let mut cur_metadata = metadata;
         for dep in self.dependents.iter().map(AsRef::as_ref) {
             trace!("Updating {}", dep.layer());
-            cur_metadata = dep.update_blocks(&mut self.conn, cur_metadata).await?;
+            cur_metadata = dep.update_blocks(conn, cur_metadata).await?;
         }
         let deps_has_more = cur_metadata.next_block_height != metadata.next_block_height;
 
@@ -520,11 +532,11 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
         }
     }
 
-    async fn process_query(&mut self, req: DbQueryRequest<S>) {
+    async fn process_query(&mut self, req: L0Request<S>) {
+        let mut conn = self.conn.lock().await;
         match req {
-            DbQueryRequest::Query { sql, responder } => {
-                let res = self
-                    .conn
+            L0Request::Query { sql, responder } => {
+                let res = conn
                     .spawn_blocking(
                         move |conn| -> Result<Vec<serde_json::Value>, diesel::result::Error> {
                             crate::sqlite_raw::raw_query_json(conn, &sql).map_err(|e| {
@@ -542,9 +554,8 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                 };
                 responder.send(res).ok();
             }
-            DbQueryRequest::Export { responder } => {
-                let res = self
-                    .conn
+            L0Request::Export { responder } => {
+                let res = conn
                     .spawn_blocking(move |conn| -> Result<Vec<u8>, diesel::result::Error> {
                         crate::sqlite_raw::serialize_db(conn).map_err(|e| {
                             diesel::result::Error::DatabaseError(
@@ -560,7 +571,7 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                 };
                 responder.send(res).ok();
             }
-            DbQueryRequest::UpdateRpc { client } => {
+            L0Request::UpdateRpc { client } => {
                 info!("Updating RPC client");
                 self.manager = client
                     .as_ref()
@@ -606,10 +617,12 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                 break;
             }
 
+            let mut conn = self.conn.lock().await;
+
             // Let dependent layers advance while time remains.
             let mut cur_metadata = metadata;
             for dep in self.dependents.iter().map(AsRef::as_ref) {
-                match dep.update_blocks(&mut self.conn, cur_metadata).await {
+                match dep.update_blocks(&mut conn, cur_metadata).await {
                     Ok(new_metadata) => {
                         cur_metadata = new_metadata;
                     }
@@ -620,6 +633,8 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency>> L0Client<S, D> {
                 }
             }
             let has_more = cur_metadata.next_block_height != metadata.next_block_height;
+
+            core::mem::drop(conn);
 
             if !has_more {
                 // Dependencies are caught up; just wait while still serving queries.

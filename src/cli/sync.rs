@@ -141,7 +141,8 @@ impl SyncArgs {
         let scry = Some(NockAppServiceClient::new(
             Channel::builder(connect).connect().await?,
         ));
-        let (client, _query_tx) = L0Client::new(conn, scry, self.l0, activations, all_deps);
+        let (client, _query_tx) =
+            L0Client::new(Arc::new(conn.into()), scry, self.l0, activations, all_deps);
         client.run().await;
 
         Ok(())

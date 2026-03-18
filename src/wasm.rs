@@ -82,7 +82,7 @@ pub struct BlockExporter {
     l2_stats: Option<watch::Receiver<Option<L2Stats>>>,
     l3_stats: Option<watch::Receiver<Option<L3Stats>>>,
     l4_stats: Option<watch::Receiver<Option<L4Stats>>>,
-    query_tx: crate::layers::l0::DbQueryHandle<WasmScryClient>,
+    query_tx: crate::layers::l0::L0Handle<WasmScryClient>,
 }
 
 #[wasm_bindgen]
@@ -219,7 +219,13 @@ impl BlockExporter {
         cfg.store_pow = false;
         cfg.block_range_config.block_range_scry_no_pow = config.scry_no_pow;
         cfg.verify_outputs = config.verify_outputs;
-        let (l0_client, query_tx) = L0Client::new(conn, scry, cfg, activations.clone(), l0_deps);
+        let (l0_client, query_tx) = L0Client::new(
+            Arc::new(conn.into()),
+            scry,
+            cfg,
+            activations.clone(),
+            l0_deps,
+        );
         let l0_stats = Some(l0_client.stats_handle());
 
         let (stop_handle, stop_receiver) = oneshot::channel();
