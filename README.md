@@ -6,21 +6,14 @@ A fast, self-hosted Nockchain indexer that syncs chain data into a local SQLite 
 
 ## What can you do with iris-blocks?
 
-**Time-travel to any block.** Query the state of the chain at any height — block metadata, transactions, coinbase rewards, and the full note lifecycle at that point in time.
-
-**Track owners of complex notes.** Resolves note ownership across V0 public keys, V1 PKHs, multi-sig arrangements, and raw lock trees. Ownership data is continuously enriched as spend conditions are revealed on-chain.
-
-**Reveal public keys behind PKHs.** When a PKH holder signs a transaction, iris-blocks captures the reverse mapping so you can see the actual public key behind any revealed public key hash.
-
-**Debit/credit tracking and instant CSV export.** A full double-entry accounting ledger tracks every credit and debit. Export a wallet's complete transaction history as CSV in under a second.
-
-**Extend with custom SQL.** The database is plain SQLite. Write your own queries, build custom APIs, or plug it into any tool that speaks SQL. Schema is documented in [docs/SCHEMA.md](docs/SCHEMA.md).
-
-**Self-hosted and private.** Your data stays on your machine. No third-party APIs, no rate limits, no accounts.
-
-**Sub-second block parsing.** Each new block is parsed and all five layers derived in under a second.
-
-**Runs in the browser.** The entire indexer compiles to WebAssembly and runs client-side — load a snapshot, sync via gRPC-Web, and query the chain from a browser tab.
+- **Time-travel to any block** — query chain state at any height: block metadata, transactions, coinbase rewards.
+- **Track owners of complex notes** — resolves ownership across V0 public keys, V1 PKHs, multi-sig, and lock trees, continuously enriched as spend conditions are revealed.
+- **Reveal public keys behind PKHs** — captures reverse mappings when PKH holders sign transactions.
+- **Debit/credit tracking with instant CSV export** — full double-entry accounting ledger, export a wallet's complete history.
+- **Extend with custom SQL** — plain SQLite database, build your own queries and APIs on top. Schema documented in [docs/SCHEMA.md](docs/SCHEMA.md).
+- **Self-hosted and private** — your data stays on your machine. No third-party APIs, no rate limits.
+- **Sub-second block parsing** — each new block parsed and all five layers derived in under a second.
+- **Runs in the browser** — compiles to WebAssembly and runs entirely client-side.
 
 ---
 
