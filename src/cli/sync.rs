@@ -49,8 +49,8 @@ pub struct SyncArgs {
     /// then re-running up migrations. This drops and recreates tables.
     #[arg(long, value_name = "LAYER")]
     pub remove_layer: Option<String>,
-    #[arg(long, value_delimiter = ',')]
-    pub only_enable_layers: Option<Vec<String>>,
+    #[arg(long, value_delimiter = ',', default_value = "l1,l2,l3,l4")]
+    pub only_enable_layers: Vec<String>,
     #[command(flatten)]
     pub l0: L0Config,
 }
@@ -91,21 +91,18 @@ impl SyncArgs {
         let activations = ChainActivations::mainnet();
         let mut all_deps: Vec<Arc<dyn LayerDependency>> = vec![];
 
-        let el = self
-            .only_enable_layers
-            .as_ref()
-            .map(|v| v.iter().map(|s| &(**s)).collect::<HashSet<_>>());
+        let el: HashSet<_> = self.only_enable_layers.iter().map(|s| &(**s)).collect();
 
-        if el.as_ref().map(|v| v.contains("l1")).unwrap_or(true) {
+        if el.contains("l1") {
             all_deps.push(Arc::new(L1Client::new(activations.clone())));
         }
-        if el.as_ref().map(|v| v.contains("l2")).unwrap_or(true) {
+        if el.contains("l2") {
             all_deps.push(Arc::new(L2Client::new(activations.clone())));
         }
-        if el.as_ref().map(|v| v.contains("l3")).unwrap_or(true) {
+        if el.contains("l3") {
             all_deps.push(Arc::new(L3Client::new(activations.clone())));
         }
-        if el.as_ref().map(|v| v.contains("l4")).unwrap_or(true) {
+        if el.contains("l4") {
             all_deps.push(Arc::new(L4Client::new(activations.clone())));
         }
 
