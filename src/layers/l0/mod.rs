@@ -360,8 +360,14 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency> + RtBound + RtSync> L0Client<S, 
         let mut create_blocks = vec![];
         let mut create_txs = vec![];
 
+        debug!(
+            "Processing {} new blocks from height {}",
+            new_blocks.len(),
+            new_blocks[0].0
+        );
+
         for (height, bid, mut block, txs) in new_blocks {
-            debug!(
+            trace!(
                 "Processing block {bid} at height {height}. Num transactions: {}",
                 txs.len()
             );
@@ -454,11 +460,6 @@ impl<S: Scryable, D: AsRef<dyn LayerDependency> + RtBound + RtSync> L0Client<S, 
         .await?;
 
         self.stats_tx.send(Some(new_stats)).ok();
-
-        let metadata = FixedLayerMetadata {
-            layer: self.layer(),
-            next_block_height: 0,
-        };
 
         Ok(metadata)
     }
