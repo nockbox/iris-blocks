@@ -82,7 +82,7 @@ fn diesel_unknown(message: impl Into<String>) -> diesel::result::Error {
 pub async fn new_conn(database_url: &str) -> Result<AsyncDbConnection, DbError> {
     let mut conn = AsyncDbConnection::establish(database_url).await?;
 
-    sql_query("PRAGMA foreign_keys = ON;")
+    sql_query("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
         .execute(&mut conn)
         .await?;
 
