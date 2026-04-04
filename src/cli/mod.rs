@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub mod audit;
 pub mod balance;
 pub mod block;
+pub mod names;
 pub mod status;
 pub mod sync;
 pub mod tx;
@@ -11,6 +12,7 @@ pub mod verify_balance;
 pub use audit::{AuditArgs, AuditView};
 pub use balance::BalanceArgs;
 pub use block::BlockArgs;
+pub use names::NamesArgs;
 pub use status::StatusArgs;
 pub use sync::SyncArgs;
 pub use tx::TxArgs;
@@ -73,6 +75,7 @@ impl Cli {
             Commands::Status(args) => args.run(&self.db).await?,
             Commands::Audit(args) => args.run(&self.db).await?,
             Commands::VerifyBalance(args) => args.run(&self.db).await?,
+            Commands::Names(args) => args.run(&self.db).await?,
         }
         Ok(())
     }
@@ -87,6 +90,7 @@ pub enum Commands {
     Status(StatusArgs),
     Audit(AuditArgs),
     VerifyBalance(VerifyBalanceArgs),
+    Names(NamesArgs),
 }
 
 #[cfg(test)]

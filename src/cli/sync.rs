@@ -127,7 +127,7 @@ impl SyncArgs {
                             .await
                             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
                     }
-                    if cur_metadata == l0_metadata {
+                    if cur_metadata.next_block_height == l0_metadata.next_block_height {
                         break;
                     }
                     log::trace!("More blocks available, looping");
